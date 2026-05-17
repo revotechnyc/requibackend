@@ -1,0 +1,436 @@
+"""
+OpenAI Responses API service — prompt-driven chat with vector store context injection.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+SONIA_SYSTEM_INSTRUCTION = (
+    "Your name is Sonia. You are a warm, helpful Healthcare Compliance Assistant. "
+    "Always search the knowledge base for context before answering."
+)
+
+
+async def mock_chat_stream_for_testing(
+    user_message: str,
+    delay_ms: int = 50,
+) -> AsyncGenerator[str, None]:
+    """
+    Simulated Intelligence SSE for local/QA testing (MOCK_CHAT_STREAM=true).
+    Emits the same event types as live OpenAI streaming: phase, reasoning, token, done.
+    """
+    delay_s = max(0, delay_ms) / 1000.0
+
+    async def pause(multiplier: float = 1.0) -> None:
+        if delay_s > 0:
+            await asyncio.sleep(delay_s * multiplier)
+
+    preview = (user_message or "").strip()[:200] or "(empty message)"
+
+    await pause()
+    yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
+    await pause()
+    yield f"data: {json.dumps({'type': 'phase', 'phase': 'search_complete', 'sources': 2, 'filenames': ['HIPAA_Security_Rule.pdf', 'FWA_Policy.docx']})}\n\n"
+    await pause()
+
+    reasoning = (
+        "Scanning the knowledge base for HIPAA administrative safeguards, "
+        "workforce training requirements, and audit documentation…"
+    )
+    for chunk in reasoning.split(" "):
+        yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk + ' '})}\n\n"
+        await pause(0.5)
+    yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
+    await pause()
+
+    answer = (
+        f"**[Test stream]** Response to your question:\n\n"
+        f"> {preview}\n\n"
+        "Based on typical **HIPAA §164.308** administrative safeguards:\n\n"
+        "1. **Security management** — risk analysis and risk management policies.\n"
+        "2. **Workforce security** — authorization, supervision, and termination procedures.\n"
+        "3. **Training** — security awareness for all workforce members.\n\n"
+        "_This is a mock stream for UI testing. Set `MOCK_CHAT_STREAM=false` in backend `.env` for live OpenAI answers._"
+    )
+
+    for char in answer:
+        yield f"data: {json.dumps({'type': 'token', 'content': char})}\n\n"
+        if delay_s > 0 and char in " \n":
+            await asyncio.sleep(delay_s / 2)
+
+    yield f"data: {json.dumps({'type': 'done', 'content': answer, 'tokens_used': len(answer.split())})}\n\n"
+
+
+def _user_content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "input_text":
+                parts.append(item.get("text", ""))
+        return " ".join(parts).strip()
+    return str(content) if content is not None else ""
+
+
+class ResponsesService:
+    """OpenAI Responses API with stored prompt + vector store search."""
+
+    def __init__(
+        self,
+        system_instruction: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ):
+        self.api_key = settings.openai_api_key
+        self.base_url = "https://api.openai.com/v1/responses"
+        vs_id = (settings.openai_vector_store_id or "").strip()
+        self.vector_store_id = vs_id
+        self.vs_search_url = (
+            f"https://api.openai.com/v1/vector_stores/{vs_id}/search" if vs_id else ""
+        )
+        self.model = settings.openai_responses_model
+        self.prompt_id = settings.openai_prompt_id
+        self.prompt_version = settings.openai_prompt_version
+        self.system_instruction = system_instruction
+        self.request_id = request_id or str(uuid.uuid4())[:8]
+
+    async def _search_vector_store(self, query: str, max_results: int = 5) -> List[Dict]:
+        if not self.vs_search_url:
+            return []
+
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.vs_search_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"query": query, "max_num_results": max_results},
+                timeout=30,
+            )
+            if response.status_code != 200:
+                logger.warning(
+                    "[%s] Vector store search failed: %s",
+                    self.request_id,
+                    response.status_code,
+                )
+                return []
+            return response.json().get("data", [])
+
+    def _build_context_message(self, results: List[Dict]) -> Optional[str]:
+        if not results:
+            return None
+
+        parts = [
+            "The following are relevant excerpts from the organization's knowledge base. "
+            "Use them as your primary source to answer the user's question. "
+            "Cite the source filename and relevance score where applicable.",
+        ]
+        for i, r in enumerate(results):
+            filename = r.get("filename", "unknown")
+            score = r.get("score", 0)
+            content_parts = r.get("content", [])
+            text = " ".join(
+                c.get("text", "") for c in content_parts if c.get("type") == "text"
+            )
+            if len(text) > 3000:
+                text = text[:3000] + "..."
+            parts.append(
+                f"\n--- Source {i + 1}: {filename} (relevance: {score:.2f}) ---\n{text}"
+            )
+        return "\n".join(parts)
+
+    async def _inject_context(
+        self, messages: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict]]:
+        last_user_msg = None
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_msg = _user_content_text(messages[i].get("content", ""))
+                last_user_idx = i
+                break
+
+        if not last_user_msg:
+            msgs = list(messages)
+            if self.system_instruction:
+                msgs.insert(0, {"role": "developer", "content": self.system_instruction})
+            return msgs, []
+
+        results = await self._search_vector_store(last_user_msg)
+
+        if not results:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "vector_search",
+                        "request_id": self.request_id,
+                        "query_preview": last_user_msg[:100],
+                        "num_results": 0,
+                        "vs_id": self.vector_store_id,
+                    }
+                )
+            )
+            msgs = list(messages)
+            if self.system_instruction:
+                msgs.insert(0, {"role": "developer", "content": self.system_instruction})
+            return msgs, []
+
+        context_text = self._build_context_message(results)
+        msgs = list(messages)
+        if last_user_idx >= 0 and context_text:
+            msgs.insert(last_user_idx, {"role": "developer", "content": context_text})
+
+        if self.system_instruction:
+            msgs.insert(0, {"role": "developer", "content": self.system_instruction})
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "vector_search",
+                    "request_id": self.request_id,
+                    "query_preview": last_user_msg[:100],
+                    "num_results": len(results),
+                    "filenames": [r.get("filename", "?") for r in results],
+                    "scores": [round(r.get("score", 0), 3) for r in results],
+                    "vs_id": self.vector_store_id,
+                    "context_injected": True,
+                }
+            )
+        )
+
+        return msgs, results
+
+    def _build_request(
+        self,
+        messages: List[Dict[str, Any]],
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "model": self.model,
+            "input": messages,
+            "stream": stream,
+            "reasoning": {"summary": "auto"},
+            "include": ["reasoning.encrypted_content", "web_search_call.action.sources"],
+        }
+        if self.prompt_id:
+            body["prompt"] = {
+                "id": self.prompt_id,
+                "version": self.prompt_version or "1",
+            }
+        return body
+
+    async def chat(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        import httpx
+
+        enriched_messages, search_results = await self._inject_context(messages)
+        body = self._build_request(enriched_messages, stream=False)
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "responses_request",
+                    "request_id": self.request_id,
+                    "prompt_id": self.prompt_id,
+                    "model": self.model,
+                    "vector_chunks_found": len(search_results),
+                }
+            )
+        )
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=120,
+            )
+            data = response.json()
+
+        if response.status_code != 200:
+            error_msg = data.get("error", {}).get("message", str(data))
+            logger.error(
+                json.dumps(
+                    {
+                        "event": "responses_error",
+                        "request_id": self.request_id,
+                        "status_code": response.status_code,
+                        "error": error_msg,
+                    }
+                )
+            )
+            return {
+                "content": f"Error: {error_msg}",
+                "role": "assistant",
+                "tokens_used": 0,
+                "error": error_msg,
+            }
+
+        result = self._parse_response(data)
+        logger.info(
+            json.dumps(
+                {
+                    "event": "responses_response",
+                    "request_id": self.request_id,
+                    "tokens_used": result.get("tokens_used"),
+                }
+            )
+        )
+        return result
+
+    async def chat_stream(
+        self, messages: List[Dict[str, Any]]
+    ) -> AsyncGenerator[str, None]:
+        import httpx
+        import time as _time
+
+        yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
+        t_search_start = _time.time()
+
+        enriched_messages, search_results = await self._inject_context(messages)
+
+        t_search_done = _time.time()
+        logger.info(
+            json.dumps(
+                {
+                    "event": "vector_search_timing",
+                    "request_id": self.request_id,
+                    "search_duration_ms": round((t_search_done - t_search_start) * 1000),
+                    "results": len(search_results),
+                }
+            )
+        )
+
+        filenames = [r.get("filename", "unknown") for r in search_results]
+        yield f"data: {json.dumps({'type': 'phase', 'phase': 'search_complete', 'sources': len(search_results), 'filenames': filenames})}\n\n"
+
+        body = self._build_request(enriched_messages, stream=True)
+        full_content = ""
+
+        logger.info(
+            json.dumps(
+                {
+                    "event": "responses_stream_request",
+                    "request_id": self.request_id,
+                    "prompt_id": self.prompt_id,
+                    "model": self.model,
+                    "vector_chunks_found": len(search_results),
+                }
+            )
+        )
+
+        t_openai_start = _time.time()
+
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                self.base_url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=300,
+            ) as response:
+                if response.status_code != 200:
+                    error_data = await response.aread()
+                    try:
+                        err = json.loads(error_data)
+                        msg = err.get("error", {}).get("message", str(error_data))
+                    except Exception:
+                        msg = str(error_data)
+                    logger.error(
+                        json.dumps(
+                            {
+                                "event": "responses_stream_error",
+                                "request_id": self.request_id,
+                                "status_code": response.status_code,
+                                "error": msg,
+                            }
+                        )
+                    )
+                    yield f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
+                    return
+
+                current_event = ""
+                async for line in response.aiter_lines():
+                    if line.startswith("event: "):
+                        current_event = line[7:]
+                    elif line.startswith("data: "):
+                        raw = line[6:]
+                        if current_event == "response.created":
+                            yield f"data: {json.dumps({'type': 'phase', 'phase': 'processing'})}\n\n"
+                        elif current_event == "response.in_progress":
+                            yield f"data: {json.dumps({'type': 'phase', 'phase': 'generating'})}\n\n"
+                        elif current_event == "response.reasoning_summary_part.added":
+                            yield f"data: {json.dumps({'type': 'reasoning_start'})}\n\n"
+                        elif current_event == "response.reasoning_summary_text.delta":
+                            try:
+                                payload = json.loads(raw)
+                                delta = payload.get("delta", "")
+                                if delta:
+                                    yield f"data: {json.dumps({'type': 'reasoning', 'content': delta})}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+                        elif current_event == "response.reasoning_summary_text.done":
+                            yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
+                        elif current_event == "response.output_item.added":
+                            yield f"data: {json.dumps({'type': 'output_start'})}\n\n"
+                        elif current_event == "response.output_text.delta":
+                            try:
+                                payload = json.loads(raw)
+                                delta = payload.get("delta", "")
+                                if delta:
+                                    full_content += delta
+                                    yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+                        elif current_event == "response.completed":
+                            try:
+                                payload = json.loads(raw)
+                                resp = payload.get("response", payload)
+                                usage = resp.get("usage", {})
+                                tokens = usage.get("total_tokens", 0)
+                                yield f"data: {json.dumps({'type': 'done', 'content': full_content, 'tokens_used': tokens})}\n\n"
+                            except json.JSONDecodeError:
+                                yield f"data: {json.dumps({'type': 'done', 'content': full_content, 'tokens_used': 0})}\n\n"
+                            return
+                        elif current_event == "response.error":
+                            try:
+                                payload = json.loads(raw)
+                                err_msg = payload.get("error", {}).get("message", str(payload))
+                            except Exception:
+                                err_msg = raw
+                            yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
+                            return
+
+    @staticmethod
+    def _parse_response(data: dict) -> dict:
+        content = ""
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for part in item.get("content", []):
+                    if part.get("type") == "output_text":
+                        content += part.get("text", "")
+
+        usage = data.get("usage", {})
+        return {
+            "content": content,
+            "role": "assistant",
+            "tokens_used": usage.get("total_tokens", 0),
+            "response_id": data.get("id"),
+        }

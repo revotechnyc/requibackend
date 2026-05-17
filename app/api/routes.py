@@ -1,0 +1,100 @@
+"""
+API Routes Registration — v2.1
+Requi Health platform endpoints
+"""
+
+from fastapi import APIRouter, Depends
+
+from app.api.endpoints import (
+    admin,
+    ai,
+    alerts,
+    auth,
+    billing,
+    blog,
+    integrations,
+    knowledge,
+    organizations,
+    permissions,
+    scoring,
+    sources,
+    tasks,
+    teams,
+    users,
+    viewers,
+)
+from app.api.endpoints.auth import get_current_active_user
+
+api_router = APIRouter()
+
+# Auth routes (no auth required)
+api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+
+# Protected routes — all require authentication
+auth_dep = [Depends(get_current_active_user)]
+
+api_router.include_router(
+    users.router, prefix="/users", tags=["users"], dependencies=auth_dep,
+)
+api_router.include_router(
+    organizations.router, prefix="/organizations", tags=["organizations"], dependencies=auth_dep,
+)
+api_router.include_router(
+    billing.router, prefix="/billing", tags=["billing"], dependencies=auth_dep,
+)
+api_router.include_router(
+    sources.router, prefix="/sources", tags=["sources"], dependencies=auth_dep,
+)
+api_router.include_router(
+    knowledge.router, prefix="/knowledge", tags=["knowledge"], dependencies=auth_dep,
+)
+api_router.include_router(
+    ai.router, prefix="/ai", tags=["ai"], dependencies=auth_dep,
+)
+api_router.include_router(
+    admin.router, prefix="/admin", tags=["admin"], dependencies=auth_dep,
+)
+
+# ==========================
+# v2.1 ENDPOINTS
+# ==========================
+
+# Alerts API — Compliance alerts (Zapier, email, in-app)
+api_router.include_router(
+    alerts.router, prefix="/alerts", tags=["v2.1 — Alerts"], dependencies=auth_dep,
+)
+
+# Tasks API — Full lifecycle with approval workflows
+api_router.include_router(
+    tasks.router, prefix="/tasks", tags=["v2.1 — Tasks"], dependencies=auth_dep,
+)
+
+# View-Only User Management API
+api_router.include_router(
+    viewers.router, prefix="/viewers", tags=["v2.1 — View-Only Users"], dependencies=auth_dep,
+)
+
+# Scoring Engine API — Compliance, Risk, Audit Readiness
+api_router.include_router(
+    scoring.router, prefix="/scoring", tags=["v2.1 — Scoring"], dependencies=auth_dep,
+)
+
+# Blog API — Content management for SEO team
+api_router.include_router(
+    blog.router, prefix="/blog", tags=["v2.1 — Blog"], dependencies=auth_dep,
+)
+
+# Integration Hub API — Microsoft, Google, Salesforce (placeholders)
+api_router.include_router(
+    integrations.router, prefix="/integrations", tags=["v2.1 — Integrations"], dependencies=auth_dep,
+)
+
+# Teams API — v2.1 role management
+api_router.include_router(
+    teams.router, prefix="/teams", tags=["v2.1 — Teams"], dependencies=auth_dep,
+)
+
+# Permissions API — Feature gating & role checks
+api_router.include_router(
+    permissions.router, prefix="/permissions", tags=["v2.1 — Permissions"], dependencies=auth_dep,
+)

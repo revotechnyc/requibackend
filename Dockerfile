@@ -1,0 +1,29 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DEFAULT_TIMEOUT=300 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# System deps for psycopg2 / asyncpg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (lean set — avoids multi-GB torch downloads)
+COPY requirements-docker.txt .
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir --default-timeout=300 -r requirements-docker.txt
+
+# Application code
+COPY app/ ./app/
+COPY alembic/ ./alembic/
+COPY alembic.ini .
+
+EXPOSE 8000
+
+# Tables created on startup via init_db() in app lifespan
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

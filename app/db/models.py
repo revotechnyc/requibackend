@@ -1,0 +1,682 @@
+"""
+Requi Health Database Models
+Multi-tenant SaaS with Stripe billing and knowledge management
+"""
+
+import uuid
+from datetime import datetime
+from enum import Enum as PyEnum
+from typing import List, Optional
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    Index,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    """Base class for all models"""
+    pass
+
+
+# Association tables
+organization_users = Table(
+    "organization_users",
+    Base.metadata,
+    Column("organization_id", UUID(as_uuid=True), ForeignKey("organizations.id"), primary_key=True),
+    Column("user_id", UUID(as_uuid=True), ForeignKey("users.id"), primary_key=True),
+    Column("role", String(50), nullable=False, default="viewer"),
+    Column("created_at", DateTime, default=datetime.utcnow),
+)
+
+
+class UserRole(str, PyEnum):
+    """User roles within organization (9-tier hierarchy + SEO)"""
+    ADMIN = "admin"
+    PRESIDENT = "president"
+    VICE_PRESIDENT = "vice_president"
+    DIRECTOR = "director"
+    MANAGER = "manager"
+    TEAM_LEAD = "team_lead"
+    SPECIALIST = "specialist"
+    ASSISTANT = "assistant"
+    VIEWER = "viewer"
+    SEO = "seo"
+
+
+class SubscriptionStatus(str, PyEnum):
+    """Stripe subscription statuses"""
+    ACTIVE = "active"
+    CANCELED = "canceled"
+    INCOMPLETE = "incomplete"
+    INCOMPLETE_EXPIRED = "incomplete_expired"
+    PAST_DUE = "past_due"
+    PAUSED = "paused"
+    TRIALING = "trialing"
+    UNPAID = "unpaid"
+
+
+class PlanType(str, PyEnum):
+    """Pricing plan types"""
+    STANDARD = "standard"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+
+
+class KnowledgeStatus(str, PyEnum):
+    """Knowledge record status"""
+    DRAFT = "draft"
+    PENDING_REVIEW = "pending_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    STALE = "stale"
+    ARCHIVED = "archived"
+
+
+class GapTaskStatus(str, PyEnum):
+    """Gap detection task status"""
+    DETECTED = "detected"
+    IN_PROGRESS = "in_progress"
+    RESOLVED = "resolved"
+    REJECTED = "rejected"
+
+
+class SourceType(str, PyEnum):
+    """Knowledge source types"""
+    REGULATION = "regulation"
+    GUIDANCE = "guidance"
+    POLICY = "policy"
+    ARTICLE = "article"
+    INTERNAL = "internal"
+
+
+# ============================================
+# USER & ORGANIZATION MODELS
+# ============================================
+
+class User(Base):
+    """User accounts"""
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    last_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_superuser: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # Stripe
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Relationships
+    owned_organizations: Mapped[List["Organization"]] = relationship(
+        "Organization", back_populates="owner", foreign_keys="Organization.owner_id"
+    )
+    memberships: Mapped[List["Organization"]] = relationship(
+        "Organization", secondary=organization_users, back_populates="members"
+    )
+    seats: Mapped[List["Seat"]] = relationship("Seat", back_populates="user")
+    audit_logs: Mapped[List["AuditLog"]] = relationship("AuditLog", back_populates="user")
+    blog_posts: Mapped[List["BlogPost"]] = relationship("BlogPost", back_populates="author")
+    
+    def __repr__(self) -> str:
+        return f"<User {self.email}>"
+
+
+class Organization(Base):
+    """Multi-tenant organizations"""
+    __tablename__ = "organizations"
+    
+    __table_args__ = (
+        Index('idx_org_slug', 'slug', unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Owner
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    # Settings
+    settings: Mapped[dict] = mapped_column(JSON, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    owner: Mapped["User"] = relationship("User", back_populates="owned_organizations", foreign_keys=[owner_id])
+    members: Mapped[List["User"]] = relationship("User", secondary=organization_users, back_populates="memberships")
+    subscription: Mapped[Optional["Subscription"]] = relationship("Subscription", back_populates="organization", uselist=False)
+    seats: Mapped[List["Seat"]] = relationship("Seat", back_populates="organization")
+    sources: Mapped[List["Source"]] = relationship("Source", back_populates="organization")
+    documents: Mapped[List["Document"]] = relationship("Document", back_populates="organization")
+    knowledge_records: Mapped[List["KnowledgeRecord"]] = relationship("KnowledgeRecord", back_populates="organization")
+    gap_tasks: Mapped[List["GapTask"]] = relationship("GapTask", back_populates="organization")
+    audit_logs: Mapped[List["AuditLog"]] = relationship("AuditLog", back_populates="organization")
+    blog_posts: Mapped[List["BlogPost"]] = relationship("BlogPost", back_populates="organization")
+    
+    def __repr__(self) -> str:
+        return f"<Organization {self.name}>"
+
+
+# ============================================
+# BILLING MODELS
+# ============================================
+
+class Subscription(Base):
+    """Stripe subscriptions"""
+    __tablename__ = "subscriptions"
+    
+    __table_args__ = (
+        Index('idx_sub_stripe_id', 'stripe_subscription_id', unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    # Organization
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), unique=True, nullable=False)
+    
+    # Plan
+    plan_type: Mapped[PlanType] = mapped_column(Enum(PlanType), nullable=False)
+    
+    # Stripe
+    stripe_subscription_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    stripe_price_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    stripe_customer_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    
+    # Status
+    status: Mapped[SubscriptionStatus] = mapped_column(Enum(SubscriptionStatus), nullable=False)
+    
+    # Seats
+    seat_quantity: Mapped[int] = mapped_column(Integer, default=1)
+    
+    # Billing cycle
+    current_period_start: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    current_period_end: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # Trial
+    trial_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    trial_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="subscription")
+    
+    def is_active(self) -> bool:
+        return self.status in [SubscriptionStatus.ACTIVE, SubscriptionStatus.TRIALING]
+    
+    def __repr__(self) -> str:
+        return f"<Subscription {self.stripe_subscription_id} {self.status}>"
+
+
+class Seat(Base):
+    """Seat assignments for billing"""
+    __tablename__ = "seats"
+    
+    __table_args__ = (
+        UniqueConstraint('organization_id', 'user_id', name='uq_org_user_seat'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    # Role
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.VIEWER)
+    
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="seats")
+    user: Mapped["User"] = relationship("User", back_populates="seats")
+    
+    def __repr__(self) -> str:
+        return f"<Seat {self.organization_id}:{self.user_id}>"
+
+
+# ============================================
+# KNOWLEDGE SOURCE MODELS
+# ============================================
+
+class Source(Base):
+    """Approved knowledge sources"""
+    __tablename__ = "sources"
+    
+    __table_args__ = (
+        Index('idx_source_org_url', 'organization_id', 'url', unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    
+    # Source info
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    url: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_type: Mapped[SourceType] = mapped_column(Enum(SourceType), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Authority
+    authority_score: Mapped[float] = mapped_column(Numeric(3, 2), default=1.0)  # 0.0 - 1.0
+    is_official: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # Ingestion settings
+    ingest_frequency: Mapped[str] = mapped_column(String(50), default="daily")  # daily, weekly, manual
+    last_ingested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="sources")
+    documents: Mapped[List["Document"]] = relationship("Document", back_populates="source")
+    
+    def __repr__(self) -> str:
+        return f"<Source {self.name}>"
+
+
+class Document(Base):
+    """Ingested documents"""
+    __tablename__ = "documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    source_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id"), nullable=True)
+    
+    # Document info
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)  # SHA-256
+    
+    # Content (stored or referenced)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    storage_path: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    
+    # Metadata
+    document_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    
+    # Versioning
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    
+    # Status
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="documents")
+    source: Mapped[Optional["Source"]] = relationship("Source", back_populates="documents")
+    chunks: Mapped[List["DocumentChunk"]] = relationship("DocumentChunk", back_populates="document")
+    
+    def __repr__(self) -> str:
+        return f"<Document {self.title}>"
+
+
+class DocumentChunk(Base):
+    """Document chunks with embeddings"""
+    __tablename__ = "document_chunks"
+    
+    __table_args__ = (
+        Index('idx_chunk_doc', 'document_id'),
+        Index('idx_chunk_embedding', 'embedding', postgresql_using='ivfflat'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False)
+    
+    # Chunk content
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    # Embedding (pgvector)
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)
+    
+    # Metadata
+    chunk_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    document: Mapped["Document"] = relationship("Document", back_populates="chunks")
+    
+    def __repr__(self) -> str:
+        return f"<DocumentChunk {self.document_id}:{self.chunk_index}>"
+
+
+# ============================================
+# KNOWLEDGE RECORD MODELS
+# ============================================
+
+class KnowledgeRecord(Base):
+    """Canonical knowledge records"""
+    __tablename__ = "knowledge_records"
+    
+    __table_args__ = (
+        Index('idx_knowledge_org_status', 'organization_id', 'status'),
+        Index('idx_knowledge_topic', 'topic'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    
+    # Knowledge content
+    topic: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    # Quality scores
+    confidence_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    relevance_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    recency_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    trust_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    
+    # Status
+    status: Mapped[KnowledgeStatus] = mapped_column(Enum(KnowledgeStatus), default=KnowledgeStatus.DRAFT)
+    
+    # Versioning
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    previous_version_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_records.id"), nullable=True)
+    
+    # Review
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    review_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Staleness tracking
+    last_validated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="knowledge_records")
+    citations: Mapped[List["Citation"]] = relationship("Citation", back_populates="knowledge_record")
+    
+    def __repr__(self) -> str:
+        return f"<KnowledgeRecord {self.topic}>"
+
+
+class Citation(Base):
+    """Citations linking knowledge to source chunks"""
+    __tablename__ = "citations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    knowledge_record_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_records.id"), nullable=False)
+    document_chunk_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("document_chunks.id"), nullable=False)
+    
+    # Citation info
+    relevance_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    excerpt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    knowledge_record: Mapped["KnowledgeRecord"] = relationship("KnowledgeRecord", back_populates="citations")
+    document_chunk: Mapped["DocumentChunk"] = relationship("DocumentChunk")
+    
+    def __repr__(self) -> str:
+        return f"<Citation {self.knowledge_record_id}:{self.document_chunk_id}>"
+
+
+# ============================================
+# GAP DETECTION MODELS
+# ============================================
+
+class GapTask(Base):
+    """Knowledge gap detection and resolution tasks"""
+    __tablename__ = "gap_tasks"
+    
+    __table_args__ = (
+        Index('idx_gap_org_status', 'organization_id', 'status'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    
+    # Original query that triggered gap
+    original_query: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    # Gap analysis
+    gap_description: Mapped[str] = mapped_column(Text, nullable=False)
+    confidence_score: Mapped[float] = mapped_column(Numeric(3, 2), default=0.0)
+    
+    # Status
+    status: Mapped[GapTaskStatus] = mapped_column(Enum(GapTaskStatus), default=GapTaskStatus.DETECTED)
+    
+    # Resolution
+    proposed_knowledge_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("knowledge_records.id"), nullable=True)
+    resolved_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="gap_tasks")
+    proposed_knowledge: Mapped[Optional["KnowledgeRecord"]] = relationship("KnowledgeRecord")
+    
+    def __repr__(self) -> str:
+        return f"<GapTask {self.status}>"
+
+
+# ============================================
+# AUDIT LOG MODELS
+# ============================================
+
+class AuditLog(Base):
+    """Compliance audit logs"""
+    __tablename__ = "audit_logs"
+    
+    __table_args__ = (
+        Index('idx_audit_org_time', 'organization_id', 'created_at'),
+        Index('idx_audit_action', 'action'),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    
+    # Action details
+    action: Mapped[str] = mapped_column(String(100), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(100), nullable=False)  # knowledge, source, user, etc.
+    resource_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    
+    # Data
+    previous_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    new_state: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    
+    # Context
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="audit_logs")
+    user: Mapped[Optional["User"]] = relationship("User", back_populates="audit_logs")
+    
+    def __repr__(self) -> str:
+        return f"<AuditLog {self.action}:{self.resource_type}>"
+
+
+# ============================================
+# USAGE TRACKING (trial daily AI prompt limits)
+# ============================================
+
+class UsageRecord(Base):
+    """Daily AI prompt usage per user (trial rate limiting)."""
+    __tablename__ = "usage_records"
+
+    __table_args__ = (
+        Index("idx_usage_user_date", "user_id", "date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    date: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    prompt_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    user: Mapped["User"] = relationship("User")
+
+    def __repr__(self) -> str:
+        return f"<UsageRecord {self.user_id} {self.date.date()} prompts={self.prompt_count}>"
+
+
+# ============================================
+# CONVERSATION MODELS (for AI Q&A)
+# ============================================
+
+class Conversation(Base):
+    """User conversations with AI"""
+    __tablename__ = "conversations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    # Conversation info
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    messages: Mapped[List["Message"]] = relationship("Message", back_populates="conversation", order_by="Message.created_at")
+
+
+class Message(Base):
+    """Individual messages in conversations"""
+    __tablename__ = "messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    conversation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False)
+    
+    # Message content
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user, assistant, system
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    # AI response metadata
+    citations: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(3, 2), nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Relationships
+    conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
+
+
+# ============================================
+# BLOG MODELS
+# ============================================
+
+class BlogPostStatus(str, PyEnum):
+    """Blog post publication status"""
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
+
+
+class BlogPost(Base):
+    """Blog posts for SEO team and content management"""
+    __tablename__ = "blog_posts"
+    
+    __table_args__ = (
+        Index('idx_blog_org_status', 'organization_id', 'status'),
+        Index('idx_blog_slug', 'slug', unique=True),
+        Index('idx_blog_author', 'author_id'),
+    )
+    
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    
+    organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
+    author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    
+    # Content
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    excerpt: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    
+    # SEO
+    meta_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    meta_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    
+    # Status
+    status: Mapped[BlogPostStatus] = mapped_column(Enum(BlogPostStatus), default=BlogPostStatus.DRAFT)
+    
+    # Metrics
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    read_time_minutes: Mapped[int] = mapped_column(Integer, default=5)
+    
+    # Publishing
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    
+    # Timestamps
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    organization: Mapped["Organization"] = relationship("Organization", back_populates="blog_posts")
+    author: Mapped["User"] = relationship("User", back_populates="blog_posts")
+    
+    def __repr__(self) -> str:
+        return f"<BlogPost {self.slug} {self.status}>"

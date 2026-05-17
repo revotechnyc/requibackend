@@ -1,0 +1,109 @@
+# ============================================
+# Requi Health Backend — Python / FastAPI
+# ============================================
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment & secrets (keep templates)
+.env
+.env.*
+!.env.example
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers & linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# Logs
+*.log
+logs/
+
+# Local document storage (when DOCUMENT_STORAGE_TYPE=local)
+uploads/
+documents/
+storage/
+
+# Database (local dev only)
+*.db
+*.sqlite3
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pyenv / direnv
+.python-version
+.direnv/
+
+# IDE & editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Docker (local overrides only; keep compose files tracked)
+docker-compose.override.yml
+.docker/
+
+# Flower / misc local state
+.flower/
