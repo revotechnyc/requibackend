@@ -62,7 +62,7 @@ def _normalize_origin(origin: str) -> str:
 
 
 def _cors_allow_origins() -> list[str]:
-    """Dev: localhost + CORS_ORIGINS. Production: CORS_ORIGINS only (set in server .env)."""
+    """Dev: localhost + CORS_ORIGINS. Production: CORS_ORIGINS only (unless allow-all)."""
     combined: list[str] = list(_dev_cors_origins) if settings.is_development else []
     combined.extend(settings.cors_origins_list)
     seen: set[str] = set()
@@ -75,13 +75,29 @@ def _cors_allow_origins() -> list[str]:
     return result
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_allow_origins(),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Any http(s) frontend origin (credentials + Authorization header both work)
+_CORS_ALLOW_ALL_REGEX = r"https?://.*"
+
+if settings.cors_allow_all_enabled:
+    print("[CORS] Allowing all origins (CORS_ALLOW_ALL=true or CORS_ORIGINS=*)")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=_CORS_ALLOW_ALL_REGEX,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    _origins = _cors_allow_origins()
+    if settings.is_production and not _origins:
+        print("[CORS] Warning: no CORS_ORIGINS in production — browsers may block cross-origin calls")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 

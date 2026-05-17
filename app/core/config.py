@@ -149,19 +149,27 @@ class Settings(BaseSettings):
     trial_days: int = 7  # Free trial duration
     trial_prompt_limit: int = 3  # AI prompts allowed on trial
 
-    # CORS — comma-separated browser origins (used when APP_ENV=production)
-    # Example: http://52.62.222.6,https://app.example.com
+    # CORS — comma-separated origins, or set CORS_ORIGINS=* / CORS_ALLOW_ALL=true for any frontend
     cors_origins: str = ""
+    cors_allow_all: bool = False
 
     @property
     def cors_origins_list(self) -> list[str]:
-        if not self.cors_origins.strip():
+        raw = self.cors_origins.strip()
+        if not raw or raw == "*":
             return []
         return [
             origin.strip().rstrip("/")
-            for origin in self.cors_origins.split(",")
-            if origin.strip()
+            for origin in raw.split(",")
+            if origin.strip() and origin.strip() != "*"
         ]
+
+    @property
+    def cors_allow_all_enabled(self) -> bool:
+        """True when any browser origin may call the API (server .env: CORS_ALLOW_ALL=true)."""
+        if self.cors_allow_all:
+            return True
+        return self.cors_origins.strip() == "*"
 
     @property
     def is_production(self) -> bool:
