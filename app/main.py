@@ -48,22 +48,31 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: dev localhost origins; production from CORS_ORIGINS in .env
+# Local Vite dev servers only (_dev_cors_origins is NOT used on EC2 when APP_ENV=production)
 _dev_cors_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://52.62.222.6:8000",
-    "https://52.62.222.6/",
-    "http://52.62.222.6/"
 ]
 
 
+def _normalize_origin(origin: str) -> str:
+    return origin.strip().rstrip("/")
+
+
 def _cors_allow_origins() -> list[str]:
-    if settings.is_development:
-        return _dev_cors_origins
-    return settings.cors_origins_list
+    """Dev: localhost + CORS_ORIGINS. Production: CORS_ORIGINS only (set in server .env)."""
+    combined: list[str] = list(_dev_cors_origins) if settings.is_development else []
+    combined.extend(settings.cors_origins_list)
+    seen: set[str] = set()
+    result: list[str] = []
+    for origin in combined:
+        normalized = _normalize_origin(origin)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
 
 
 app.add_middleware(

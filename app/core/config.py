@@ -148,7 +148,21 @@ class Settings(BaseSettings):
     # Trial Configuration
     trial_days: int = 7  # Free trial duration
     trial_prompt_limit: int = 3  # AI prompts allowed on trial
-    
+
+    # CORS — comma-separated browser origins (used when APP_ENV=production)
+    # Example: http://52.62.222.6,https://app.example.com
+    cors_origins: str = ""
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        if not self.cors_origins.strip():
+            return []
+        return [
+            origin.strip().rstrip("/")
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
