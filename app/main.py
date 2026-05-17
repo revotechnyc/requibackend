@@ -48,16 +48,27 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add middleware — explicit origins in dev (wildcard + credentials breaks browsers)
+# CORS: dev localhost origins; production from CORS_ORIGINS in .env
 _dev_cors_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://52.62.222.6:8000",
+    "https://52.62.222.6/",
+    "http://52.62.222.6/"
 ]
+
+
+def _cors_allow_origins() -> list[str]:
+    if settings.is_development:
+        return _dev_cors_origins
+    return settings.cors_origins_list
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_dev_cors_origins if settings.is_development else [],
+    allow_origins=_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
