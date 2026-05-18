@@ -4,9 +4,10 @@ Requi Health API - Main application
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.routes import api_router
 from app.core.config import settings
@@ -100,6 +101,24 @@ else:
     )
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Return error detail in development to simplify debugging."""
+    if settings.debug:
+        import traceback
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": str(exc),
+                "type": type(exc).__name__,
+                "traceback": traceback.format_exc().splitlines()[-8:],
+            },
+        )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
 
 # Include API routes
 app.include_router(api_router, prefix=settings.api_v1_prefix)

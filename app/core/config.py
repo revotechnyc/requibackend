@@ -133,6 +133,7 @@ class Settings(BaseSettings):
     
     # Document Storage
     document_storage_type: str = "local"  # local, s3
+    document_upload_dir: str = "data/document_uploads"
     s3_bucket_name: Optional[str] = None
     s3_region: str = "us-east-1"
     aws_access_key_id: Optional[str] = None

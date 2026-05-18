@@ -12,6 +12,9 @@ env/
 .env.*
 !.env.example
 
+# Uploaded document binaries (local storage)
+data/document_uploads/
+
 # Python bytecode & caches
 __pycache__/
 *.py[cod]
