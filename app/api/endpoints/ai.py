@@ -2,6 +2,7 @@
 AI Q&A endpoints
 """
 
+import asyncio
 import json
 import logging
 import time as time_module
@@ -424,6 +425,7 @@ async def chat_stream(
 
         yield f"data: {json.dumps({'type': 'start', 'conversation_id': conv_id})}\n\n"
         yield f"data: {json.dumps({'type': 'phase', 'phase': 'initializing'})}\n\n"
+        yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
 
         t_prep_start = time_module.time()
         messages = []
@@ -502,6 +504,7 @@ async def chat_stream(
         async for sse_event in stream_iter:
             if await fastapi_request.is_disconnected():
                 break
+            await asyncio.sleep(0)
             try:
                 data = json.loads(sse_event.replace("data: ", "").strip())
                 if data.get("type") == "done":
@@ -555,10 +558,12 @@ async def chat_stream(
 
     return StreamingResponse(
         generate(),
-        media_type="text/event-stream",
+        media_type="text/event-stream; charset=utf-8",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-store, no-transform",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Content-Encoding": "identity",
         },
     )
 

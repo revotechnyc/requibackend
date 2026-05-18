@@ -22,35 +22,29 @@ SONIA_SYSTEM_INSTRUCTION = (
 
 async def mock_chat_stream_for_testing(
     user_message: str,
-    delay_ms: int = 50,
+    delay_ms: int = 0,
 ) -> AsyncGenerator[str, None]:
-    """
-    Simulated Intelligence SSE for local/QA testing (MOCK_CHAT_STREAM=true).
-    Emits the same event types as live OpenAI streaming: phase, reasoning, token, done.
-    """
+    """Simulated SSE for MOCK_CHAT_STREAM=true. No sleeps unless delay_ms > 0."""
     delay_s = max(0, delay_ms) / 1000.0
 
-    async def pause(multiplier: float = 1.0) -> None:
+    async def pause() -> None:
         if delay_s > 0:
-            await asyncio.sleep(delay_s * multiplier)
+            await asyncio.sleep(delay_s)
 
     preview = (user_message or "").strip()[:200] or "(empty message)"
 
-    await pause()
     yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
-    await pause()
     yield f"data: {json.dumps({'type': 'phase', 'phase': 'search_complete', 'sources': 2, 'filenames': ['HIPAA_Security_Rule.pdf', 'FWA_Policy.docx']})}\n\n"
-    await pause()
 
     reasoning = (
         "Scanning the knowledge base for HIPAA administrative safeguards, "
         "workforce training requirements, and audit documentation…"
     )
+    yield f"data: {json.dumps({'type': 'reasoning_start'})}\n\n"
     for chunk in reasoning.split(" "):
         yield f"data: {json.dumps({'type': 'reasoning', 'content': chunk + ' '})}\n\n"
-        await pause(0.5)
+        await pause()
     yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
-    await pause()
 
     answer = (
         f"**[Test stream]** Response to your question:\n\n"
@@ -59,15 +53,56 @@ async def mock_chat_stream_for_testing(
         "1. **Security management** — risk analysis and risk management policies.\n"
         "2. **Workforce security** — authorization, supervision, and termination procedures.\n"
         "3. **Training** — security awareness for all workforce members.\n\n"
-        "_This is a mock stream for UI testing. Set `MOCK_CHAT_STREAM=false` in backend `.env` for live OpenAI answers._"
+        "_Mock stream. Set MOCK_CHAT_STREAM=false for live OpenAI._"
     )
 
-    for char in answer:
-        yield f"data: {json.dumps({'type': 'token', 'content': char})}\n\n"
-        if delay_s > 0 and char in " \n":
-            await asyncio.sleep(delay_s / 2)
+    chunk_size = 32
+    for i in range(0, len(answer), chunk_size):
+        piece = answer[i : i + chunk_size]
+        yield f"data: {json.dumps({'type': 'token', 'content': piece})}\n\n"
+        await pause()
 
     yield f"data: {json.dumps({'type': 'done', 'content': answer, 'tokens_used': len(answer.split())})}\n\n"
+
+
+def _sse_delta(payload: dict) -> str:
+    """Extract text delta from OpenAI stream JSON payloads."""
+    for key in ("delta", "text", "content"):
+        val = payload.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def _extract_output_text_from_response(payload: dict) -> str:
+    resp = payload.get("response", payload)
+    parts: List[str] = []
+    for item in resp.get("output", []):
+        if item.get("type") == "message":
+            for part in item.get("content", []):
+                if part.get("type") == "output_text":
+                    parts.append(part.get("text", ""))
+    return "".join(parts)
+
+
+async def _sse_event(event: dict) -> str:
+    """Let the event loop flush each chunk to the client (avoid one TCP dump)."""
+    await asyncio.sleep(0)
+    return f"data: {json.dumps(event)}\n\n"
+
+
+async def _stream_answer_chunks(
+    text: str,
+    chunk_size: int = 28,
+    pace_ms: int = 12,
+) -> AsyncGenerator[str, None]:
+    """Emit token SSE when OpenAI only returns full text on completed."""
+    pace_s = max(0, pace_ms) / 1000.0
+    for i in range(0, len(text), chunk_size):
+        piece = text[i : i + chunk_size]
+        yield await _sse_event({"type": "token", "content": piece})
+        if pace_s > 0:
+            await asyncio.sleep(pace_s)
 
 
 def _user_content_text(content: Any) -> str:
@@ -298,7 +333,7 @@ class ResponsesService:
         import httpx
         import time as _time
 
-        yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
+        yield await _sse_event({"type": "phase", "phase": "searching"})
         t_search_start = _time.time()
 
         enriched_messages, search_results = await self._inject_context(messages)
@@ -316,7 +351,14 @@ class ResponsesService:
         )
 
         filenames = [r.get("filename", "unknown") for r in search_results]
-        yield f"data: {json.dumps({'type': 'phase', 'phase': 'search_complete', 'sources': len(search_results), 'filenames': filenames})}\n\n"
+        yield await _sse_event(
+            {
+                "type": "phase",
+                "phase": "search_complete",
+                "sources": len(search_results),
+                "filenames": filenames,
+            }
+        )
 
         body = self._build_request(enriched_messages, stream=True)
         full_content = ""
@@ -363,40 +405,61 @@ class ResponsesService:
                             }
                         )
                     )
-                    yield f"data: {json.dumps({'type': 'error', 'error': msg})}\n\n"
+                    yield await _sse_event({"type": "error", "error": msg})
                     return
 
                 current_event = ""
+                token_events_emitted = 0
                 async for line in response.aiter_lines():
                     if line.startswith("event: "):
-                        current_event = line[7:]
+                        current_event = line[7:].strip()
                     elif line.startswith("data: "):
                         raw = line[6:]
+                        if raw.strip() == "[DONE]":
+                            continue
                         if current_event == "response.created":
-                            yield f"data: {json.dumps({'type': 'phase', 'phase': 'processing'})}\n\n"
+                            yield await _sse_event({"type": "phase", "phase": "processing"})
                         elif current_event == "response.in_progress":
-                            yield f"data: {json.dumps({'type': 'phase', 'phase': 'generating'})}\n\n"
-                        elif current_event == "response.reasoning_summary_part.added":
-                            yield f"data: {json.dumps({'type': 'reasoning_start'})}\n\n"
-                        elif current_event == "response.reasoning_summary_text.delta":
+                            yield await _sse_event({"type": "phase", "phase": "generating"})
+                        elif current_event in (
+                            "response.reasoning_summary_part.added",
+                            "response.reasoning_part.added",
+                        ):
+                            yield await _sse_event({"type": "reasoning_start"})
+                        elif current_event in (
+                            "response.reasoning_summary_text.delta",
+                            "response.reasoning_text.delta",
+                        ):
                             try:
                                 payload = json.loads(raw)
-                                delta = payload.get("delta", "")
+                                delta = _sse_delta(payload)
                                 if delta:
-                                    yield f"data: {json.dumps({'type': 'reasoning', 'content': delta})}\n\n"
+                                    yield await _sse_event(
+                                        {"type": "reasoning", "content": delta}
+                                    )
                             except json.JSONDecodeError:
                                 pass
-                        elif current_event == "response.reasoning_summary_text.done":
-                            yield f"data: {json.dumps({'type': 'reasoning_done'})}\n\n"
+                        elif current_event in (
+                            "response.reasoning_summary_text.done",
+                            "response.reasoning_text.done",
+                        ):
+                            yield await _sse_event({"type": "reasoning_done"})
                         elif current_event == "response.output_item.added":
-                            yield f"data: {json.dumps({'type': 'output_start'})}\n\n"
-                        elif current_event == "response.output_text.delta":
+                            yield await _sse_event({"type": "output_start"})
+                        elif current_event in (
+                            "response.output_text.delta",
+                            "response.content_part.delta",
+                            "response.text.delta",
+                        ):
                             try:
                                 payload = json.loads(raw)
-                                delta = payload.get("delta", "")
+                                delta = _sse_delta(payload)
                                 if delta:
                                     full_content += delta
-                                    yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+                                    token_events_emitted += 1
+                                    yield await _sse_event(
+                                        {"type": "token", "content": delta}
+                                    )
                             except json.JSONDecodeError:
                                 pass
                         elif current_event == "response.completed":
@@ -405,9 +468,29 @@ class ResponsesService:
                                 resp = payload.get("response", payload)
                                 usage = resp.get("usage", {})
                                 tokens = usage.get("total_tokens", 0)
-                                yield f"data: {json.dumps({'type': 'done', 'content': full_content, 'tokens_used': tokens})}\n\n"
+                                if not full_content:
+                                    full_content = _extract_output_text_from_response(payload)
+                                if full_content and token_events_emitted == 0:
+                                    async for chunk_evt in _stream_answer_chunks(
+                                        full_content
+                                    ):
+                                        yield chunk_evt
+                                        token_events_emitted += 1
+                                yield await _sse_event(
+                                    {
+                                        "type": "done",
+                                        "content": full_content,
+                                        "tokens_used": tokens,
+                                    }
+                                )
                             except json.JSONDecodeError:
-                                yield f"data: {json.dumps({'type': 'done', 'content': full_content, 'tokens_used': 0})}\n\n"
+                                yield await _sse_event(
+                                    {
+                                        "type": "done",
+                                        "content": full_content,
+                                        "tokens_used": 0,
+                                    }
+                                )
                             return
                         elif current_event == "response.error":
                             try:
@@ -415,8 +498,26 @@ class ResponsesService:
                                 err_msg = payload.get("error", {}).get("message", str(payload))
                             except Exception:
                                 err_msg = raw
-                            yield f"data: {json.dumps({'type': 'error', 'error': err_msg})}\n\n"
+                            yield await _sse_event({"type": "error", "error": err_msg})
                             return
+                        elif current_event.endswith(".delta"):
+                            try:
+                                payload = json.loads(raw)
+                                delta = _sse_delta(payload)
+                                if not delta:
+                                    continue
+                                if "reasoning" in current_event:
+                                    yield await _sse_event(
+                                        {"type": "reasoning", "content": delta}
+                                    )
+                                else:
+                                    full_content += delta
+                                    token_events_emitted += 1
+                                    yield await _sse_event(
+                                        {"type": "token", "content": delta}
+                                    )
+                            except json.JSONDecodeError:
+                                pass
 
     @staticmethod
     def _parse_response(data: dict) -> dict:
