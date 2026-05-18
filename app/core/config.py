@@ -36,6 +36,18 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
 
+    # TLS (uvicorn) — off by default; enable on server with certbot certs
+    # Node equivalent: key: fs.readFileSync('.../privkey.pem'), cert: fs.readFileSync('.../fullchain.pem')
+    ssl_enabled: bool = False
+    ssl_certfile: Optional[str] = None  # fullchain.pem
+    ssl_keyfile: Optional[str] = None  # privkey.pem
+    ssl_port: int = 443
+
+    @property
+    def server_port(self) -> int:
+        """Listen port: SSL_PORT when TLS enabled, else PORT."""
+        return self.ssl_port if self.ssl_enabled else self.port
+
     # Database — full URL or components (components used when DATABASE_URL is unset)
     database_url: Optional[str] = Field(
         default=None,

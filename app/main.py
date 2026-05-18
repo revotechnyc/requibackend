@@ -177,9 +177,14 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
+
+    from app.core.ssl import uvicorn_ssl_kwargs
+
+    ssl_kwargs = uvicorn_ssl_kwargs()
     uvicorn.run(
         "app.main:app",
         host=settings.host,
-        port=settings.port,
-        reload=settings.is_development,
+        port=settings.server_port,
+        reload=settings.is_development and not ssl_kwargs,
+        **ssl_kwargs,
     )

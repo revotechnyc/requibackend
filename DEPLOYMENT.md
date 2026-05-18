@@ -74,6 +74,41 @@ celery -A app.tasks.celery_app beat --loglevel=info
 
 ## Production Deployment
 
+### HTTPS with certbot (optional — uvicorn TLS)
+
+This API is **FastAPI + uvicorn** (not Flask). To use the same Let's Encrypt files as a Node server:
+
+```bash
+# certbot (on the host)
+sudo certbot certonly --nginx -d requi.io -d www.requi.io
+```
+
+`.env` on the server:
+
+```bash
+SSL_ENABLED=true
+SSL_CERTFILE=/etc/letsencrypt/live/requi.io/fullchain.pem
+SSL_KEYFILE=/etc/letsencrypt/live/requi.io/privkey.pem
+SSL_PORT=443
+APP_ENV=production
+PORT=8000
+```
+
+Start with HTTPS:
+
+```bash
+python scripts/run_uvicorn.py
+# or: python -m app.main
+```
+
+Docker with certs mounted from the host:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ssl.yml up -d api
+```
+
+**Recommended for requi.io:** terminate SSL in **Apache or Nginx** on port 443 and proxy to the API on `http://127.0.0.1:8000` (`SSL_ENABLED=false`). That matches your frontend same-origin setup and avoids binding port 443 inside Docker.
+
 ### Docker Deployment
 
 ```bash

@@ -20,6 +20,7 @@ RUN pip install --upgrade pip setuptools wheel \
 
 # Application code
 COPY app/ ./app/
+COPY scripts/ ./scripts/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 
