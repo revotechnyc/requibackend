@@ -57,6 +57,14 @@ _dev_cors_origins = [
     "http://127.0.0.1:3000",
 ]
 
+# Frontend on :443 → API on :8000 is cross-origin; allow requi.io without extra .env
+_requi_frontend_origins = [
+    "https://requi.io",
+    "https://www.requi.io",
+    "http://requi.io",
+    "http://www.requi.io",
+]
+
 
 def _normalize_origin(origin: str) -> str:
     return origin.strip().rstrip("/")
@@ -65,6 +73,7 @@ def _normalize_origin(origin: str) -> str:
 def _cors_allow_origins() -> list[str]:
     """Dev: localhost + CORS_ORIGINS. Production: CORS_ORIGINS only (unless allow-all)."""
     combined: list[str] = list(_dev_cors_origins) if settings.is_development else []
+    combined.extend(_requi_frontend_origins)
     combined.extend(settings.cors_origins_list)
     seen: set[str] = set()
     result: list[str] = []
@@ -184,7 +193,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
         host=settings.host,
-        port=settings.server_port,
+        port=settings.port,
         reload=settings.is_development and not ssl_kwargs,
         **ssl_kwargs,
     )

@@ -27,4 +27,4 @@ COPY alembic.ini .
 EXPOSE 8000
 
 # Tables created on startup via init_db() in app lifespan
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "scripts/run_uvicorn.py"]

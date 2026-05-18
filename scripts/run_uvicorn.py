@@ -34,7 +34,7 @@ def main() -> None:
     uvicorn.run(
         "app.main:app",
         host=settings.host,
-        port=settings.server_port,
+        port=settings.port,
         workers=workers,
         reload=settings.is_development and not ssl_kwargs,
         **ssl_kwargs,
