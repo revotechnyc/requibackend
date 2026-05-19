@@ -4,6 +4,7 @@ Knowledge source management endpoints
 
 import hashlib
 import io
+import logging
 import uuid
 from typing import List, Optional
 
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.auth import get_current_active_user
+from app.core.config import settings
 from app.core.permissions import Feature, require_feature_dependency
 from app.db.database import get_db
 from app.db.models import Document, DocumentChunk, Organization, Source, SourceType, User
@@ -28,6 +30,7 @@ from app.services.retrieval import RetrievalService
 from app.tasks.ingestion import ingest_document_task, ingest_source_task
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 DOCUMENT_CATEGORIES = frozenset({
     "General",
@@ -154,38 +157,46 @@ async def _get_org_document(
     return document
 
 
-async def _queue_or_run_ingestion(db: AsyncSession, document: Document) -> str:
-    """Queue Celery ingestion or run inline if broker unavailable."""
+async def _run_document_ingestion_inline(db: AsyncSession, document: Document) -> str:
+    """Run chunking + embeddings in-process; updates document_metadata via RetrievalService."""
+    if not (document.content or "").strip():
+        document.document_metadata = {
+            **(document.document_metadata or {}),
+            "ingestion_status": "failed",
+            "ingestion_error": "No extractable text in file",
+        }
+        await db.commit()
+        return "failed"
     try:
-        ingest_document_task.delay(str(document.id))
-        return "processing"
-    except Exception:
-        if not (document.content or "").strip():
-            document.document_metadata = {
-                **(document.document_metadata or {}),
+        retrieval = RetrievalService()
+        chunks = await retrieval.ingest_document(db, document)
+        return "processed" if chunks else "failed"
+    except Exception as exc:
+        await db.rollback()
+        result = await db.execute(select(Document).where(Document.id == document.id))
+        doc = result.scalar_one_or_none()
+        if doc:
+            doc.document_metadata = {
+                **(doc.document_metadata or {}),
                 "ingestion_status": "failed",
-                "ingestion_error": "No extractable text in file",
+                "ingestion_error": str(exc)[:2000],
             }
             await db.commit()
-            return "failed"
+        return "failed"
+
+
+async def _queue_or_run_ingestion(db: AsyncSession, document: Document) -> str:
+    """Run ingestion inline by default; optionally queue Celery when DOCUMENT_INGEST_USE_ASYNC_WORKER=true."""
+    if settings.document_ingest_use_async_worker:
         try:
-            retrieval = RetrievalService()
-            chunks = await retrieval.ingest_document(db, document)
-            status_value = "processed" if chunks else "failed"
-            document.document_metadata = {
-                **(document.document_metadata or {}),
-                "ingestion_status": status_value,
-            }
-            await db.commit()
-            return status_value
-        except Exception as exc:
-            document.document_metadata = {
-                **(document.document_metadata or {}),
-                "ingestion_status": "failed",
-                "ingestion_error": str(exc),
-            }
-            await db.commit()
-            return "failed"
+            ingest_document_task.delay(str(document.id))
+            return "processing"
+        except Exception:
+            logger.warning(
+                "document_ingest_use_async_worker=true but Celery publish failed; ingesting inline",
+                exc_info=True,
+            )
+    return await _run_document_ingestion_inline(db, document)
 
 
 class SourceCreate(BaseModel):
@@ -324,8 +335,13 @@ async def upload_document_file(
     ingestion_status = await _queue_or_run_ingestion(db, document)
     await db.refresh(document)
 
+    chunk_count_result = await db.execute(
+        select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document.id)
+    )
+    chunk_total = int(chunk_count_result.scalar_one() or 0)
+
     return {
-        **_serialize_document(document, 0),
+        **_serialize_document(document, chunk_total),
         "status": ingestion_status,
         "message": "Document uploaded successfully",
     }

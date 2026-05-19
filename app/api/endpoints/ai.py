@@ -29,6 +29,7 @@ from app.services.responses_service import (
     mock_chat_stream_for_testing,
 )
 from app.services.usage import check_trial_usage_limit, get_trial_info, increment_usage_if_trialing
+from app.services.retrieval import RetrievalService
 
 router = APIRouter()
 ml_service = MLService()
@@ -350,10 +351,31 @@ async def delete_conversation(
 # RESPONSES API — Streaming Intelligence Chat
 # ==========================
 
+def _uuid_list(raw: Optional[List[str]]) -> List[uuid.UUID]:
+    out: List[uuid.UUID] = []
+    if not raw:
+        return out
+    for s in raw:
+        if not s or not isinstance(s, str):
+            continue
+        try:
+            out.append(uuid.UUID(s.strip()))
+        except (ValueError, AttributeError):
+            continue
+    return out
+
+
 class ChatStreamRequest(BaseModel):
     message: str
     conversation_id: Optional[str] = None
+    """Legacy: same as internal_document_ids when split fields are omitted."""
     document_ids: Optional[List[str]] = None
+    """Files uploaded / attached for this chat turn (analyzeAttachedFiles)."""
+    attachment_document_ids: Optional[List[str]] = None
+    """Explicit picks from the org document library (indexed uploads)."""
+    internal_document_ids: Optional[List[str]] = None
+    """When true, run hybrid retrieval over indexed chunks (searchInternalDocuments)."""
+    search_internal_documents: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -425,6 +447,34 @@ async def chat_stream(
 
         yield f"data: {json.dumps({'type': 'start', 'conversation_id': conv_id})}\n\n"
         yield f"data: {json.dumps({'type': 'phase', 'phase': 'initializing'})}\n\n"
+
+        attachment_uuids = _uuid_list(request.attachment_document_ids)
+        internal_explicit_uuids = _uuid_list(request.internal_document_ids)
+        legacy_uuids = _uuid_list(request.document_ids)
+
+        # Backward compatibility: old clients send only document_ids → treat as internal library picks.
+        if legacy_uuids and not attachment_uuids and not internal_explicit_uuids and not request.search_internal_documents:
+            internal_pick_uuids = legacy_uuids
+        elif legacy_uuids:
+            merged: List[uuid.UUID] = []
+            seen_m: set = set()
+            for u in internal_explicit_uuids + legacy_uuids:
+                if u not in seen_m:
+                    seen_m.add(u)
+                    merged.append(u)
+            internal_pick_uuids = merged
+        else:
+            internal_pick_uuids = internal_explicit_uuids
+
+        att_set = set(attachment_uuids)
+        internal_pick_uuids = [u for u in internal_pick_uuids if u not in att_set]
+
+        if attachment_uuids:
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 'loading_attachments'})}\n\n"
+        if internal_pick_uuids:
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 'loading_library_documents'})}\n\n"
+        if request.search_internal_documents:
+            yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching_internal_documents'})}\n\n"
         yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
 
         t_prep_start = time_module.time()
@@ -441,24 +491,67 @@ async def chat_stream(
         except Exception:
             messages = []
 
-        file_refs = []
-        attached_doc_names = []
-        if request.document_ids:
-            doc_result = await db.execute(
-                select(Document).where(
-                    Document.id.in_(request.document_ids),
-                    Document.organization_id == seat.organization_id,
+        file_refs: List[dict] = []
+
+        if attachment_uuids or internal_pick_uuids:
+            all_load_ids = list(dict.fromkeys([*attachment_uuids, *internal_pick_uuids]))
+            if all_load_ids:
+                doc_result = await db.execute(
+                    select(Document).where(
+                        Document.id.in_(all_load_ids),
+                        Document.organization_id == seat.organization_id,
+                    )
                 )
-            )
-            for d in doc_result.scalars().all():
-                attached_doc_names.append(d.title)
-                if d.content:
+                by_id = {d.id: d for d in doc_result.scalars().all()}
+
+                for uid in attachment_uuids:
+                    d = by_id.get(uid)
+                    if d and d.content:
+                        file_refs.append(
+                            {
+                                "type": "input_text",
+                                "text": f"--- Attached to this chat: {d.title} ---\n{d.content[:5000]}",
+                            }
+                        )
+
+                for uid in internal_pick_uuids:
+                    d = by_id.get(uid)
+                    if d and d.content:
+                        file_refs.append(
+                            {
+                                "type": "input_text",
+                                "text": f"--- Internal library document: {d.title} ---\n{d.content[:5000]}",
+                            }
+                        )
+
+        if request.search_internal_documents and request.message.strip():
+            try:
+                retrieval = RetrievalService()
+                context_str, _citations = await retrieval.get_context_for_query(
+                    db,
+                    seat.organization_id,
+                    request.message.strip(),
+                    max_chunks=5,
+                )
+                if context_str:
+                    cap = 12000
+                    trimmed = context_str if len(context_str) <= cap else context_str[:cap] + "\n…(truncated)"
                     file_refs.append(
                         {
                             "type": "input_text",
-                            "text": f"--- Document: {d.title} ---\n{d.content[:5000]}",
+                            "text": f"--- Relevant excerpts from indexed company documents (knowledge base search) ---\n{trimmed}",
                         }
                     )
+            except Exception as kb_exc:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "event": "chat_stream_kb_search_failed",
+                            "request_id": req_id,
+                            "error": str(kb_exc),
+                        }
+                    )
+                )
 
         if file_refs:
             user_content = [{"type": "input_text", "text": request.message}] + file_refs

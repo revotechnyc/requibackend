@@ -96,11 +96,21 @@ class RetrievalService:
         )
         for chunk in existing.scalars():
             await db.delete(chunk)
-        await db.commit()
-        
+        await db.flush()
+
         # Create chunks
         chunks_data = self.chunking_service.chunk_document(document)
-        
+        if not chunks_data:
+            meta = dict(document.document_metadata or {})
+            meta["ingestion_status"] = "failed"
+            meta["ingestion_error"] = (
+                meta.get("ingestion_error")
+                or "No text chunks produced (empty file, scan-only PDF, or unreadable content)"
+            )
+            document.document_metadata = meta
+            await db.commit()
+            return []
+
         # Get embeddings
         texts = [chunk["content"] for chunk in chunks_data]
         embeddings = await self.embedding_service.get_embeddings_batch(texts)
@@ -123,11 +133,16 @@ class RetrievalService:
             (document.content or "").encode()
         ).hexdigest()
         document.version += 1
-        
+
+        meta = dict(document.document_metadata or {})
+        meta["ingestion_status"] = "processed"
+        meta.pop("ingestion_error", None)
+        document.document_metadata = meta
+
         await db.commit()
         for chunk in chunk_records:
             await db.refresh(chunk)
-        
+
         return chunk_records
     
     async def semantic_search(

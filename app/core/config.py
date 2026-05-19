@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
     celery_worker_concurrency: int = 4
+    # When True, document uploads queue `ingest_document_task` (requires a Celery worker).
+    # Default False = ingest in the API request (avoids stuck "Indexing…" if no worker consumes the queue).
+    document_ingest_use_async_worker: bool = False
     
     # Authentication
     jwt_secret_key: str = Field(..., description="Secret key for JWT tokens")
@@ -179,6 +182,18 @@ class Settings(BaseSettings):
     @property
     def is_development(self) -> bool:
         return self.app_env == "development"
+
+    @model_validator(mode="after")
+    def _legacy_document_ingest_sync_env(self) -> "Settings":
+        """DOCUMENT_INGEST_SYNC=true (inline) / false (Celery) — deprecated; prefer DOCUMENT_INGEST_USE_ASYNC_WORKER."""
+        import os
+
+        raw = os.getenv("DOCUMENT_INGEST_SYNC")
+        if raw is None or not str(raw).strip():
+            return self
+        sync_inline = str(raw).strip().lower() in ("1", "true", "yes", "on")
+        self.document_ingest_use_async_worker = not sync_inline
+        return self
     
     def get_plan_price(self, plan_type: str) -> int:
         """Get price in cents for a plan type"""
