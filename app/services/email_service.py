@@ -1,13 +1,17 @@
 """Email delivery service for REQUI notifications.
-DevOps: Configure Gmail API or SMTP credentials.
+Configure SMTP via requi-backend/.env (SMTP_SERVER, SMTP_USER, SMTP_PASSWORD, …).
 """
 import asyncio
+import logging
+from datetime import datetime
 from typing import Optional, Dict, Any
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import aiohttp
-import aiosmtplib
 from jinja2 import Template
+
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -142,17 +146,17 @@ class EmailService:
         elif self.smtp_host:
             return await self._send_via_smtp(to_email, subject, html_body)
         else:
-            # Dev mode: log the email instead of sending
-            print(f"\n{'='*60}")
-            print(f"[EMAIL] To: {to_email}")
-            print(f"[EMAIL] Subject: {subject}")
-            print(f"[EMAIL] Title: {title}")
-            print(f"[EMAIL] CTA: {cta_label} -> {cta_link}")
-            print(f"{'='*60}\n")
+            logger.info(
+                "Email not sent (SMTP not configured): to=%s subject=%s",
+                to_email,
+                subject,
+            )
             return True
 
     async def _send_via_gmail_api(self, to_email: str, subject: str, html_body: str) -> bool:
         """Send via Gmail API (Gmail API Key or OAuth)."""
+        import aiohttp
+
         url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
         headers = {"Authorization": f"Bearer {self.gmail_api_key}", "Content-Type": "application/json"}
 
@@ -171,7 +175,15 @@ class EmailService:
                 return resp.status == 200
 
     async def _send_via_smtp(self, to_email: str, subject: str, html_body: str) -> bool:
-        """Send via SMTP (SendGrid, AWS SES, etc.)."""
+        """Send via SMTP (Gmail, SendGrid, AWS SES, etc.)."""
+        try:
+            import aiosmtplib
+        except ImportError:
+            logger.error(
+                "aiosmtplib is not installed; rebuild the API image with requirements-docker.txt"
+            )
+            return False
+
         msg = MIMEMultipart("alternative")
         msg["To"] = to_email
         msg["From"] = f"{self.sender_name} <{self.sender_email}>"
@@ -189,7 +201,7 @@ class EmailService:
             )
             return True
         except Exception as e:
-            print(f"[Email Error] {e}")
+            logger.exception("SMTP send failed to %s: %s", to_email, e)
             return False
 
     async def send_bulk(
@@ -213,5 +225,102 @@ _email_service: Optional[EmailService] = None
 def get_email_service() -> EmailService:
     global _email_service
     if _email_service is None:
-        _email_service = EmailService()
+        _email_service = EmailService(
+            sender_email=(settings.smtp_from_email or settings.smtp_user or "team@requi.io"),
+            sender_name=settings.smtp_sender_name,
+            smtp_host=(settings.smtp_server or "").strip() or None,
+            smtp_port=settings.smtp_port,
+            smtp_user=(settings.smtp_user or "").strip() or None,
+            smtp_password=(settings.smtp_password or "").strip() or None,
+        )
     return _email_service
+
+
+def _frontend_url(path: str = "") -> str:
+    base = (settings.frontend_app_url or "http://localhost:5173").rstrip("/")
+    if not path:
+        return base
+    if path.startswith("#"):
+        return f"{base}{path}"
+    return f"{base}{path if path.startswith('/') else '/' + path}"
+
+
+async def send_welcome_email(
+    *,
+    to_email: str,
+    first_name: str = "",
+    trial_days: Optional[int] = None,
+) -> bool:
+    """Send welcome email after signup. Never raises — returns False on failure."""
+    days = trial_days if trial_days is not None else settings.trial_days
+    greeting = first_name.strip() or "there"
+    title = "Welcome to Requi Health"
+    message = (
+        f"Hi {greeting},\n\n"
+        f"Thanks for signing up. Your workspace is ready and your {days}-day free trial "
+        f"has started. Sign in to explore AI-powered compliance intelligence, upload documents, "
+        f"and manage your compliance workflow.\n\n"
+        f"If you have questions, reply to this email or visit our site."
+    )
+    subject = "Welcome to Requi Health — your trial has started"
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
+            cta_link=_frontend_url("#login"),
+            cta_label="Sign in to your workspace",
+            badge=f"{days}-day free trial",
+        )
+        if ok:
+            logger.info("Welcome email sent to %s", to_email)
+        else:
+            logger.warning("Welcome email failed for %s", to_email)
+        return ok
+    except Exception:
+        logger.exception("Welcome email error for %s", to_email)
+        return False
+
+
+async def send_trial_two_days_left_email(
+    *,
+    to_email: str,
+    first_name: str = "",
+    days_remaining: int = 2,
+    trial_end: Optional[datetime] = None,
+) -> bool:
+    """Send trial expiry reminder when N days remain. Never raises."""
+    greeting = first_name.strip() or "there"
+    end_label = ""
+    if trial_end:
+        end_label = trial_end.strftime("%B %d, %Y")
+
+    title = f"Your trial ends in {days_remaining} days"
+    message = (
+        f"Hi {greeting},\n\n"
+        f"Your Requi Health free trial {'ends on ' + end_label if end_label else 'is ending soon'}. "
+        f"You have {days_remaining} days left to use AI compliance intelligence, documents, and your workspace.\n\n"
+        f"Upgrade now to keep uninterrupted access after your trial ends."
+    )
+    subject = f"Requi Health — {days_remaining} days left on your free trial"
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
+            cta_link=_frontend_url("#pricing"),
+            cta_label="View plans & upgrade",
+            badge=f"{days_remaining} days remaining",
+        )
+        if ok:
+            logger.info("Trial reminder email sent to %s (%s days left)", to_email, days_remaining)
+        else:
+            logger.warning("Trial reminder email failed for %s", to_email)
+        return ok
+    except Exception:
+        logger.exception("Trial reminder email error for %s", to_email)
+        return False

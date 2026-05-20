@@ -153,6 +153,23 @@ class Settings(BaseSettings):
     trial_days: int = 7  # Free trial duration
     trial_prompt_limit: int = 3  # AI prompts allowed on trial
 
+    # Trial reminder email (Celery Beat — override via .env: TRIAL_REMINDER_CRON_*)
+    trial_reminder_email_enabled: bool = True
+    trial_reminder_days_before_end: int = 2
+    trial_reminder_cron_hour: int = 9
+    trial_reminder_cron_minute: int = 0
+    trial_reminder_timezone: str = "America/Los_Angeles"
+
+    # SMTP (transactional email — welcome, reminders, etc.)
+    smtp_server: Optional[str] = None
+    smtp_port: int = 587
+    smtp_user: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from_email: Optional[str] = None
+    smtp_sender_name: str = "Requi Health"
+    # App URL for email CTAs (e.g. http://localhost:5173 or https://requi.io)
+    frontend_app_url: str = "http://localhost:5173"
+
     # CORS — comma-separated origins, or set CORS_ORIGINS=* / CORS_ALLOW_ALL=true for any frontend
     cors_origins: str = ""
     cors_allow_all: bool = False
@@ -182,6 +199,20 @@ class Settings(BaseSettings):
     @property
     def is_development(self) -> bool:
         return self.app_env == "development"
+
+    @property
+    def smtp_enabled(self) -> bool:
+        return bool(
+            (self.smtp_server or "").strip()
+            and (self.smtp_user or "").strip()
+            and (self.smtp_password or "").strip()
+        )
+
+    @model_validator(mode="after")
+    def _smtp_from_defaults(self) -> "Settings":
+        if not (self.smtp_from_email or "").strip() and (self.smtp_user or "").strip():
+            self.smtp_from_email = self.smtp_user.strip()
+        return self
 
     @model_validator(mode="after")
     def _legacy_document_ingest_sync_env(self) -> "Settings":

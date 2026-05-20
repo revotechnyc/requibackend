@@ -2,6 +2,7 @@
 Authentication endpoints
 """
 
+import logging
 import re
 import uuid as uuid_lib
 from datetime import datetime, timedelta
@@ -28,6 +29,7 @@ from app.db.models import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.api_v1_prefix}/auth/login")
@@ -289,6 +291,20 @@ async def register(
     await db.refresh(user)
     await db.refresh(org)
     await db.refresh(subscription)
+
+    # Welcome email after successful signup (registration still succeeds if email fails)
+    if settings.smtp_enabled:
+        from app.services.email_service import send_welcome_email
+
+        sent = await send_welcome_email(
+            to_email=user.email,
+            first_name=user.first_name or "",
+            trial_days=settings.trial_days,
+        )
+        if not sent:
+            logger.warning("Welcome email was not delivered for %s", user.email)
+    else:
+        logger.debug("SMTP not configured; skipping welcome email for %s", user.email)
 
     return {
         "id": str(user.id),
