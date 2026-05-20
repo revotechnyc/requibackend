@@ -236,8 +236,12 @@ def get_email_service() -> EmailService:
     return _email_service
 
 
-def _frontend_url(path: str = "") -> str:
-    base = (settings.frontend_app_url or "http://localhost:5173").rstrip("/")
+# Production app URL for email CTAs (welcome, trial reminders, etc.)
+LIVE_APP_URL = "https://requi.io"
+
+
+def _app_url(path: str = "") -> str:
+    base = LIVE_APP_URL.rstrip("/")
     if not path:
         return base
     if path.startswith("#"):
@@ -270,7 +274,7 @@ async def send_welcome_email(
             subject=subject,
             title=title,
             message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
-            cta_link=_frontend_url("#login"),
+            cta_link=_app_url("#login"),
             cta_label="Sign in to your workspace",
             badge=f"{days}-day free trial",
         )
@@ -312,7 +316,7 @@ async def send_trial_two_days_left_email(
             subject=subject,
             title=title,
             message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
-            cta_link=_frontend_url("#pricing"),
+            cta_link=_app_url("#pricing"),
             cta_label="View plans & upgrade",
             badge=f"{days_remaining} days remaining",
         )

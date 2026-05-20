@@ -167,8 +167,6 @@ class Settings(BaseSettings):
     smtp_password: Optional[str] = None
     smtp_from_email: Optional[str] = None
     smtp_sender_name: str = "Requi Health"
-    # App URL for email CTAs (e.g. http://localhost:5173 or https://requi.io)
-    frontend_app_url: str = "http://localhost:5173"
 
     # CORS — comma-separated origins, or set CORS_ORIGINS=* / CORS_ALLOW_ALL=true for any frontend
     cors_origins: str = ""
