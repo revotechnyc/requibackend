@@ -10,6 +10,7 @@ from app.api.endpoints import (
     ai,
     alerts,
     auth,
+    chat_share,
     billing,
     blog,
     integrations,
@@ -50,6 +51,13 @@ api_router.include_router(
 )
 api_router.include_router(
     ai.router, prefix="/ai", tags=["ai"], dependencies=auth_dep,
+)
+# Public shared chat view (no auth)
+api_router.include_router(
+    chat_share.public_router, prefix="/ai", tags=["Chat Share"],
+)
+api_router.include_router(
+    chat_share.router, prefix="/ai", tags=["Chat Share"], dependencies=auth_dep,
 )
 api_router.include_router(
     admin.router, prefix="/admin", tags=["admin"], dependencies=auth_dep,

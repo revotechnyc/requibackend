@@ -67,6 +67,26 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+async def _ensure_conversation_share_columns(conn) -> None:
+    """Add share-import columns to existing deployments (create_all does not alter tables)."""
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS is_shared_import BOOLEAN NOT NULL DEFAULT FALSE
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS shared_from_token VARCHAR(64)
+            """
+        )
+    )
+
+
 async def init_db() -> None:
     """Initialize database (create tables)"""
     from app.db.models import Base
@@ -76,6 +96,7 @@ async def init_db() -> None:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         # Create all tables
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_conversation_share_columns(conn)
 
 
 async def close_db() -> None:

@@ -76,6 +76,8 @@ class ConversationResponse(BaseModel):
     messages: List[MessageResponse]
     created_at: str
     updated_at: str
+    is_shared_import: bool = False
+    shared_from_token: Optional[str] = None
 
 
 @router.post("/ask", response_model=AskResponse)
@@ -280,6 +282,7 @@ async def list_conversations(
             "message_count": int(message_count or 0),
             "created_at": conv.created_at.isoformat(),
             "updated_at": conv.updated_at.isoformat(),
+            "is_shared_import": bool(getattr(conv, "is_shared_import", False)),
         }
         for conv, message_count in result.all()
     ]
@@ -320,6 +323,8 @@ async def get_conversation(
         ],
         created_at=conversation.created_at.isoformat(),
         updated_at=conversation.updated_at.isoformat(),
+        is_shared_import=bool(getattr(conversation, "is_shared_import", False)),
+        shared_from_token=getattr(conversation, "shared_from_token", None),
     )
 
 
@@ -345,6 +350,38 @@ async def delete_conversation(
     await db.commit()
     
     return {"status": "deleted"}
+
+
+@router.post("/conversations/{conversation_id}/share")
+async def create_conversation_share(
+    conversation_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or refresh a public link for the user's conversation."""
+    from app.services.chat_share_service import build_share_url, create_or_get_share
+
+    try:
+        conv_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid conversation id")
+
+    try:
+        share = await create_or_get_share(
+            db,
+            conversation_id=conv_uuid,
+            user_id=current_user.id,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+    return {
+        "share_token": share.share_token,
+        "share_url": build_share_url(share.share_token),
+    }
 
 
 # ==========================

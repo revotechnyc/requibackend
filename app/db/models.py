@@ -591,6 +591,10 @@ class Conversation(Base):
     
     # Conversation info
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # Imported from a public share link (User 2 continuing a shared chat)
+    is_shared_import: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    shared_from_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -621,6 +625,30 @@ class Message(Base):
     
     # Relationships
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
+
+
+class ConversationShare(Base):
+    """Public read-only snapshot of a conversation for sharing via link."""
+    __tablename__ = "conversation_shares"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    share_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=False,
+    )
+    created_by_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False,
+    )
+
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    snapshot_messages: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 # ============================================
