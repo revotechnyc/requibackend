@@ -53,13 +53,14 @@ def build_realtime_session_config() -> Dict[str, Any]:
                     "model": "gpt-4o-mini-transcribe",
                     "language": "en",
                 },
-                # semantic_vad + low eagerness: wait until the user finishes their thought
-                # (avoids splitting long sentences into multiple assistant replies).
+                # semantic_vad chunks utterances; create_response is False so the client
+                # triggers exactly one response.create per finalized user transcript (prevents
+                # iOS / multi-segment VAD from generating 2–3 assistant replies per phrase).
                 "turn_detection": {
                     "type": "semantic_vad",
                     "eagerness": "low",
-                    "create_response": True,
-                    "interrupt_response": True,
+                    "create_response": False,
+                    "interrupt_response": False,
                 },
             },
         },
