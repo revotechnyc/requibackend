@@ -92,6 +92,12 @@ class Settings(BaseSettings):
     openai_prompt_version: Optional[str] = "40"
     openai_vector_store_id: Optional[str] = None
 
+    # OpenAI Realtime API (live voice — Requi Sonia Assistant + Marin)
+    openai_voice_prompt_id: Optional[str] = None
+    openai_voice_prompt_version: Optional[str] = "7"
+    openai_realtime_model: str = "gpt-realtime-1.5"
+    openai_realtime_voice: str = "marin"
+
     # Intelligence chat testing (simulated SSE stream; no OpenAI calls when true)
     mock_chat_stream: bool = False
     mock_chat_stream_delay_ms: int = 50

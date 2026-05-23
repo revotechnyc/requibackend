@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,10 +28,16 @@ from app.services.responses_service import (
     ResponsesService,
     mock_chat_stream_for_testing,
 )
+from app.services.realtime_voice_service import (
+    is_realtime_voice_configured,
+    negotiate_webrtc_call,
+    validate_sdp_offer,
+)
 from app.services.usage import check_trial_usage_limit, get_trial_info, increment_usage_if_trialing
 from app.services.retrieval import RetrievalService
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 ml_service = MLService()
 
 
@@ -705,6 +711,201 @@ async def ai_usage(
 ):
     """Trial AI usage: prompts used today vs daily limit."""
     return await get_trial_info(str(current_user.id), db)
+
+
+@router.get("/realtime/config")
+async def realtime_voice_config(
+    current_user: User = Depends(get_current_active_user),
+):
+    """Whether OpenAI Realtime (Requi Sonia / Marin) is available for live mode."""
+    if not is_realtime_voice_configured():
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "voice": settings.openai_realtime_voice,
+        "model": settings.openai_realtime_model,
+        "prompt_id": settings.openai_voice_prompt_id,
+        "prompt_version": settings.openai_voice_prompt_version,
+        "prompt_source": "voice",
+        "text_chat_prompt_id": settings.openai_prompt_id,
+    }
+
+
+async def _read_sdp_offer_from_request(request: Request) -> str:
+    """Accept raw SDP (application/sdp) or multipart form field ``sdp``."""
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        field = form.get("sdp")
+        if field is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Multipart form must include field "sdp"',
+            )
+        if hasattr(field, "read"):
+            raw = await field.read()
+            return raw.decode("utf-8", errors="replace")
+        return str(field)
+
+    return (await request.body()).decode("utf-8", errors="replace")
+
+
+@router.post("/realtime/call")
+async def realtime_webrtc_call(
+    request: Request,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+    _: Organization = Depends(lambda: require_feature_dependency(Feature.AI_QA)),
+    __trial_limit: None = Depends(check_trial_usage_limit),
+):
+    """
+    WebRTC SDP exchange for OpenAI Realtime (live voice).
+    Body: raw SDP (application/sdp) or multipart form field ``sdp``. Returns SDP answer.
+    """
+    if not is_realtime_voice_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Live voice (OpenAI Realtime) is not configured.",
+        )
+
+    try:
+        offer_raw = await _read_sdp_offer_from_request(request)
+        offer_sdp = validate_sdp_offer(offer_raw)
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    try:
+        answer_sdp = await negotiate_webrtc_call(
+            offer_sdp,
+            safety_identifier=str(current_user.id),
+        )
+    except ValueError as e:
+        msg = str(e)
+        status_code = (
+            status.HTTP_503_SERVICE_UNAVAILABLE
+            if "not available for your OpenAI API key" in msg
+            else status.HTTP_502_BAD_GATEWAY
+        )
+        raise HTTPException(status_code=status_code, detail=msg) from e
+
+    logger.warning(
+        "realtime/call user=%s offer_bytes=%s answer_bytes=%s answer_starts=%r",
+        current_user.id,
+        len(offer_sdp.encode("utf-8")),
+        len(answer_sdp.encode("utf-8")),
+        answer_sdp[:40],
+    )
+    return Response(content=answer_sdp, media_type="application/sdp")
+
+
+class RealtimeTurnCompleteRequest(BaseModel):
+    """Persist a live-voice turn and count trial usage (OpenAI Realtime / Sonia)."""
+
+    conversation_id: Optional[str] = None
+    user_message: Optional[str] = None
+    assistant_message: Optional[str] = None
+    title_hint: Optional[str] = None
+
+
+async def _get_active_seat(db: AsyncSession, user_id: uuid.UUID) -> Seat:
+    result = await db.execute(
+        select(Seat).where(Seat.user_id == user_id, Seat.is_active == True)
+    )
+    seat = result.scalar_one_or_none()
+    if not seat:
+        raise HTTPException(status_code=400, detail="No active organization")
+    return seat
+
+
+async def _get_or_create_realtime_conversation(
+    db: AsyncSession,
+    *,
+    user: User,
+    seat: Seat,
+    conversation_id: Optional[str],
+    title_hint: Optional[str],
+) -> Conversation:
+    conversation: Optional[Conversation] = None
+    if conversation_id:
+        try:
+            conv_uuid = uuid.UUID(conversation_id)
+        except (ValueError, AttributeError):
+            conv_uuid = None
+        if conv_uuid:
+            conv_result = await db.execute(
+                select(Conversation).where(
+                    Conversation.id == conv_uuid,
+                    Conversation.user_id == user.id,
+                )
+            )
+            conversation = conv_result.scalar_one_or_none()
+
+    if not conversation:
+        title = (title_hint or "Live with Sonia").strip()[:255] or "Live with Sonia"
+        conversation = Conversation(
+            organization_id=seat.organization_id,
+            user_id=user.id,
+            title=title,
+        )
+        db.add(conversation)
+        await db.flush()
+
+    return conversation
+
+
+@router.post("/realtime/turn-complete")
+async def realtime_turn_complete(
+    body: RealtimeTurnCompleteRequest = RealtimeTurnCompleteRequest(),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+    _: Organization = Depends(lambda: require_feature_dependency(Feature.AI_QA)),
+):
+    """
+    After each Realtime assistant turn: save user/assistant lines to the conversation
+  history and count one trial prompt. Uses OPENAI_VOICE_PROMPT_ID session (not text chat prompt).
+    """
+    seat = await _get_active_seat(db, current_user.id)
+    user_text = (body.user_message or "").strip()
+    assistant_text = (body.assistant_message or "").strip()
+
+    conversation = await _get_or_create_realtime_conversation(
+        db,
+        user=current_user,
+        seat=seat,
+        conversation_id=body.conversation_id,
+        title_hint=body.title_hint,
+    )
+
+    if user_text:
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                role="user",
+                content=user_text,
+            )
+        )
+    if assistant_text:
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                role="assistant",
+                content=assistant_text,
+            )
+        )
+
+    if user_text or assistant_text:
+        conversation.updated_at = datetime.utcnow()
+
+    await increment_usage_if_trialing(str(current_user.id), db)
+    await db.commit()
+
+    return {
+        "ok": True,
+        "conversation_id": str(conversation.id),
+    }
 
 
 @router.post("/chat")
