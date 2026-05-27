@@ -114,6 +114,9 @@ class Settings(BaseSettings):
     stripe_price_standard: str = Field(..., description="Stripe price ID for STANDARD plan")
     stripe_price_pro: str = Field(..., description="Stripe price ID for PRO plan")
     stripe_price_enterprise: str = Field(..., description="Stripe price ID for ENTERPRISE plan")
+
+    # Frontend base URL for Stripe Checkout redirects (no trailing slash)
+    frontend_url: str = "http://localhost:5173"
     
     # Plan Configuration (in cents) — v2.1 Pricing
     standard_plan_price: int = 50000  # $500/month

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.database import get_db
+from app.services.billing import BillingService
 from app.db.models import (
     Organization,
     PlanType,
@@ -58,6 +59,16 @@ class UserCreate(BaseModel):
         if normalized not in ("standard", "pro", "enterprise"):
             raise ValueError("plan_type must be standard, pro, or enterprise")
         return normalized
+
+
+class RegisterCheckoutCreate(UserCreate):
+    """Register account then redirect to Stripe Checkout (no free trial)."""
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
+
+
+class CheckoutCompleteRequest(BaseModel):
+    session_id: str
 
 
 class UserLogin(BaseModel):
@@ -202,6 +213,17 @@ def _subscription_payload(subscription: Optional[Subscription]) -> Optional[dict
         "trial_end": subscription.trial_end.isoformat() if subscription.trial_end else None,
         "trial_days": settings.trial_days,
         "is_trial_active": _trial_subscription_active(subscription),
+        "current_period_start": (
+            subscription.current_period_start.isoformat()
+            if subscription.current_period_start
+            else None
+        ),
+        "current_period_end": (
+            subscription.current_period_end.isoformat()
+            if subscription.current_period_end
+            else None
+        ),
+        "cancel_at_period_end": subscription.cancel_at_period_end,
     }
 
 
@@ -311,6 +333,137 @@ async def register(
         "email": user.email,
         "message": "User registered successfully",
         "organization": _org_payload(org, seat, subscription),
+    }
+
+
+@router.post("/register-checkout", response_model=dict)
+async def register_checkout(
+    user_data: RegisterCheckoutCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Register user/org and return Stripe Checkout URL (paid plan, no trial).
+    Used when signing up from the pricing page.
+    """
+    result = await db.execute(select(User).where(User.email == user_data.email))
+    if result.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered",
+        )
+
+    plan_type = PlanType(user_data.plan_type)
+    limits = settings.get_plan_limits(plan_type.value)
+    org_display_name = (
+        user_data.organization_name.strip()
+        if user_data.organization_name and user_data.organization_name.strip()
+        else f"{user_data.first_name} {user_data.last_name}".strip() or "My Organization"
+    )
+    org_slug = await _ensure_unique_slug(db, _slugify(org_display_name))
+
+    user = User(
+        email=user_data.email,
+        hashed_password=get_password_hash(user_data.password),
+        first_name=user_data.first_name,
+        last_name=user_data.last_name,
+    )
+    db.add(user)
+    await db.flush()
+
+    org = Organization(
+        name=org_display_name,
+        slug=org_slug,
+        owner_id=user.id,
+    )
+    db.add(org)
+    await db.flush()
+
+    seat = Seat(
+        organization_id=org.id,
+        user_id=user.id,
+        role=UserRole.ADMIN,
+        is_active=True,
+    )
+    db.add(seat)
+
+    now = datetime.utcnow()
+    local_id = uuid_lib.uuid4().hex
+    customer_id = await BillingService.create_customer(user, org)
+    user.stripe_customer_id = customer_id
+
+    subscription = Subscription(
+        organization_id=org.id,
+        plan_type=plan_type,
+        stripe_subscription_id=f"pending_{local_id}",
+        stripe_price_id=_stripe_price_for_plan(plan_type),
+        stripe_customer_id=customer_id,
+        status=SubscriptionStatus.INCOMPLETE,
+        seat_quantity=limits["min"],
+        current_period_start=now,
+        current_period_end=now,
+    )
+    db.add(subscription)
+    await db.commit()
+    await db.refresh(user)
+    await db.refresh(org)
+
+    frontend = settings.frontend_url.rstrip("/")
+    success_url = user_data.success_url or (
+        f"{frontend}/#checkout-success?session_id={{CHECKOUT_SESSION_ID}}"
+    )
+    cancel_url = user_data.cancel_url or f"{frontend}/#/signup"
+
+    session = await BillingService.create_signup_checkout_session(
+        db,
+        user,
+        org,
+        plan_type,
+        limits["min"],
+        success_url,
+        cancel_url,
+    )
+
+    return {
+        "checkout_url": session["url"],
+        "session_id": session["session_id"],
+        "organization_id": str(org.id),
+        "email": user.email,
+    }
+
+
+@router.post("/complete-checkout", response_model=dict)
+async def complete_checkout(
+    body: CheckoutCompleteRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """After Stripe Checkout success, sync subscription and return auth tokens."""
+    user, org, subscription = await BillingService.complete_checkout_session(
+        db, body.session_id
+    )
+
+    seat_result = await db.execute(
+        select(Seat).where(
+            Seat.organization_id == org.id,
+            Seat.user_id == user.id,
+            Seat.is_active == True,
+        )
+    )
+    seat = seat_result.scalar_one()
+
+    access_token = create_access_token(str(user.id))
+    refresh_token = create_refresh_token(str(user.id))
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "organization": _org_payload(org, seat, subscription),
+        },
     }
 
 

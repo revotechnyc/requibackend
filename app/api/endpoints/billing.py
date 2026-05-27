@@ -2,6 +2,7 @@
 Billing endpoints with Stripe integration
 """
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -17,6 +18,8 @@ from app.db.models import Organization, PlanType, Seat, Subscription, Subscripti
 from app.services.billing import BillingService
 
 router = APIRouter()
+public_router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # Pydantic models
@@ -241,28 +244,44 @@ async def create_portal_session(
     return session
 
 
-@router.post("/webhook")
+@public_router.post("/webhook")
 async def stripe_webhook(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Handle Stripe webhook events"""
+    """Handle Stripe webhook events (no auth — verified by Stripe signature)."""
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-    
+
+    if not sig_header:
+        logger.warning("Stripe webhook rejected: missing stripe-signature header")
+        raise HTTPException(status_code=400, detail="Missing stripe-signature")
+
     try:
         import stripe
         event = stripe.Webhook.construct_event(
             payload, sig_header, settings.stripe_webhook_secret
         )
     except ValueError:
+        logger.warning("Stripe webhook rejected: invalid payload")
         raise HTTPException(status_code=400, detail="Invalid payload")
     except stripe.error.SignatureVerificationError:
+        logger.warning(
+            "Stripe webhook rejected: invalid signature (check STRIPE_WEBHOOK_SECRET matches stripe listen)"
+        )
         raise HTTPException(status_code=400, detail="Invalid signature")
-    
-    # Handle event
-    await BillingService.handle_webhook(db, event["type"], event["data"]["object"])
-    
+
+    event_type = event["type"]
+    event_id = event.get("id", "unknown")
+    logger.info("Stripe webhook received: type=%s id=%s", event_type, event_id)
+
+    try:
+        await BillingService.handle_webhook(db, event_type, event["data"]["object"])
+        logger.info("Stripe webhook handled: type=%s id=%s", event_type, event_id)
+    except Exception:
+        logger.exception("Stripe webhook handler failed: type=%s id=%s", event_type, event_id)
+        raise
+
     return {"status": "success"}
 
 

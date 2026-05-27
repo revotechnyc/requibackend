@@ -41,6 +41,9 @@ api_router.include_router(
     organizations.router, prefix="/organizations", tags=["organizations"], dependencies=auth_dep,
 )
 api_router.include_router(
+    billing.public_router, prefix="/billing", tags=["billing"],
+)
+api_router.include_router(
     billing.router, prefix="/billing", tags=["billing"], dependencies=auth_dep,
 )
 api_router.include_router(
