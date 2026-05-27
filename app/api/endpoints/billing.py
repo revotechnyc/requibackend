@@ -181,12 +181,29 @@ async def cancel_subscription(
     if not seat or not PermissionChecker.can_administrate(seat.role):
         raise HTTPException(status_code=403, detail="Only administrators can manage billing")
     
-    cancelled = await BillingService.cancel_subscription(db, subscription, immediately)
-    
+    try:
+        cancelled = await BillingService.cancel_subscription(db, subscription, immediately)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("cancel_subscription failed for %s", subscription_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to cancel subscription: {exc}",
+        ) from exc
+
+    period_end = cancelled.current_period_end.isoformat() if cancelled.current_period_end else None
+
     return {
         "subscription_id": str(cancelled.id),
         "status": cancelled.status.value,
         "cancel_at_period_end": cancelled.cancel_at_period_end,
+        "current_period_end": period_end,
+        "message": (
+            "Subscription canceled immediately."
+            if immediately
+            else "Subscription will cancel at the end of the current billing period."
+        ),
     }
 
 

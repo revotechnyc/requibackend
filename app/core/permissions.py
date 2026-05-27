@@ -198,6 +198,11 @@ class PermissionChecker:
         return ROLE_HIERARCHY.get(user_role, 0)
     
     @staticmethod
+    def can_administrate(user_role: UserRole) -> bool:
+        """Admin, President, VP — billing and org administration."""
+        return ROLE_HIERARCHY.get(user_role, 0) >= ROLE_HIERARCHY.get(UserRole.VICE_PRESIDENT, 80)
+
+    @staticmethod
     def can_manage_role(manager_role: UserRole, target_role: UserRole) -> bool:
         """Check if manager_role can manage target_role"""
         if manager_role == UserRole.ADMIN:

@@ -206,6 +206,8 @@ def _subscription_payload(subscription: Optional[Subscription]) -> Optional[dict
     if not subscription:
         return None
     return {
+        "id": str(subscription.id),
+        "stripe_subscription_id": subscription.stripe_subscription_id,
         "plan": subscription.plan_type.value,
         "status": subscription.status.value,
         "seats": subscription.seat_quantity,

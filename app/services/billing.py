@@ -218,32 +218,113 @@ class BillingService:
         return subscription
     
     @staticmethod
+    def _is_stripe_billed_subscription(stripe_subscription_id: str) -> bool:
+        """True when subscription is managed in Stripe (not local/trial placeholders)."""
+        return bool(stripe_subscription_id) and stripe_subscription_id.startswith("sub_")
+
+    @staticmethod
+    async def resolve_stripe_subscription_id(
+        db: AsyncSession,
+        subscription: Subscription,
+    ) -> Optional[str]:
+        """
+        Return a real Stripe subscription id (sub_...).
+        Repairs pending_/local_ placeholders using the stored Stripe customer id.
+        """
+        sid = subscription.stripe_subscription_id or ""
+        if BillingService._is_stripe_billed_subscription(sid):
+            return sid
+
+        customer_id = subscription.stripe_customer_id
+        if not customer_id or customer_id.startswith("local"):
+            return None
+
+        try:
+            listed = stripe.Subscription.list(
+                customer=customer_id,
+                status="active",
+                limit=1,
+            )
+            if listed.data:
+                real_id = listed.data[0].id
+                subscription.stripe_subscription_id = real_id
+                await db.flush()
+                logger.info(
+                    "Resolved Stripe subscription %s for org subscription %s",
+                    real_id,
+                    subscription.id,
+                )
+                return real_id
+            listed_all = stripe.Subscription.list(customer=customer_id, limit=1)
+            if listed_all.data:
+                real_id = listed_all.data[0].id
+                subscription.stripe_subscription_id = real_id
+                await db.flush()
+                return real_id
+        except stripe.error.StripeError as e:
+            logger.warning("Could not list Stripe subscriptions for %s: %s", customer_id, e)
+        return None
+
+    @staticmethod
     async def cancel_subscription(
         db: AsyncSession,
         subscription: Subscription,
         immediately: bool = False,
     ) -> Subscription:
-        """Cancel subscription"""
-        try:
-            if immediately:
-                stripe.Subscription.delete(subscription.stripe_subscription_id)
-                subscription.status = SubscriptionStatus.CANCELED
-            else:
-                stripe.Subscription.modify(
-                    subscription.stripe_subscription_id,
-                    cancel_at_period_end=True,
+        """Cancel subscription (Stripe cancel at period end, or local trial end)."""
+        stripe_sub_id = subscription.stripe_subscription_id
+        if not BillingService._is_stripe_billed_subscription(stripe_sub_id or ""):
+            resolved = await BillingService.resolve_stripe_subscription_id(db, subscription)
+            if resolved:
+                stripe_sub_id = resolved
+
+        if BillingService._is_stripe_billed_subscription(stripe_sub_id or ""):
+            try:
+                if immediately:
+                    stripe.Subscription.delete(stripe_sub_id)
+                    subscription.status = SubscriptionStatus.CANCELED
+                    subscription.cancel_at_period_end = False
+                else:
+                    stripe.Subscription.modify(
+                        stripe_sub_id,
+                        cancel_at_period_end=True,
+                    )
+                    subscription.cancel_at_period_end = True
+            except stripe.error.StripeError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Failed to cancel subscription: {str(e)}",
                 )
+        else:
+            # Paid in app but Stripe id not resolved (sync/webhook gap)
+            if subscription.status in (
+                SubscriptionStatus.ACTIVE,
+                SubscriptionStatus.PAST_DUE,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Could not find your Stripe subscription to cancel. "
+                        "Please contact support or try again after refreshing the page."
+                    ),
+                )
+            # Free trial / local placeholders — no Stripe call
+            if immediately:
+                subscription.status = SubscriptionStatus.CANCELED
+                subscription.cancel_at_period_end = False
+            else:
                 subscription.cancel_at_period_end = True
-            
-            await db.commit()
-            await db.refresh(subscription)
-            
-            return subscription
-        except stripe.error.StripeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to cancel subscription: {str(e)}"
+                if subscription.status == SubscriptionStatus.TRIALING:
+                    subscription.status = SubscriptionStatus.CANCELED
+            logger.info(
+                "Canceled local subscription record %s (stripe_id=%s)",
+                subscription.id,
+                stripe_sub_id,
             )
+
+        await db.commit()
+        await db.refresh(subscription)
+        return subscription
     
     @staticmethod
     def _stripe_ts_to_dt(ts: Optional[int]) -> datetime:
