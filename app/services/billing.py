@@ -252,6 +252,28 @@ class BillingService:
         return datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)
 
     @staticmethod
+    def _period_timestamps_from_subscription(data) -> tuple[Optional[int], Optional[int]]:
+        """
+        Billing period bounds from a Stripe Subscription object.
+        Newer API versions may omit top-level current_period_* on webhook payloads;
+        fall back to the first subscription item when needed.
+        """
+        start = data.get("current_period_start") if hasattr(data, "get") else None
+        end = data.get("current_period_end") if hasattr(data, "get") else None
+        if start is not None and end is not None:
+            return start, end
+
+        items = data.get("items") if hasattr(data, "get") else None
+        if items is not None:
+            item_data = items.get("data") if hasattr(items, "get") else getattr(items, "data", None)
+            if item_data:
+                first = item_data[0]
+                if hasattr(first, "get"):
+                    start = start or first.get("current_period_start")
+                    end = end or first.get("current_period_end")
+        return start, end
+
+    @staticmethod
     async def sync_subscription_from_stripe(
         db: AsyncSession,
         organization_id: UUID,
@@ -287,8 +309,11 @@ class BillingService:
         )
         subscription = result.scalar_one_or_none()
         status_value = SubscriptionStatus(stripe_sub["status"])
-        period_start = BillingService._stripe_ts_to_dt(stripe_sub.get("current_period_start"))
-        period_end = BillingService._stripe_ts_to_dt(stripe_sub.get("current_period_end"))
+        period_start_ts, period_end_ts = BillingService._period_timestamps_from_subscription(
+            stripe_sub
+        )
+        period_start = BillingService._stripe_ts_to_dt(period_start_ts)
+        period_end = BillingService._stripe_ts_to_dt(period_end_ts)
         seat_qty = int(stripe_sub["items"]["data"][0].get("quantity") or 1)
 
         if subscription:
@@ -513,31 +538,60 @@ class BillingService:
         data: dict,
     ) -> None:
         """Handle subscription.updated webhook"""
-        stripe_sub_id = data["id"]
-        
+        stripe_sub_id = data.get("id") if hasattr(data, "get") else data["id"]
+        if not stripe_sub_id:
+            logger.warning("customer.subscription.updated: missing subscription id")
+            return
+
         result = await db.execute(
             select(Subscription).where(
                 Subscription.stripe_subscription_id == stripe_sub_id
             )
         )
         subscription = result.scalar_one_or_none()
-        
-        if subscription:
-            subscription.status = SubscriptionStatus(data["status"])
-            subscription.current_period_start = data["current_period_start"]
-            subscription.current_period_end = data["current_period_end"]
-            subscription.cancel_at_period_end = data.get("cancel_at_period_end", False)
-            await db.commit()
-            logger.info(
-                "customer.subscription.updated: sub_id=%s status=%s",
-                stripe_sub_id,
-                data["status"],
-            )
-        else:
+
+        if not subscription:
             logger.warning(
                 "customer.subscription.updated: no local subscription for %s",
                 stripe_sub_id,
             )
+            return
+
+        # Webhook payloads (newer Stripe API versions) may not include period fields;
+        # always refresh from the Subscription API for a complete object.
+        try:
+            stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
+        except stripe.error.StripeError as e:
+            logger.error(
+                "customer.subscription.updated: retrieve failed for %s: %s",
+                stripe_sub_id,
+                e,
+            )
+            raise
+
+        status_raw = stripe_sub.get("status") or data.get("status")
+        subscription.status = SubscriptionStatus(status_raw)
+        period_start_ts, period_end_ts = BillingService._period_timestamps_from_subscription(
+            stripe_sub
+        )
+        if period_start_ts is not None:
+            subscription.current_period_start = BillingService._stripe_ts_to_dt(
+                period_start_ts
+            )
+        if period_end_ts is not None:
+            subscription.current_period_end = BillingService._stripe_ts_to_dt(period_end_ts)
+        subscription.cancel_at_period_end = bool(
+            stripe_sub.get("cancel_at_period_end")
+            if stripe_sub.get("cancel_at_period_end") is not None
+            else data.get("cancel_at_period_end", False)
+        )
+        await db.commit()
+        logger.info(
+            "customer.subscription.updated: sub_id=%s status=%s cancel_at_period_end=%s",
+            stripe_sub_id,
+            status_raw,
+            subscription.cancel_at_period_end,
+        )
     
     @staticmethod
     async def _handle_subscription_deleted(
