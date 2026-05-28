@@ -79,6 +79,26 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+
+    # SaaS admin portal (separate JWT + seed user)
+    platform_admin_jwt_secret_key: Optional[str] = Field(
+        default=None,
+        description="JWT secret for platform admin tokens; defaults to jwt_secret_key if unset",
+    )
+    platform_admin_access_token_expire_minutes: int = 480
+    platform_admin_seed_email: str = "nuvostudios99@gmail.com"
+    platform_admin_seed_password: Optional[str] = Field(
+        default=None,
+        description="Password for seed platform admin (required to create/update owner)",
+    )
+    platform_admin_seed_first_name: str = "Angelo"
+    platform_admin_seed_last_name: str = "Admin"
+    platform_admin_portal_url: str = "http://localhost:5174"
+
+    @property
+    def platform_admin_jwt_secret_effective(self) -> str:
+        key = (self.platform_admin_jwt_secret_key or "").strip()
+        return key or self.jwt_secret_key
     
     # OpenAI GPT-5.5 (Primary AI Model)
     openai_api_key: str = Field(..., description="OpenAI API key")

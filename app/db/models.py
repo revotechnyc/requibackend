@@ -143,6 +143,49 @@ class User(Base):
         return f"<User {self.email}>"
 
 
+class PlatformAdminRole(str, PyEnum):
+    """Roles for the standalone SaaS admin portal (separate from org UserRole)."""
+    SUPER_ADMIN = "super_admin"
+    BLOG_WRITER = "blog_writer"
+    BLOG_EDITOR = "blog_editor"
+    BLOG_ADMIN = "blog_admin"
+
+
+class PlatformAdmin(Base):
+    """Platform operators — SaaS admin portal only (not customer app users)."""
+    __tablename__ = "platform_admins"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    last_name: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    role: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default=PlatformAdminRole.SUPER_ADMIN.value,
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    invited_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("platform_admins.id"),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_login: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    invited_by: Mapped[Optional["PlatformAdmin"]] = relationship(
+        "PlatformAdmin",
+        remote_side="PlatformAdmin.id",
+        foreign_keys=[invited_by_id],
+    )
+
+    def __repr__(self) -> str:
+        return f"<PlatformAdmin {self.email} {self.role}>"
+
+
 class Organization(Base):
     """Multi-tenant organizations"""
     __tablename__ = "organizations"

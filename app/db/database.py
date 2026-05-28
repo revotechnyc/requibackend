@@ -67,6 +67,40 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+async def _ensure_platform_admin_invited_by_column(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE platform_admins
+            ADD COLUMN IF NOT EXISTS invited_by_id UUID REFERENCES platform_admins(id)
+            """
+        )
+    )
+
+
+async def _ensure_platform_admins_role_column(conn) -> None:
+    """Migrate platform_admins.role from PG enum to varchar (safe for re-deploys)."""
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'platform_admins'
+                  AND column_name = 'role'
+                  AND udt_name = 'platformadminrole'
+              ) THEN
+                ALTER TABLE platform_admins
+                  ALTER COLUMN role TYPE VARCHAR(50) USING role::text;
+              END IF;
+            END $$;
+            """
+        )
+    )
+    await conn.execute(text("DROP TYPE IF EXISTS platformadminrole"))
+
+
 async def _ensure_conversation_share_columns(conn) -> None:
     """Add share-import columns to existing deployments (create_all does not alter tables)."""
     await conn.execute(
@@ -96,6 +130,8 @@ async def init_db() -> None:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         # Create all tables
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_platform_admins_role_column(conn)
+        await _ensure_platform_admin_invited_by_column(conn)
         await _ensure_conversation_share_columns(conn)
 
 

@@ -288,6 +288,55 @@ async def send_welcome_email(
         return False
 
 
+async def send_platform_admin_invite_email(
+    *,
+    to_email: str,
+    invited_name: str,
+    inviter_name: str,
+    role_label: str,
+    admin_portal_url: str,
+    temporary_password: Optional[str] = None,
+) -> bool:
+    """Send platform-admin invitation email. Never raises — returns False on failure."""
+    title = "You’ve been invited to the Requi Admin Portal"
+    subject = "Requi Admin Portal — invitation"
+    password_html = ""
+    if temporary_password:
+        password_html = (
+            "<br><br><strong>Temporary password:</strong> "
+            f"<code style=\"background:#f5f5f7;padding:2px 6px;border-radius:6px;\">{temporary_password}</code>"
+            "<br><span style=\"font-size:12px;color:#86868b;\">Please change it after your first login.</span>"
+        )
+
+    greeting = invited_name.strip() or "there"
+    inviter = inviter_name.strip() or "A Super Admin"
+    message = (
+        f"Hi {greeting},<br><br>"
+        f"{inviter} invited you to the Requi Admin Portal as <strong>{role_label}</strong>."
+        f"{password_html}<br><br>"
+        "Use the button below to open the portal and sign in."
+    )
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=message,
+            cta_link=admin_portal_url,
+            cta_label="Open Admin Portal",
+            badge="Admin portal access",
+        )
+        if ok:
+            logger.info("Platform admin invite email sent to %s", to_email)
+        else:
+            logger.warning("Platform admin invite email failed for %s", to_email)
+        return ok
+    except Exception:
+        logger.exception("Platform admin invite email error for %s", to_email)
+        return False
+
+
 async def send_trial_two_days_left_email(
     *,
     to_email: str,

@@ -17,6 +17,7 @@ from app.core.infrastructure import (
     run_infrastructure_checks,
 )
 from app.db.database import close_db, init_db
+from app.db.platform_admin_seed import ensure_platform_admin_seed
 
 
 @asynccontextmanager
@@ -26,6 +27,8 @@ async def lifespan(app: FastAPI):
     print(f"Starting {settings.app_name}...")
     await init_db()
     print("[OK  ] Database: tables ready")
+    await ensure_platform_admin_seed()
+    print("[OK  ] Platform admin seed checked")
 
     celery_ready = log_startup_infrastructure()
     app.state.celery_ready = celery_ready
@@ -53,6 +56,8 @@ app = FastAPI(
 _dev_cors_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]

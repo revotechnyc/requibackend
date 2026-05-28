@@ -10,6 +10,8 @@ from app.api.endpoints import (
     ai,
     alerts,
     auth,
+    platform_admin_auth,
+    platform_admin_team,
     chat_share,
     billing,
     blog,
@@ -25,11 +27,28 @@ from app.api.endpoints import (
     viewers,
 )
 from app.api.endpoints.auth import get_current_active_user
+from app.core.platform_admin_security import get_current_platform_admin
 
 api_router = APIRouter()
 
 # Auth routes (no auth required)
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+
+# SaaS admin portal auth (separate JWT; no customer session)
+api_router.include_router(
+    platform_admin_auth.router,
+    prefix="/platform-admin/auth",
+    tags=["platform-admin-auth"],
+)
+
+platform_admin_dep = [Depends(get_current_platform_admin)]
+
+api_router.include_router(
+    platform_admin_team.router,
+    prefix="/platform-admin/team",
+    tags=["platform-admin-team"],
+    dependencies=platform_admin_dep,
+)
 
 # Protected routes — all require authentication
 auth_dep = [Depends(get_current_active_user)]
