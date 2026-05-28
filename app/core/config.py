@@ -11,7 +11,7 @@ config.py reads .env; the rest of the app uses `settings.database_url` only.
 from typing import Optional
 from urllib.parse import quote_plus
 
-from pydantic import Field, model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -93,13 +93,30 @@ class Settings(BaseSettings):
     )
     platform_admin_seed_first_name: str = "Angelo"
     platform_admin_seed_last_name: str = "Admin"
-    platform_admin_portal_url: str = "http://localhost:5174"
+    admin_portal_url: str = Field(
+        default="http://localhost:5174",
+        description="Public URL of the SaaS admin portal (invite emails, CTAs)",
+        validation_alias=AliasChoices(
+            "admin_portal_url",
+            "ADMIN_PORTAL_URL",
+            "PLATFORM_ADMIN_PORTAL_URL",
+        ),
+    )
 
     @property
     def platform_admin_jwt_secret_effective(self) -> str:
         key = (self.platform_admin_jwt_secret_key or "").strip()
         return key or self.jwt_secret_key
-    
+
+    @property
+    def platform_admin_portal_url(self) -> str:
+        """Backward-compatible alias for admin_portal_url."""
+        return self.admin_portal_url_normalized
+
+    @property
+    def admin_portal_url_normalized(self) -> str:
+        return (self.admin_portal_url or "").strip().rstrip("/")
+
     # OpenAI GPT-5.5 (Primary AI Model)
     openai_api_key: str = Field(..., description="OpenAI API key")
     openai_model: str = "gpt-5.5"  # GPT-5.5 series for agents

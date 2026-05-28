@@ -219,7 +219,7 @@ async def invite_team_member(
                 invited_name=invited_name,
                 inviter_name=inviter_name,
                 role_label=role_label,
-                admin_portal_url=settings.platform_admin_portal_url,
+                admin_portal_url=settings.admin_portal_url_normalized,
                 temporary_password=(temp_password if not body.password else None),
             )
             payload["email_sent"] = bool(sent)
