@@ -64,6 +64,7 @@ PLAN_FEATURES = {
     PlanType.STANDARD: [
         "intelligence",
         "documents",
+        "blog",
         "settings",
     ],
     PlanType.PRO: [

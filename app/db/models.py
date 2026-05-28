@@ -186,6 +186,63 @@ class PlatformAdmin(Base):
         return f"<PlatformAdmin {self.email} {self.role}>"
 
 
+class PlatformBlogStatus(str, PyEnum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    SCHEDULED = "scheduled"
+    ARCHIVED = "archived"
+
+
+class PlatformBlogCategory(str, PyEnum):
+    BLOG = "blog"
+    GUIDES = "guides"
+    RESOURCES = "resources"
+
+
+class PlatformBlogPost(Base):
+    """Marketing/blog content managed from the SaaS admin portal (platform-wide)."""
+    __tablename__ = "platform_blog_posts"
+
+    __table_args__ = (
+        Index("idx_platform_blog_status", "status"),
+        Index("idx_platform_blog_category", "category"),
+        Index("idx_platform_blog_slug", "slug", unique=True),
+        Index("idx_platform_blog_author", "author_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    author_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("platform_admins.id"), nullable=False)
+
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    slug: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    excerpt: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    cover_image_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    category: Mapped[PlatformBlogCategory] = mapped_column(Enum(PlatformBlogCategory), nullable=False, default=PlatformBlogCategory.BLOG)
+    status: Mapped[PlatformBlogStatus] = mapped_column(Enum(PlatformBlogStatus), nullable=False, default=PlatformBlogStatus.DRAFT)
+
+    tags: Mapped[list] = mapped_column(JSON, default=list)
+    meta_title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    meta_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    view_count: Mapped[int] = mapped_column(Integer, default=0)
+    read_time_minutes: Mapped[int] = mapped_column(Integer, default=5)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    last_edited_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("platform_admins.id"), nullable=True)
+    published_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("platform_admins.id"), nullable=True)
+
+    author: Mapped["PlatformAdmin"] = relationship("PlatformAdmin", foreign_keys=[author_id])
+    last_edited_by: Mapped[Optional["PlatformAdmin"]] = relationship("PlatformAdmin", foreign_keys=[last_edited_by_id])
+    published_by: Mapped[Optional["PlatformAdmin"]] = relationship("PlatformAdmin", foreign_keys=[published_by_id])
+
+
 class Organization(Base):
     """Multi-tenant organizations"""
     __tablename__ = "organizations"

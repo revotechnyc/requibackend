@@ -121,6 +121,19 @@ async def _ensure_conversation_share_columns(conn) -> None:
     )
 
 
+async def _ensure_platform_blog_post_columns(conn) -> None:
+    """Add columns for iterative development (create_all does not alter tables)."""
+    # Scheduled publishing (added after initial rollout)
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE platform_blog_posts
+            ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMP
+            """
+        )
+    )
+
+
 async def init_db() -> None:
     """Initialize database (create tables)"""
     from app.db.models import Base
@@ -132,6 +145,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_platform_admins_role_column(conn)
         await _ensure_platform_admin_invited_by_column(conn)
+        await _ensure_platform_blog_post_columns(conn)
         await _ensure_conversation_share_columns(conn)
 
 

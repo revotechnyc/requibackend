@@ -12,6 +12,8 @@ from app.api.endpoints import (
     auth,
     platform_admin_auth,
     platform_admin_team,
+    platform_admin_blog,
+    platform_blog_public,
     chat_share,
     billing,
     blog,
@@ -48,6 +50,20 @@ api_router.include_router(
     prefix="/platform-admin/team",
     tags=["platform-admin-team"],
     dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_blog.router,
+    prefix="/platform-admin/blog",
+    tags=["platform-admin-blog"],
+    dependencies=platform_admin_dep,
+)
+
+# Public platform blog (read-only)
+api_router.include_router(
+    platform_blog_public.public_router,
+    prefix="/platform-blog",
+    tags=["platform-blog"],
 )
 
 # Protected routes — all require authentication
