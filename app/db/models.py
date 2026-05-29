@@ -808,3 +808,131 @@ class BlogPost(Base):
     
     def __repr__(self) -> str:
         return f"<BlogPost {self.slug} {self.status}>"
+
+
+# ==========================
+# IN-APP NOTIFICATIONS
+# ==========================
+
+
+class NotificationStatus(str, PyEnum):
+    QUEUED = "queued"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    OPENED = "opened"
+    FAILED = "failed"
+    EXPIRED = "expired"
+    DISMISSED = "dismissed"
+
+
+class NotificationPriority(str, PyEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class NotificationType(str, PyEnum):
+    WELCOME = "welcome"
+    TRIAL_STARTED = "trial_started"
+    TRIAL_3_DAYS_LEFT = "trial_3_days_left"
+    TRIAL_1_DAY_LEFT = "trial_1_day_left"
+    TRIAL_EXPIRED = "trial_expired"
+    PROMPT_NEAR_LIMIT = "prompt_near_limit"
+    PROMPT_LIMIT_REACHED = "prompt_limit_reached"
+    LIVE_VOICE_CONNECTED = "live_voice_connected"
+    LIVE_VOICE_ENDED = "live_voice_ended"
+    LIVE_VOICE_TURN_SAVED = "live_voice_turn_saved"
+    AI_RESPONSE_READY = "ai_response_ready"
+    CHAT_SHARED_IMPORTED = "chat_shared_imported"
+
+
+class NotificationChannel(str, PyEnum):
+    EMAIL = "email"
+    IN_APP = "in_app"
+    PUSH = "push"
+    SMS = "sms"
+
+
+# Types surfaced in the product (working modules only — Intelligence + trial usage).
+WORKING_IN_APP_NOTIFICATION_TYPES: frozenset[NotificationType] = frozenset({
+    NotificationType.WELCOME,
+    NotificationType.TRIAL_STARTED,
+    NotificationType.TRIAL_3_DAYS_LEFT,
+    NotificationType.TRIAL_1_DAY_LEFT,
+    NotificationType.TRIAL_EXPIRED,
+    NotificationType.PROMPT_NEAR_LIMIT,
+    NotificationType.PROMPT_LIMIT_REACHED,
+    NotificationType.LIVE_VOICE_CONNECTED,
+    NotificationType.LIVE_VOICE_ENDED,
+    NotificationType.LIVE_VOICE_TURN_SAVED,
+    NotificationType.AI_RESPONSE_READY,
+    NotificationType.CHAT_SHARED_IMPORTED,
+})
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    organization_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True
+    )
+
+    type: Mapped[NotificationType] = mapped_column(Enum(NotificationType), nullable=False, index=True)
+    status: Mapped[NotificationStatus] = mapped_column(
+        Enum(NotificationStatus), default=NotificationStatus.QUEUED, nullable=False
+    )
+    priority: Mapped[NotificationPriority] = mapped_column(
+        Enum(NotificationPriority), default=NotificationPriority.MEDIUM
+    )
+
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    cta_link: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    cta_label: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    channel: Mapped[NotificationChannel] = mapped_column(Enum(NotificationChannel), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    scheduled_for: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    dismissed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    email_subject: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email_template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    related_entity_type: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    related_entity_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    delivery_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class NotificationPreference(Base):
+    __tablename__ = "notification_preferences"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, unique=True)
+    organization_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=True
+    )
+
+    email_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    in_app_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    push_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    trial_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    team_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    billing_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    security_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    workspace_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    ai_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+    system_notifications: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    digest_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    digest_frequency: Mapped[str] = mapped_column(String(16), default="daily")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

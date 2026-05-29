@@ -27,6 +27,7 @@ from app.api.endpoints import (
     teams,
     users,
     viewers,
+    notifications,
 )
 from app.api.endpoints.auth import get_current_active_user
 from app.core.platform_admin_security import get_current_platform_admin
@@ -143,4 +144,8 @@ api_router.include_router(
 # Permissions API — Feature gating & role checks
 api_router.include_router(
     permissions.router, prefix="/permissions", tags=["v2.1 — Permissions"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    notifications.router, tags=["notifications"], dependencies=auth_dep,
 )

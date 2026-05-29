@@ -20,7 +20,7 @@ from sqlalchemy.orm import selectinload
 from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import Feature, check_feature_access, require_feature_dependency
 from app.db.database import get_db
-from app.db.models import Conversation, Document, Message, Organization, Seat, User
+from app.db.models import Conversation, Document, Message, NotificationType, Organization, Seat, User
 from app.services.ml import MLService
 from app.core.config import settings
 from app.services.responses_service import (
@@ -798,6 +798,24 @@ async def realtime_webrtc_call(
         len(answer_sdp.encode("utf-8")),
         answer_sdp[:40],
     )
+
+    try:
+        from app.services.notification_service import NotificationService
+
+        seat_row = await db.execute(
+            select(Seat).where(Seat.user_id == current_user.id, Seat.is_active == True)
+        )
+        seat_for_notif = seat_row.scalar_one_or_none()
+        org_id = seat_for_notif.organization_id if seat_for_notif else None
+        await NotificationService(db).create_notification(
+            current_user.id,
+            org_id,
+            NotificationType.LIVE_VOICE_CONNECTED,
+            allow_duplicate_within_minutes=5,
+        )
+    except Exception:
+        logger.exception("Failed to create live_voice_connected notification")
+
     return Response(content=answer_sdp, media_type="application/sdp")
 
 
@@ -900,6 +918,21 @@ async def realtime_turn_complete(
         conversation.updated_at = datetime.utcnow()
 
     await increment_usage_if_trialing(str(current_user.id), db)
+
+    if user_text or assistant_text:
+        try:
+            from app.services.notification_service import NotificationService
+
+            await NotificationService(db).create_notification(
+                current_user.id,
+                seat.organization_id,
+                NotificationType.LIVE_VOICE_TURN_SAVED,
+                template_vars={"conversation_title": (conversation.title or "Live with Sonia")[:120]},
+                allow_duplicate_within_minutes=1,
+            )
+        except Exception:
+            logger.exception("Failed to create live_voice_turn_saved notification")
+
     await db.commit()
 
     return {

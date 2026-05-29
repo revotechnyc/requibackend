@@ -2,6 +2,7 @@
 Trial AI prompt usage tracking and daily limits.
 """
 
+import uuid
 from datetime import datetime
 
 from fastapi import Depends, HTTPException, status
@@ -59,6 +60,20 @@ async def increment_usage_if_trialing(user_id: str, db: AsyncSession) -> None:
     if not seat or not _is_trialing_subscription(seat.organization.subscription):
         return
     await _increment_usage_record(user_id, db)
+    prompts_today = await get_today_usage(user_id, db)
+    try:
+        from app.services.notification_service import NotificationService
+
+        org_id = seat.organization_id if seat.organization else None
+        uid = user_id if isinstance(user_id, uuid.UUID) else uuid.UUID(str(user_id))
+        await NotificationService(db).notify_prompt_usage(
+            uid,
+            org_id,
+            used=prompts_today,
+            limit=TRIAL_DAILY_LIMIT,
+        )
+    except Exception:
+        pass
 
 
 async def _increment_usage_record(user_id: str, db: AsyncSession) -> None:

@@ -316,6 +316,14 @@ async def register(
     await db.refresh(org)
     await db.refresh(subscription)
 
+    try:
+        from app.services.notification_service import NotificationService
+
+        notif_svc = NotificationService(db)
+        await notif_svc.create_welcome_sequence(user.id, org.id)
+    except Exception:
+        logger.exception("Failed to create welcome in-app notifications for %s", user.email)
+
     # Welcome email after successful signup (registration still succeeds if email fails)
     if settings.smtp_enabled:
         from app.services.email_service import send_welcome_email
