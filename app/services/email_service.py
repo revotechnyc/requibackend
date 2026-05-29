@@ -274,7 +274,7 @@ async def send_welcome_email(
             subject=subject,
             title=title,
             message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
-            cta_link=_app_url("#login"),
+            cta_link=_app_url("/login"),
             cta_label="Sign in to your workspace",
             badge=f"{days}-day free trial",
         )
@@ -365,7 +365,7 @@ async def send_trial_two_days_left_email(
             subject=subject,
             title=title,
             message=message.replace("\n\n", "<br><br>").replace("\n", "<br>"),
-            cta_link=_app_url("#pricing"),
+            cta_link=_app_url("/pricing"),
             cta_label="View plans & upgrade",
             badge=f"{days_remaining} days remaining",
         )

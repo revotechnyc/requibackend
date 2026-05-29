@@ -93,5 +93,7 @@ async def get_published_post_by_slug(
     post = result.scalar_one_or_none()
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
+    if post.category != PlatformBlogCategory.BLOG:
+        raise HTTPException(status_code=404, detail="Post not found")
     return {"post": _post_payload(post)}
 

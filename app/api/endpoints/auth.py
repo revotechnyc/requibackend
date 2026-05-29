@@ -411,9 +411,9 @@ async def register_checkout(
 
     frontend = settings.frontend_url.rstrip("/")
     success_url = user_data.success_url or (
-        f"{frontend}/#checkout-success?session_id={{CHECKOUT_SESSION_ID}}"
+        f"{frontend}/checkout-success?session_id={{CHECKOUT_SESSION_ID}}"
     )
-    cancel_url = user_data.cancel_url or f"{frontend}/#/signup"
+    cancel_url = user_data.cancel_url or f"{frontend}/signup"
 
     session = await BillingService.create_signup_checkout_session(
         db,
