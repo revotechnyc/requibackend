@@ -395,12 +395,13 @@ class WorkspaceInvitation(Base):
     )
 
     email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.VIEWER)
+    # VARCHAR (not PG enum) — values are lowercase: viewer, reviewer, admin, …
+    role: Mapped[str] = mapped_column(String(50), nullable=False, default=UserRole.VIEWER.value)
     token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
 
-    status: Mapped[WorkspaceInvitationStatus] = mapped_column(
-        Enum(WorkspaceInvitationStatus),
-        default=WorkspaceInvitationStatus.PENDING,
+    status: Mapped[str] = mapped_column(
+        String(32),
+        default=WorkspaceInvitationStatus.PENDING.value,
         nullable=False,
     )
 

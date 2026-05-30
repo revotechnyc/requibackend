@@ -33,6 +33,8 @@ from app.db.models import (
 from app.services.workspace_invite_service import (
     assert_workspace_invite_allowed,
     get_invitation_by_token,
+    invite_role_value,
+    invite_status_value,
     resolve_primary_seat,
 )
 
@@ -668,17 +670,20 @@ async def preview_invitation(
 ):
     """Public: preview a pending workspace invitation."""
     inv = await get_invitation_by_token(token, db)
-    if inv.status == WorkspaceInvitationStatus.PENDING and inv.expires_at < datetime.utcnow():
-        inv.status = WorkspaceInvitationStatus.EXPIRED
+    if (
+        invite_status_value(inv.status) == WorkspaceInvitationStatus.PENDING.value
+        and inv.expires_at < datetime.utcnow()
+    ):
+        inv.status = WorkspaceInvitationStatus.EXPIRED.value
     await db.flush()
 
-    if inv.status != WorkspaceInvitationStatus.PENDING:
+    if invite_status_value(inv.status) != WorkspaceInvitationStatus.PENDING.value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invitation is {inv.status.value}",
+            detail=f"Invitation is {invite_status_value(inv.status)}",
         )
 
-    assert_workspace_invite_allowed(inv.organization, inv.role)
+    assert_workspace_invite_allowed(inv.organization, UserRole(invite_role_value(inv.role)))
 
     user_result = await db.execute(select(User).where(User.email == inv.email))
     existing_user = user_result.scalar_one_or_none()
@@ -691,7 +696,7 @@ async def preview_invitation(
 
     return {
         "email": inv.email,
-        "role": inv.role.value,
+        "role": invite_role_value(inv.role),
         "organization_name": inv.organization.name,
         "organization_id": str(inv.organization_id),
         "inviter_name": inviter_name,
@@ -710,15 +715,22 @@ async def accept_invitation(
 ):
     """Public: accept viewer invitation — create account or verify password, activate seat."""
     inv = await get_invitation_by_token(body.token, db)
-    if inv.status == WorkspaceInvitationStatus.PENDING and inv.expires_at < datetime.utcnow():
-        inv.status = WorkspaceInvitationStatus.EXPIRED
+    if (
+        invite_status_value(inv.status) == WorkspaceInvitationStatus.PENDING.value
+        and inv.expires_at < datetime.utcnow()
+    ):
+        inv.status = WorkspaceInvitationStatus.EXPIRED.value
         await db.commit()
         raise HTTPException(status_code=400, detail="Invitation has expired")
 
-    if inv.status != WorkspaceInvitationStatus.PENDING:
-        raise HTTPException(status_code=400, detail=f"Invitation is {inv.status.value}")
+    if invite_status_value(inv.status) != WorkspaceInvitationStatus.PENDING.value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invitation is {invite_status_value(inv.status)}",
+        )
 
-    assert_workspace_invite_allowed(inv.organization, inv.role)
+    invite_role = UserRole(invite_role_value(inv.role))
+    assert_workspace_invite_allowed(inv.organization, invite_role)
 
     user_result = await db.execute(select(User).where(User.email == inv.email))
     user = user_result.scalar_one_or_none()
@@ -761,17 +773,17 @@ async def accept_invitation(
     seat = seat_result.scalar_one_or_none()
     if seat:
         seat.is_active = True
-        seat.role = inv.role
+        seat.role = invite_role
     else:
         seat = Seat(
             organization_id=inv.organization_id,
             user_id=user.id,
-            role=inv.role,
+            role=invite_role,
             is_active=True,
         )
         db.add(seat)
 
-    inv.status = WorkspaceInvitationStatus.ACCEPTED
+    inv.status = WorkspaceInvitationStatus.ACCEPTED.value
     inv.accepted_at = datetime.utcnow()
     user.last_login = datetime.utcnow()
     await db.flush()

@@ -148,7 +148,57 @@ async def init_db() -> None:
         await _ensure_platform_blog_post_columns(conn)
         await _ensure_conversation_share_columns(conn)
         await _ensure_workspace_invitations_table(conn)
+        await _ensure_workspace_invitation_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
+
+
+async def _ensure_workspace_invitation_varchar_columns(conn) -> None:
+    """Migrate workspace_invitations.role/status from PG enum to VARCHAR (lowercase values)."""
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'workspace_invitations'
+                  AND column_name = 'role'
+                  AND udt_name = 'userrole'
+              ) THEN
+                ALTER TABLE workspace_invitations
+                  ALTER COLUMN role TYPE VARCHAR(50) USING (
+                    CASE role::text
+                      WHEN 'VIEWER' THEN 'viewer'
+                      WHEN 'ADMIN' THEN 'admin'
+                      WHEN 'SEO' THEN 'seo'
+                      WHEN 'REVIEWER' THEN 'reviewer'
+                      WHEN 'CONTRIBUTOR' THEN 'contributor'
+                      ELSE lower(role::text)
+                    END
+                  );
+              END IF;
+
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'workspace_invitations'
+                  AND column_name = 'status'
+                  AND udt_name = 'workspaceinvitationstatus'
+              ) THEN
+                ALTER TABLE workspace_invitations
+                  ALTER COLUMN status TYPE VARCHAR(32) USING (
+                    CASE status::text
+                      WHEN 'PENDING' THEN 'pending'
+                      WHEN 'ACCEPTED' THEN 'accepted'
+                      WHEN 'REVOKED' THEN 'revoked'
+                      WHEN 'EXPIRED' THEN 'expired'
+                      ELSE lower(status::text)
+                    END
+                  );
+              END IF;
+            END $$;
+            """
+        )
+    )
 
 
 async def _ensure_userrole_enum_values(conn) -> None:

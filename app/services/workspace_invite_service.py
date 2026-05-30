@@ -43,8 +43,20 @@ def invite_accept_url(token: str) -> str:
     return f"{base}/accept-invite?token={token}"
 
 
-def role_label(role: UserRole) -> str:
-    return role.value.replace("_", " ").title()
+def role_label(role: UserRole | str) -> str:
+    if isinstance(role, UserRole):
+        return role.value.replace("_", " ").title()
+    return str(role).replace("_", " ").title()
+
+
+def invite_role_value(role: UserRole | str) -> str:
+    return role.value if isinstance(role, UserRole) else str(role).lower()
+
+
+def invite_status_value(status: WorkspaceInvitationStatus | str) -> str:
+    if isinstance(status, WorkspaceInvitationStatus):
+        return status.value
+    return str(status).lower()
 
 
 async def get_admin_seat(user: User, db: AsyncSession) -> tuple[Organization, Seat]:
@@ -139,10 +151,10 @@ async def get_invitation_by_token(
 
 def _expire_if_needed(inv: WorkspaceInvitation) -> None:
     if (
-        inv.status == WorkspaceInvitationStatus.PENDING
+        invite_status_value(inv.status) == WorkspaceInvitationStatus.PENDING.value
         and inv.expires_at < datetime.utcnow()
     ):
-        inv.status = WorkspaceInvitationStatus.EXPIRED
+        inv.status = WorkspaceInvitationStatus.EXPIRED.value
 
 
 async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict:
@@ -167,12 +179,13 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
 
     for inv in invitations:
         _expire_if_needed(inv)
-        if inv.status == WorkspaceInvitationStatus.REVOKED:
+        st = invite_status_value(inv.status)
+        if st == WorkspaceInvitationStatus.REVOKED.value:
             continue
         email = inv.email.lower()
         if email in seen_emails:
             continue
-        if inv.status == WorkspaceInvitationStatus.ACCEPTED:
+        if st == WorkspaceInvitationStatus.ACCEPTED.value:
             continue
         seen_emails.add(email)
         members.append(
@@ -181,14 +194,14 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "email": inv.email,
                 "first_name": inv.first_name,
                 "last_name": inv.last_name,
-                "status": inv.status.value,
-                "role": inv.role.value,
+                "status": st,
+                "role": invite_role_value(inv.role),
                 "invited_at": inv.created_at.isoformat() if inv.created_at else None,
                 "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
                 "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None,
                 "invitation_id": str(inv.id),
                 "seat_id": None,
-                "revocable": inv.status == WorkspaceInvitationStatus.PENDING,
+                "revocable": st == WorkspaceInvitationStatus.PENDING.value,
             }
         )
 

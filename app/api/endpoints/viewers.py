@@ -27,6 +27,7 @@ from app.services.workspace_invite_service import (
     generate_invite_token,
     get_admin_seat,
     invite_accept_url,
+    invite_role_value,
     list_viewers_for_org,
     list_workspace_members_for_org,
     role_label,
@@ -100,7 +101,7 @@ async def invite_workspace_member(
         select(WorkspaceInvitation).where(
             WorkspaceInvitation.organization_id == org.id,
             WorkspaceInvitation.email == email,
-            WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING,
+            WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING.value,
         )
     )
     if pending.scalar_one_or_none():
@@ -113,9 +114,9 @@ async def invite_workspace_member(
         organization_id=org.id,
         invited_by_id=current_user.id,
         email=email,
-        role=target_role,
+        role=invite_role_value(target_role),
         token=token,
-        status=WorkspaceInvitationStatus.PENDING,
+        status=WorkspaceInvitationStatus.PENDING.value,
         first_name=(data.first_name or "").strip() or None,
         last_name=(data.last_name or "").strip() or None,
         message=(data.message or "").strip() or None,
@@ -218,16 +219,16 @@ async def revoke_workspace_member(
         )
         invitation = inv_result.scalar_one_or_none()
         if invitation:
-            if invitation.status == WorkspaceInvitationStatus.REVOKED:
+            if invitation.status == WorkspaceInvitationStatus.REVOKED.value:
                 raise HTTPException(status_code=400, detail="Invitation already revoked")
-            invitation.status = WorkspaceInvitationStatus.REVOKED
+            invitation.status = WorkspaceInvitationStatus.REVOKED.value
             await db.commit()
             return {
                 "member": {
                     "id": str(invitation.id),
                     "email": invitation.email,
                     "status": "revoked",
-                    "role": invitation.role.value,
+                    "role": invite_role_value(invitation.role),
                 },
                 "message": "Invitation revoked.",
             }
