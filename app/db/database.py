@@ -149,6 +149,7 @@ async def init_db() -> None:
         await _ensure_conversation_share_columns(conn)
         await _ensure_workspace_invitations_table(conn)
         await _ensure_workspace_invitation_varchar_columns(conn)
+        await _ensure_seats_role_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
 
 
@@ -192,6 +193,37 @@ async def _ensure_workspace_invitation_varchar_columns(conn) -> None:
                       WHEN 'REVOKED' THEN 'revoked'
                       WHEN 'EXPIRED' THEN 'expired'
                       ELSE lower(status::text)
+                    END
+                  );
+              END IF;
+            END $$;
+            """
+        )
+    )
+
+
+async def _ensure_seats_role_varchar_columns(conn) -> None:
+    """Migrate seats.role from PG userrole enum to VARCHAR (lowercase values)."""
+    await conn.execute(
+        text(
+            """
+            DO $$
+            BEGIN
+              IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'seats'
+                  AND column_name = 'role'
+                  AND udt_name = 'userrole'
+              ) THEN
+                ALTER TABLE seats
+                  ALTER COLUMN role TYPE VARCHAR(50) USING (
+                    CASE role::text
+                      WHEN 'VIEWER' THEN 'viewer'
+                      WHEN 'ADMIN' THEN 'admin'
+                      WHEN 'SEO' THEN 'seo'
+                      WHEN 'REVIEWER' THEN 'reviewer'
+                      WHEN 'CONTRIBUTOR' THEN 'contributor'
+                      ELSE lower(role::text)
                     END
                   );
               END IF;

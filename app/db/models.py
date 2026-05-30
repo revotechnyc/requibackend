@@ -27,6 +27,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
+from app.db.user_role_type import UserRoleType
+
 
 class Base(DeclarativeBase):
     """Base class for all models"""
@@ -351,8 +353,12 @@ class Seat(Base):
     organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     
-    # Role
-    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.VIEWER)
+    # Role (VARCHAR lowercase — reviewer, admin, viewer, …)
+    role: Mapped[UserRole] = mapped_column(
+        UserRoleType(),
+        nullable=False,
+        default=UserRole.VIEWER,
+    )
     
     # Status
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
