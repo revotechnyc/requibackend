@@ -27,6 +27,13 @@ from app.db.models import (
     SubscriptionStatus,
     User,
     UserRole,
+    WorkspaceInvitation,
+    WorkspaceInvitationStatus,
+)
+from app.services.workspace_invite_service import (
+    assert_viewer_invite_allowed,
+    get_invitation_by_token,
+    resolve_primary_seat,
 )
 
 router = APIRouter()
@@ -244,6 +251,32 @@ def _org_payload(
         "subscription_status": subscription.status.value if subscription else None,
         "subscription": _subscription_payload(subscription),
     }
+
+
+async def _organizations_for_user(user_id, db: AsyncSession) -> list:
+    from sqlalchemy.orm import selectinload
+
+    result = await db.execute(
+        select(Seat)
+        .where(Seat.user_id == user_id, Seat.is_active == True)
+        .options(selectinload(Seat.organization).selectinload(Organization.subscription))
+        .order_by(Seat.created_at.desc())
+    )
+    organizations = []
+    for seat in result.scalars().all():
+        org = seat.organization
+        plan_type = "standard"
+        subscription_info = _subscription_payload(org.subscription)
+        if org.subscription:
+            plan_type = org.subscription.plan_type.value
+        organizations.append({
+            "id": str(org.id),
+            "name": org.name,
+            "role": seat.role.value,
+            "plan": plan_type,
+            "subscription": subscription_info,
+        })
+    return organizations
 
 
 @router.post("/register", response_model=dict)
@@ -502,19 +535,17 @@ async def login(
     access_token = create_access_token(str(user.id))
     refresh_token = create_refresh_token(str(user.id))
     
-    # Get user's primary organization with plan/role
-    org_data = None
     from sqlalchemy.orm import selectinload
-    org_result = await db.execute(
-        select(Seat)
-        .where(Seat.user_id == user.id, Seat.is_active == True)
-        .options(selectinload(Seat.organization).selectinload(Organization.subscription))
-    )
-    seat = org_result.scalar_one_or_none()
+
     org_data = None
+    primary_org_id = None
+    seat = await resolve_primary_seat(user.id, db)
     if seat and seat.organization:
         org_data = _org_payload(seat.organization, seat)
-    
+        primary_org_id = str(seat.organization_id)
+
+    organizations = await _organizations_for_user(user.id, db)
+
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -525,7 +556,9 @@ async def login(
             "first_name": user.first_name,
             "last_name": user.last_name,
             "organization": org_data,
-        }
+            "primary_organization_id": primary_org_id,
+            "organizations": organizations,
+        },
     }
 
 
@@ -583,39 +616,20 @@ async def get_me(
     db: AsyncSession = Depends(get_db),
 ):
     """Get current user info with plan and role"""
-    from sqlalchemy.orm import selectinload
-    
-    # Get user's organizations with plan/role
-    result = await db.execute(
-        select(Seat)
-        .where(Seat.user_id == current_user.id, Seat.is_active == True)
-        .options(selectinload(Seat.organization).selectinload(Organization.subscription))
-    )
-    seats = result.scalars().all()
-    
-    organizations = []
+    organizations = await _organizations_for_user(current_user.id, db)
     primary_plan = "standard"
     primary_role = "viewer"
     primary_subscription = None
+    primary_org_id = None
 
-    for seat in seats:
+    seat = await resolve_primary_seat(current_user.id, db)
+    if seat and seat.organization:
         org = seat.organization
-        plan_type = "standard"
-        subscription_info = _subscription_payload(org.subscription)
-
+        primary_role = seat.role.value
+        primary_org_id = str(org.id)
         if org.subscription:
-            plan_type = org.subscription.plan_type.value
-            primary_plan = plan_type
-            primary_role = seat.role.value
-            primary_subscription = subscription_info
-
-        organizations.append({
-            "id": str(org.id),
-            "name": org.name,
-            "role": seat.role.value,
-            "plan": plan_type,
-            "subscription": subscription_info,
-        })
+            primary_plan = org.subscription.plan_type.value
+            primary_subscription = _subscription_payload(org.subscription)
 
     return {
         "id": str(current_user.id),
@@ -626,5 +640,161 @@ async def get_me(
         "role": primary_role,
         "is_admin": primary_role == "admin",
         "subscription": primary_subscription,
+        "primary_organization_id": primary_org_id,
         "organizations": organizations,
+    }
+
+
+class InvitationAcceptRequest(BaseModel):
+    token: str
+    password: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def password_optional_min(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
+
+@router.get("/invitations/preview", response_model=dict)
+async def preview_invitation(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public: preview a pending workspace invitation."""
+    inv = await get_invitation_by_token(token, db)
+    if inv.status == WorkspaceInvitationStatus.PENDING and inv.expires_at < datetime.utcnow():
+        inv.status = WorkspaceInvitationStatus.EXPIRED
+    await db.flush()
+
+    if inv.status != WorkspaceInvitationStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invitation is {inv.status.value}",
+        )
+
+    await assert_viewer_invite_allowed(inv.organization)
+
+    user_result = await db.execute(select(User).where(User.email == inv.email))
+    existing_user = user_result.scalar_one_or_none()
+    inviter = inv.invited_by
+    inviter_name = (
+        f"{inviter.first_name} {inviter.last_name}".strip() if inviter else ""
+    ) or (inviter.email if inviter else "Your team admin")
+
+    await db.commit()
+
+    return {
+        "email": inv.email,
+        "role": inv.role.value,
+        "organization_name": inv.organization.name,
+        "organization_id": str(inv.organization_id),
+        "inviter_name": inviter_name,
+        "expires_at": inv.expires_at.isoformat(),
+        "requires_password": existing_user is None,
+        "requires_sign_in": existing_user is not None,
+        "first_name": inv.first_name,
+        "last_name": inv.last_name,
+    }
+
+
+@router.post("/invitations/accept", response_model=dict)
+async def accept_invitation(
+    body: InvitationAcceptRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Public: accept viewer invitation — create account or verify password, activate seat."""
+    inv = await get_invitation_by_token(body.token, db)
+    if inv.status == WorkspaceInvitationStatus.PENDING and inv.expires_at < datetime.utcnow():
+        inv.status = WorkspaceInvitationStatus.EXPIRED
+        await db.commit()
+        raise HTTPException(status_code=400, detail="Invitation has expired")
+
+    if inv.status != WorkspaceInvitationStatus.PENDING:
+        raise HTTPException(status_code=400, detail=f"Invitation is {inv.status.value}")
+
+    await assert_viewer_invite_allowed(inv.organization)
+
+    user_result = await db.execute(select(User).where(User.email == inv.email))
+    user = user_result.scalar_one_or_none()
+
+    if user:
+        if not body.password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password required to accept invitation for this email",
+            )
+        if not verify_password(body.password, user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password",
+            )
+    else:
+        if not body.password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password required to create your account",
+            )
+        first = (body.first_name or inv.first_name or inv.email.split("@")[0]).strip()
+        last = (body.last_name or inv.last_name or "").strip()
+        user = User(
+            email=inv.email,
+            hashed_password=get_password_hash(body.password),
+            first_name=first or "User",
+            last_name=last,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+
+    seat_result = await db.execute(
+        select(Seat).where(
+            Seat.organization_id == inv.organization_id,
+            Seat.user_id == user.id,
+        )
+    )
+    seat = seat_result.scalar_one_or_none()
+    if seat:
+        seat.is_active = True
+        seat.role = inv.role
+    else:
+        seat = Seat(
+            organization_id=inv.organization_id,
+            user_id=user.id,
+            role=inv.role,
+            is_active=True,
+        )
+        db.add(seat)
+
+    inv.status = WorkspaceInvitationStatus.ACCEPTED
+    inv.accepted_at = datetime.utcnow()
+    user.last_login = datetime.utcnow()
+    await db.flush()
+
+    access_token = create_access_token(str(user.id))
+    refresh_token = create_refresh_token(str(user.id))
+    org_data = _org_payload(inv.organization, seat)
+    organizations = await _organizations_for_user(user.id, db)
+    await db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "message": "Invitation accepted. Welcome to the workspace.",
+        "primary_organization_id": str(inv.organization_id),
+        "user": {
+            "id": str(user.id),
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+            "organization": org_data,
+            "primary_organization_id": str(inv.organization_id),
+            "organizations": organizations,
+        },
     }

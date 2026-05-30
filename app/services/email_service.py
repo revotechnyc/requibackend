@@ -288,6 +288,61 @@ async def send_welcome_email(
         return False
 
 
+def _customer_app_url(path: str = "") -> str:
+    base = (settings.frontend_url or LIVE_APP_URL).rstrip("/")
+    if not path:
+        return base
+    return f"{base}{path if path.startswith('/') else '/' + path}"
+
+
+async def send_workspace_viewer_invite_email(
+    *,
+    to_email: str,
+    invited_name: str,
+    inviter_name: str,
+    organization_name: str,
+    accept_url: str,
+    custom_message: Optional[str] = None,
+) -> bool:
+    """Send customer-app viewer invitation. Never raises."""
+    greeting = invited_name.strip() or "there"
+    inviter = inviter_name.strip() or "Your team admin"
+    org = organization_name.strip() or "a Requi workspace"
+    extra = ""
+    if custom_message and custom_message.strip():
+        extra = f"<br><br><em>{custom_message.strip()}</em>"
+
+    title = f"You’re invited to view {org}"
+    subject = f"Requi Health — view-only access to {org}"
+    message = (
+        f"Hi {greeting},<br><br>"
+        f"{inviter} invited you as a <strong>view-only</strong> member of "
+        f"<strong>{org}</strong> on Requi Health. You can read dashboards, tasks, "
+        f"and compliance views — without editing or using Intelligence."
+        f"{extra}<br><br>"
+        "Click below to accept your invitation and set up access. This link expires in 7 days."
+    )
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=message,
+            cta_link=accept_url,
+            cta_label="Accept invitation",
+            badge="View-only access",
+        )
+        if ok:
+            logger.info("Workspace viewer invite email sent to %s", to_email)
+        else:
+            logger.warning("Workspace viewer invite email failed for %s", to_email)
+        return ok
+    except Exception:
+        logger.exception("Workspace viewer invite email error for %s", to_email)
+        return False
+
+
 async def send_platform_admin_invite_email(
     *,
     to_email: str,

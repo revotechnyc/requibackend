@@ -367,6 +367,56 @@ class Seat(Base):
         return f"<Seat {self.organization_id}:{self.user_id}>"
 
 
+class WorkspaceInvitationStatus(str, PyEnum):
+    """Workspace member invitation lifecycle."""
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class WorkspaceInvitation(Base):
+    """Email invitations to join an organization (viewers on Pro/Enterprise)."""
+    __tablename__ = "workspace_invitations"
+
+    __table_args__ = (
+        Index("idx_workspace_invite_org_email", "organization_id", "email"),
+        Index("idx_workspace_invite_token", "token", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    invited_by_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    role: Mapped[UserRole] = mapped_column(Enum(UserRole), nullable=False, default=UserRole.VIEWER)
+    token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+
+    status: Mapped[WorkspaceInvitationStatus] = mapped_column(
+        Enum(WorkspaceInvitationStatus),
+        default=WorkspaceInvitationStatus.PENDING,
+        nullable=False,
+    )
+
+    first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    invited_by: Mapped["User"] = relationship("User", foreign_keys=[invited_by_id])
+
+
 # ============================================
 # KNOWLEDGE SOURCE MODELS
 # ============================================

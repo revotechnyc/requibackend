@@ -147,6 +147,39 @@ async def init_db() -> None:
         await _ensure_platform_admin_invited_by_column(conn)
         await _ensure_platform_blog_post_columns(conn)
         await _ensure_conversation_share_columns(conn)
+        await _ensure_workspace_invitations_table(conn)
+
+
+async def _ensure_workspace_invitations_table(conn) -> None:
+    """Create workspace_invitations if missing (create_all on fresh DB; ALTER for existing)."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_invitations (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                invited_by_id UUID NOT NULL REFERENCES users(id),
+                email VARCHAR(255) NOT NULL,
+                role VARCHAR(50) NOT NULL DEFAULT 'viewer',
+                token VARCHAR(255) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                first_name VARCHAR(100),
+                last_name VARCHAR(100),
+                message TEXT,
+                expires_at TIMESTAMP NOT NULL,
+                accepted_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_invite_org_email "
+            "ON workspace_invitations (organization_id, email)"
+        )
+    )
 
 
 async def close_db() -> None:
