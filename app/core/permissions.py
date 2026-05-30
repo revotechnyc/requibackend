@@ -29,6 +29,8 @@ from app.db.models import (
 
 ROLE_HIERARCHY = {
     UserRole.ADMIN: 100,
+    UserRole.REVIEWER: 70,
+    UserRole.CONTRIBUTOR: 50,
     UserRole.PRESIDENT: 90,
     UserRole.VICE_PRESIDENT: 80,
     UserRole.DIRECTOR: 70,
@@ -106,6 +108,14 @@ ROLE_PERMISSIONS = {
         "view", "create", "edit", "delete", "manage",
         "admin", "billing", "upgrade", "invite", "remove_user",
         "change_role", "view_audit", "publish_blog", "manage_blog",
+    ],
+    UserRole.REVIEWER: [
+        "view", "create", "edit", "manage", "approve",
+        "reports", "view_audit", "publish_blog",
+    ],
+    UserRole.CONTRIBUTOR: [
+        "view", "create", "edit", "submit",
+        "work_modules", "view_assigned", "publish_blog",
     ],
     UserRole.PRESIDENT: [
         "view", "create", "edit", "manage", "approve",

@@ -295,6 +295,61 @@ def _customer_app_url(path: str = "") -> str:
     return f"{base}{path if path.startswith('/') else '/' + path}"
 
 
+async def send_workspace_member_invite_email(
+    *,
+    to_email: str,
+    invited_name: str,
+    inviter_name: str,
+    organization_name: str,
+    accept_url: str,
+    role_label: str,
+    is_viewer: bool = False,
+    custom_message: Optional[str] = None,
+) -> bool:
+    """Send customer-app workspace invitation (viewer or paid seat). Never raises."""
+    greeting = invited_name.strip() or "there"
+    inviter = inviter_name.strip() or "Your team admin"
+    org = organization_name.strip() or "a Requi workspace"
+    extra = ""
+    if custom_message and custom_message.strip():
+        extra = f"<br><br><em>{custom_message.strip()}</em>"
+
+    access_note = (
+        "You can read dashboards, tasks, and compliance views — without editing or using Intelligence."
+        if is_viewer
+        else "You will have full access according to your assigned role after accepting."
+    )
+    title = f"You’re invited to {org}"
+    subject = f"Requi Health — {role_label} access to {org}"
+    message = (
+        f"Hi {greeting},<br><br>"
+        f"{inviter} invited you as <strong>{role_label}</strong> on "
+        f"<strong>{org}</strong> (Requi Health). {access_note}"
+        f"{extra}<br><br>"
+        "Click below to accept your invitation and set up access. This link expires in 7 days."
+    )
+    badge = "View-only access" if is_viewer else f"{role_label} · paid seat"
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=message,
+            cta_link=accept_url,
+            cta_label="Accept invitation",
+            badge=badge,
+        )
+        if ok:
+            logger.info("Workspace member invite email sent to %s (%s)", to_email, role_label)
+        else:
+            logger.warning("Workspace member invite email failed for %s", to_email)
+        return ok
+    except Exception:
+        logger.exception("Workspace member invite email error for %s", to_email)
+        return False
+
+
 async def send_workspace_viewer_invite_email(
     *,
     to_email: str,
@@ -305,42 +360,16 @@ async def send_workspace_viewer_invite_email(
     custom_message: Optional[str] = None,
 ) -> bool:
     """Send customer-app viewer invitation. Never raises."""
-    greeting = invited_name.strip() or "there"
-    inviter = inviter_name.strip() or "Your team admin"
-    org = organization_name.strip() or "a Requi workspace"
-    extra = ""
-    if custom_message and custom_message.strip():
-        extra = f"<br><br><em>{custom_message.strip()}</em>"
-
-    title = f"You’re invited to view {org}"
-    subject = f"Requi Health — view-only access to {org}"
-    message = (
-        f"Hi {greeting},<br><br>"
-        f"{inviter} invited you as a <strong>view-only</strong> member of "
-        f"<strong>{org}</strong> on Requi Health. You can read dashboards, tasks, "
-        f"and compliance views — without editing or using Intelligence."
-        f"{extra}<br><br>"
-        "Click below to accept your invitation and set up access. This link expires in 7 days."
+    return await send_workspace_member_invite_email(
+        to_email=to_email,
+        invited_name=invited_name,
+        inviter_name=inviter_name,
+        organization_name=organization_name,
+        accept_url=accept_url,
+        role_label="View-only",
+        is_viewer=True,
+        custom_message=custom_message,
     )
-    try:
-        service = get_email_service()
-        ok = await service.send(
-            to_email=to_email,
-            subject=subject,
-            title=title,
-            message=message,
-            cta_link=accept_url,
-            cta_label="Accept invitation",
-            badge="View-only access",
-        )
-        if ok:
-            logger.info("Workspace viewer invite email sent to %s", to_email)
-        else:
-            logger.warning("Workspace viewer invite email failed for %s", to_email)
-        return ok
-    except Exception:
-        logger.exception("Workspace viewer invite email error for %s", to_email)
-        return False
 
 
 async def send_platform_admin_invite_email(

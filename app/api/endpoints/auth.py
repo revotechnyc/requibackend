@@ -31,7 +31,7 @@ from app.db.models import (
     WorkspaceInvitationStatus,
 )
 from app.services.workspace_invite_service import (
-    assert_viewer_invite_allowed,
+    assert_workspace_invite_allowed,
     get_invitation_by_token,
     resolve_primary_seat,
 )
@@ -678,7 +678,7 @@ async def preview_invitation(
             detail=f"Invitation is {inv.status.value}",
         )
 
-    await assert_viewer_invite_allowed(inv.organization)
+    assert_workspace_invite_allowed(inv.organization, inv.role)
 
     user_result = await db.execute(select(User).where(User.email == inv.email))
     existing_user = user_result.scalar_one_or_none()
@@ -718,7 +718,7 @@ async def accept_invitation(
     if inv.status != WorkspaceInvitationStatus.PENDING:
         raise HTTPException(status_code=400, detail=f"Invitation is {inv.status.value}")
 
-    await assert_viewer_invite_allowed(inv.organization)
+    assert_workspace_invite_allowed(inv.organization, inv.role)
 
     user_result = await db.execute(select(User).where(User.email == inv.email))
     user = user_result.scalar_one_or_none()

@@ -148,6 +148,28 @@ async def init_db() -> None:
         await _ensure_platform_blog_post_columns(conn)
         await _ensure_conversation_share_columns(conn)
         await _ensure_workspace_invitations_table(conn)
+        await _ensure_userrole_enum_values(conn)
+
+
+async def _ensure_userrole_enum_values(conn) -> None:
+    """Add reviewer/contributor to PG userrole enum when missing (safe re-deploy)."""
+    for value in ("reviewer", "contributor"):
+        await conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1 FROM pg_enum e
+                    JOIN pg_type t ON e.enumtypid = t.oid
+                    WHERE t.typname = 'userrole' AND e.enumlabel = '{value}'
+                  ) THEN
+                    ALTER TYPE userrole ADD VALUE '{value}';
+                  END IF;
+                END $$;
+                """
+            )
+        )
 
 
 async def _ensure_workspace_invitations_table(conn) -> None:

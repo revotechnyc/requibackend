@@ -1,4 +1,4 @@
-"""Workspace viewer invitations — create, accept, revoke."""
+"""Workspace member invitations — viewers (Pro+) and paid seats (Enterprise)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -25,7 +25,13 @@ from app.db.models import (
 )
 
 INVITE_TTL_DAYS = 7
-VIEWER_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
+TEAM_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
+PAID_ROLES = {
+    UserRole.ADMIN,
+    UserRole.REVIEWER,
+    UserRole.CONTRIBUTOR,
+    UserRole.SEO,
+}
 
 
 def generate_invite_token() -> str:
@@ -37,8 +43,8 @@ def invite_accept_url(token: str) -> str:
     return f"{base}/accept-invite?token={token}"
 
 
-def _plan_allows_viewers(plan_type: PlanType) -> bool:
-    return plan_type in VIEWER_PLANS
+def role_label(role: UserRole) -> str:
+    return role.value.replace("_", " ").title()
 
 
 async def get_admin_seat(user: User, db: AsyncSession) -> tuple[Organization, Seat]:
@@ -62,27 +68,53 @@ async def get_admin_seat(user: User, db: AsyncSession) -> tuple[Organization, Se
                 SubscriptionStatus.ACTIVE,
                 SubscriptionStatus.TRIALING,
             ):
-                if _plan_allows_viewers(sub.plan_type):
+                if sub.plan_type in TEAM_PLANS:
                     return org, seat
 
     raise HTTPException(
         status_code=403,
-        detail="Only workspace admins on Pro or Enterprise can invite viewers",
+        detail="Only workspace admins on Pro or Enterprise can invite members",
     )
 
 
-async def assert_viewer_invite_allowed(org: Organization) -> None:
+def assert_workspace_invite_allowed(
+    org: Organization,
+    target_role: UserRole,
+    inviter_role: Optional[UserRole] = None,
+) -> None:
     sub = org.subscription
     if not sub or sub.status not in (
         SubscriptionStatus.ACTIVE,
         SubscriptionStatus.TRIALING,
     ):
         raise HTTPException(status_code=403, detail="Active subscription required")
-    if not _plan_allows_viewers(sub.plan_type):
+
+    plan = sub.plan_type
+    if plan not in TEAM_PLANS:
         raise HTTPException(
             status_code=403,
-            detail="View-only invites are available on Pro and Enterprise plans only",
+            detail="Team invites require a Pro or Enterprise plan",
         )
+
+    if target_role == UserRole.VIEWER:
+        pass  # Pro + Enterprise
+    elif target_role in PAID_ROLES:
+        if plan != PlanType.ENTERPRISE:
+            raise HTTPException(
+                status_code=403,
+                detail="Paid seat invites (Admin, Reviewer, Contributor, SEO) require Enterprise",
+            )
+    else:
+        raise HTTPException(status_code=400, detail="Invalid role for invitation")
+
+    if inviter_role is not None:
+        from app.core.permissions import PermissionChecker
+
+        if not PermissionChecker.can_manage_role(inviter_role, target_role):
+            raise HTTPException(
+                status_code=403,
+                detail=f"You cannot assign the {target_role.value} role",
+            )
 
 
 async def get_invitation_by_token(
@@ -113,31 +145,25 @@ def _expire_if_needed(inv: WorkspaceInvitation) -> None:
         inv.status = WorkspaceInvitationStatus.EXPIRED
 
 
-async def list_viewers_for_org(org_id: UUID, db: AsyncSession) -> dict:
+async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict:
+    """Pending invitations (all roles) + active seats (all roles)."""
     inv_result = await db.execute(
         select(WorkspaceInvitation)
-        .where(
-            WorkspaceInvitation.organization_id == org_id,
-            WorkspaceInvitation.role == UserRole.VIEWER,
-        )
+        .where(WorkspaceInvitation.organization_id == org_id)
         .order_by(WorkspaceInvitation.created_at.desc())
     )
     invitations = inv_result.scalars().all()
 
     seat_result = await db.execute(
         select(Seat)
-        .where(
-            Seat.organization_id == org_id,
-            Seat.role == UserRole.VIEWER,
-            Seat.is_active == True,
-        )
+        .where(Seat.organization_id == org_id, Seat.is_active == True)
         .options(selectinload(Seat.user))
         .order_by(Seat.created_at.desc())
     )
     seats = seat_result.scalars().all()
 
-    viewers = []
-    seen_emails = set()
+    members = []
+    seen_emails: set[str] = set()
 
     for inv in invitations:
         _expire_if_needed(inv)
@@ -146,20 +172,23 @@ async def list_viewers_for_org(org_id: UUID, db: AsyncSession) -> dict:
         email = inv.email.lower()
         if email in seen_emails:
             continue
+        if inv.status == WorkspaceInvitationStatus.ACCEPTED:
+            continue
         seen_emails.add(email)
-        viewers.append(
+        members.append(
             {
                 "id": str(inv.id),
                 "email": inv.email,
                 "first_name": inv.first_name,
                 "last_name": inv.last_name,
                 "status": inv.status.value,
-                "role": "viewer",
+                "role": inv.role.value,
                 "invited_at": inv.created_at.isoformat() if inv.created_at else None,
                 "expires_at": inv.expires_at.isoformat() if inv.expires_at else None,
                 "accepted_at": inv.accepted_at.isoformat() if inv.accepted_at else None,
                 "invitation_id": str(inv.id),
                 "seat_id": None,
+                "revocable": inv.status == WorkspaceInvitationStatus.PENDING,
             }
         )
 
@@ -169,7 +198,7 @@ async def list_viewers_for_org(org_id: UUID, db: AsyncSession) -> dict:
             continue
         seen_emails.add(email)
         name = f"{seat.user.first_name} {seat.user.last_name}".strip() or email
-        viewers.append(
+        members.append(
             {
                 "id": str(seat.id),
                 "email": seat.user.email,
@@ -177,20 +206,37 @@ async def list_viewers_for_org(org_id: UUID, db: AsyncSession) -> dict:
                 "last_name": seat.user.last_name,
                 "name": name,
                 "status": "active",
-                "role": "viewer",
+                "role": seat.role.value,
                 "invited_at": seat.created_at.isoformat() if seat.created_at else None,
                 "expires_at": None,
                 "accepted_at": seat.created_at.isoformat() if seat.created_at else None,
                 "invitation_id": None,
                 "seat_id": str(seat.id),
+                "revocable": seat.role == UserRole.VIEWER,
             }
         )
 
+    viewers = [m for m in members if m["role"] == "viewer"]
+    paid = [m for m in members if m["role"] != "viewer"]
+    counts = {
+        "total": len(members),
+        "active": len([m for m in members if m["status"] == "active"]),
+        "pending": len([m for m in members if m["status"] == "pending"]),
+        "viewers": len(viewers),
+        "paid": len(paid),
+    }
+    return {"members": members, "viewers": viewers, "counts": counts}
+
+
+# Backward-compatible alias for viewer-only list endpoint
+async def list_viewers_for_org(org_id: UUID, db: AsyncSession) -> dict:
+    payload = await list_workspace_members_for_org(org_id, db)
+    viewers = [m for m in payload["members"] if m["role"] == "viewer"]
     counts = {
         "total": len(viewers),
         "active": len([v for v in viewers if v["status"] == "active"]),
         "pending": len([v for v in viewers if v["status"] == "pending"]),
-        "revoked": len([v for v in viewers if v["status"] == "revoked"]),
+        "revoked": 0,
         "expired": len([v for v in viewers if v["status"] == "expired"]),
     }
     return {"viewers": viewers, "counts": counts}

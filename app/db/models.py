@@ -47,6 +47,8 @@ organization_users = Table(
 class UserRole(str, PyEnum):
     """User roles within organization (9-tier hierarchy + SEO)"""
     ADMIN = "admin"
+    REVIEWER = "reviewer"
+    CONTRIBUTOR = "contributor"
     PRESIDENT = "president"
     VICE_PRESIDENT = "vice_president"
     DIRECTOR = "director"
