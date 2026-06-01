@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.gap_resolution",
         "app.tasks.daily_update",
         "app.tasks.trial_emails",
+        "app.tasks.task_reminders",
     ],
 )
 
@@ -53,6 +54,11 @@ _trial_reminder_schedule = crontab(
     minute=settings.trial_reminder_cron_minute,
 )
 
+_task_reminder_schedule = crontab(
+    hour=settings.task_reminder_cron_hour,
+    minute=settings.task_reminder_cron_minute,
+)
+
 celery_app.conf.beat_schedule = {
     "daily-knowledge-update": {
         "task": "app.tasks.daily_update.run_daily_update",
@@ -61,5 +67,9 @@ celery_app.conf.beat_schedule = {
     "trial-reminder-two-days-left": {
         "task": "app.tasks.trial_emails.send_trial_two_day_reminders",
         "schedule": _trial_reminder_schedule,
+    },
+    "task-due-reminders": {
+        "task": "app.tasks.task_reminders.send_task_due_reminders",
+        "schedule": _task_reminder_schedule,
     },
 }

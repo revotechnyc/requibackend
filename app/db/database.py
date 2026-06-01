@@ -152,6 +152,28 @@ async def init_db() -> None:
         await _ensure_seats_role_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
         await _ensure_workspace_tasks_table(conn)
+        await _ensure_notification_type_enum_values(conn)
+
+
+async def _ensure_notification_type_enum_values(conn) -> None:
+    """Add task reminder values to PG notificationtype enum when missing."""
+    for value in ("task_due_soon", "task_due_today", "task_overdue"):
+        await conn.execute(
+            text(
+                f"""
+                DO $$
+                BEGIN
+                  IF NOT EXISTS (
+                    SELECT 1 FROM pg_enum e
+                    JOIN pg_type t ON e.enumtypid = t.oid
+                    WHERE t.typname = 'notificationtype' AND e.enumlabel = '{value}'
+                  ) THEN
+                    ALTER TYPE notificationtype ADD VALUE '{value}';
+                  END IF;
+                END $$;
+                """
+            )
+        )
 
 
 async def _ensure_workspace_tasks_table(conn) -> None:

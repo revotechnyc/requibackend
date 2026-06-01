@@ -120,6 +120,30 @@ NOTIFICATION_TEMPLATES: Dict[NotificationType, Dict[str, Any]] = {
         "cta_label": "Open Intelligence",
         "icon": "sparkles",
     },
+    NotificationType.TASK_DUE_SOON: {
+        "title": "Task due in {days_until} days",
+        "message": "{task_title} is due on {due_date}. Open Tasks to review details.",
+        "priority": NotificationPriority.MEDIUM,
+        "cta_link": "/tasks?task={task_id}",
+        "cta_label": "View task",
+        "icon": "calendar",
+    },
+    NotificationType.TASK_DUE_TODAY: {
+        "title": "Task due today",
+        "message": "{task_title} is due today ({due_date}). Complete or update it in Tasks.",
+        "priority": NotificationPriority.HIGH,
+        "cta_link": "/tasks?task={task_id}",
+        "cta_label": "View task",
+        "icon": "calendar",
+    },
+    NotificationType.TASK_OVERDUE: {
+        "title": "Task overdue",
+        "message": "{task_title} was due on {due_date} and is still open. Please take action in Tasks.",
+        "priority": NotificationPriority.CRITICAL,
+        "cta_link": "/tasks?task={task_id}",
+        "cta_label": "View task",
+        "icon": "calendar",
+    },
 }
 
 
@@ -143,11 +167,30 @@ class NotificationService:
         scheduled_for: Optional[datetime] = None,
         *,
         allow_duplicate_within_minutes: int = 0,
+        related_entity_type: Optional[str] = None,
+        related_entity_id: Optional[str] = None,
+        dedupe_same_day: bool = False,
     ) -> Optional[Notification]:
         if notif_type not in WORKING_IN_APP_NOTIFICATION_TYPES:
             return None
         if channel != NotificationChannel.IN_APP:
             return None
+
+        if dedupe_same_day and related_entity_type and related_entity_id:
+            day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            existing_day = await self.db.execute(
+                select(Notification).where(
+                    and_(
+                        Notification.user_id == user_id,
+                        Notification.type == notif_type,
+                        Notification.related_entity_type == related_entity_type,
+                        Notification.related_entity_id == related_entity_id,
+                        Notification.created_at >= day_start,
+                    )
+                ).limit(1)
+            )
+            if existing_day.scalar_one_or_none():
+                return None
 
         if allow_duplicate_within_minutes > 0:
             cutoff = datetime.utcnow() - timedelta(minutes=allow_duplicate_within_minutes)
@@ -199,6 +242,8 @@ class NotificationService:
             cta_label=template.get("cta_label"),
             channel=channel,
             metadata_json=json.dumps(metadata) if metadata else None,
+            related_entity_type=related_entity_type,
+            related_entity_id=related_entity_id,
             scheduled_for=scheduled_for,
             delivered_at=datetime.utcnow(),
         )

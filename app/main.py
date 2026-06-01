@@ -2,6 +2,7 @@
 Requi Health API - Main application
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -16,8 +17,19 @@ from app.core.infrastructure import (
     log_startup_infrastructure,
     run_infrastructure_checks,
 )
-from app.db.database import close_db, init_db
+from app.db.database import close_db, get_db_context, init_db
 from app.db.platform_admin_seed import ensure_platform_admin_seed
+from app.services.task_reminder_service import process_task_reminders
+
+
+async def _run_task_reminders_once(delay_seconds: int = 90) -> None:
+    """Fallback when Celery Beat is not running — one pass after API startup."""
+    await asyncio.sleep(delay_seconds)
+    try:
+        async with get_db_context() as db:
+            await process_task_reminders(db)
+    except Exception as exc:
+        print(f"[WARN] Task reminder startup run failed: {exc}")
 
 
 @asynccontextmanager
@@ -33,6 +45,9 @@ async def lifespan(app: FastAPI):
     celery_ready = log_startup_infrastructure()
     app.state.celery_ready = celery_ready
     app.state.infrastructure_checks = run_infrastructure_checks()
+
+    if settings.task_reminder_enabled:
+        asyncio.create_task(_run_task_reminders_once())
 
     yield
 

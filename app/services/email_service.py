@@ -421,6 +421,66 @@ async def send_platform_admin_invite_email(
         return False
 
 
+async def send_task_reminder_email(
+    *,
+    to_email: str,
+    first_name: str = "",
+    task_title: str,
+    due_date: str,
+    reminder_kind: str,
+    task_id: str,
+) -> bool:
+    """Email for task due soon / due today / overdue. Never raises."""
+    greeting = first_name.strip() or "there"
+    due_label = due_date[:10] if due_date else "soon"
+
+    if reminder_kind == "due_soon":
+        subject = f"Requi Health — Task due soon: {task_title}"
+        title = "Task due soon"
+        badge = "Due date reminder"
+        body = (
+            f"Hi {greeting},<br><br>"
+            f"<strong>{task_title}</strong> is due on {due_label}. "
+            f"Open your Tasks workspace to review and complete it on time."
+        )
+    elif reminder_kind == "due_today":
+        subject = f"Requi Health — Task due today: {task_title}"
+        title = "Task due today"
+        badge = "Due today"
+        body = (
+            f"Hi {greeting},<br><br>"
+            f"<strong>{task_title}</strong> is due today ({due_label}). "
+            f"Please complete or update the task in Requi Health."
+        )
+    else:
+        subject = f"Requi Health — Overdue task: {task_title}"
+        title = "Task overdue"
+        badge = "Overdue"
+        body = (
+            f"Hi {greeting},<br><br>"
+            f"<strong>{task_title}</strong> was due on {due_label} and is still open. "
+            f"Please take action in Tasks as soon as possible."
+        )
+
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=to_email,
+            subject=subject,
+            title=title,
+            message=body,
+            cta_link=_app_url(f"/tasks?task={task_id}"),
+            cta_label="Open task",
+            badge=badge,
+        )
+        if ok:
+            logger.info("Task reminder email sent to %s (%s)", to_email, reminder_kind)
+        return ok
+    except Exception:
+        logger.exception("Task reminder email error for %s", to_email)
+        return False
+
+
 async def send_trial_two_days_left_email(
     *,
     to_email: str,

@@ -206,6 +206,13 @@ class Settings(BaseSettings):
     trial_reminder_cron_minute: int = 0
     trial_reminder_timezone: str = "America/Los_Angeles"
 
+    # Task due-date reminders (Celery Beat + optional startup run)
+    task_reminder_enabled: bool = True
+    task_reminder_email_enabled: bool = True
+    task_reminder_days_before: int = 7
+    task_reminder_cron_hour: int = 8
+    task_reminder_cron_minute: int = 0
+
     # SMTP (transactional email — welcome, reminders, etc.)
     smtp_server: Optional[str] = None
     smtp_port: int = 587

@@ -967,6 +967,9 @@ class NotificationType(str, PyEnum):
     LIVE_VOICE_TURN_SAVED = "live_voice_turn_saved"
     AI_RESPONSE_READY = "ai_response_ready"
     CHAT_SHARED_IMPORTED = "chat_shared_imported"
+    TASK_DUE_SOON = "task_due_soon"
+    TASK_DUE_TODAY = "task_due_today"
+    TASK_OVERDUE = "task_overdue"
 
 
 class NotificationChannel(str, PyEnum):
@@ -990,6 +993,9 @@ WORKING_IN_APP_NOTIFICATION_TYPES: frozenset[NotificationType] = frozenset({
     NotificationType.LIVE_VOICE_TURN_SAVED,
     NotificationType.AI_RESPONSE_READY,
     NotificationType.CHAT_SHARED_IMPORTED,
+    NotificationType.TASK_DUE_SOON,
+    NotificationType.TASK_DUE_TODAY,
+    NotificationType.TASK_OVERDUE,
 })
 
 

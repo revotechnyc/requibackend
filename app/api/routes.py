@@ -24,6 +24,7 @@ from app.api.endpoints import (
     scoring,
     sources,
     tasks,
+    calendar,
     teams,
     users,
     viewers,
@@ -114,6 +115,10 @@ api_router.include_router(
 # Tasks API — Full lifecycle with approval workflows
 api_router.include_router(
     tasks.router, prefix="/tasks", tags=["v2.1 — Tasks"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    calendar.router, prefix="/calendar", tags=["v2.1 — Calendar"], dependencies=auth_dep,
 )
 
 # View-Only User Management API

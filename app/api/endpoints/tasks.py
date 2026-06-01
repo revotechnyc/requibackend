@@ -202,7 +202,17 @@ async def _resolve_org_member(
     return uid
 
 
-def _serialize_task(task: WorkspaceTask) -> dict:
+def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> dict:
+    assignee_name = _user_display(task.assignee)
+    # Pro: show creator/admin as owner when no explicit assignee (legacy tasks)
+    if (
+        not assignee_name
+        and org is not None
+        and not _is_enterprise(org)
+        and task.creator
+    ):
+        assignee_name = _user_display(task.creator)
+
     return {
         "id": str(task.id),
         "workspace_id": str(task.organization_id),
@@ -216,7 +226,7 @@ def _serialize_task(task: WorkspaceTask) -> dict:
         "creator_id": str(task.creator_id),
         "creator_name": _user_display(task.creator),
         "assignee_id": str(task.assignee_id) if task.assignee_id else None,
-        "assignee_name": _user_display(task.assignee),
+        "assignee_name": assignee_name,
         "reviewer_id": str(task.reviewer_id) if task.reviewer_id else None,
         "reviewer_name": _user_display(task.reviewer),
         "approver_id": str(task.approver_id) if task.approver_id else None,
@@ -263,17 +273,20 @@ def _task_workflow_permissions(
     user_role: UserRole,
     enterprise: bool,
 ) -> dict:
-    """Per-task workflow action flags (Enterprise)."""
+    """Per-task workflow action flags."""
     if not enterprise:
+        status = TaskStatus(task.status)
+        assignee_ok = _can_user_act_as_assignee(task, user, user_role)
         return {
-            "can_start_work": user_role != UserRole.VIEWER,
+            "can_start_work": False,
             "can_submit_for_review": False,
             "can_complete_review": False,
             "can_approve_task": False,
             "can_reject_at_review": False,
             "can_reject_at_approval": False,
-            "can_resume_work": user_role != UserRole.VIEWER,
-            "can_mark_complete": user_role != UserRole.VIEWER,
+            "can_resume_work": False,
+            "can_mark_complete": False,
+            "can_complete_task": status != TaskStatus.COMPLETED and assignee_ok,
         }
 
     status = TaskStatus(task.status)
@@ -292,6 +305,7 @@ def _task_workflow_permissions(
         and _can_user_approve(task, user, user_role),
         "can_resume_work": status == TaskStatus.REJECTED and assignee_ok,
         "can_mark_complete": status == TaskStatus.APPROVED and assignee_ok,
+        "can_complete_task": False,
     }
 
 
@@ -303,7 +317,14 @@ def _workflow_notice(
     workflow: dict,
 ) -> Optional[str]:
     if not enterprise:
-        return None
+        status = TaskStatus(task.status)
+        if status == TaskStatus.COMPLETED:
+            return "This task is completed."
+        if workflow.get("can_complete_task"):
+            return None
+        if user_role == UserRole.VIEWER:
+            return "You have read-only access to this task."
+        return "Only the workspace admin or task owner can complete this task."
 
     status = TaskStatus(task.status)
     assignee_name = _user_display(task.assignee) or "the assignee"
@@ -484,6 +505,12 @@ async def create_task(
         approver_id = await _resolve_org_member(
             org.id, data.approver_id, APPROVER_PICK_ROLES, db, "approver"
         )
+    else:
+        # Pro: single-owner — admin (or creator) is assignee by default
+        if user_role == UserRole.ADMIN:
+            assignee_id = current_user.id
+        elif user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+            assignee_id = current_user.id
 
     now = datetime.utcnow()
     history = [
@@ -517,7 +544,7 @@ async def create_task(
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
 
-    return {"task": _serialize_task(task), "message": "Task created"}
+    return {"task": _serialize_task(task, org), "message": "Task created"}
 
 
 @router.get("/", response_model=dict)
@@ -557,7 +584,7 @@ async def list_tasks(
     if assignee:
         tasks = [t for t in tasks if t.assignee_id and str(t.assignee_id) == assignee]
 
-    serialized = [_serialize_task(t) for t in tasks]
+    serialized = [_serialize_task(t, org) for t in tasks]
 
     counts = {s.value: 0 for s in TaskStatus}
     for t in all_tasks:
@@ -593,7 +620,7 @@ async def get_task(
     notice = _workflow_notice(task, current_user, user_role, enterprise, workflow)
 
     return {
-        "task": _serialize_task(task),
+        "task": _serialize_task(task, org),
         "permissions": {
             "can_edit": user_role in (UserRole.ADMIN, UserRole.CONTRIBUTOR) and (
                 user_role == UserRole.ADMIN or is_owner
@@ -653,7 +680,18 @@ async def transition_task_status(
             detail="Submit for review requires Enterprise plan. Mark complete instead.",
         )
 
-    if target_status not in allowed:
+    pro_direct_complete = (
+        not enterprise
+        and target_status == TaskStatus.COMPLETED
+        and current_status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS)
+    )
+    if pro_direct_complete:
+        if not _can_user_act_as_assignee(task, current_user, user_role):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the workspace admin or task owner can complete this task",
+            )
+    elif target_status not in allowed:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid transition: {current_status.value} -> {target_status.value}. "
@@ -749,7 +787,10 @@ async def transition_task_status(
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
 
-    return {"task": _serialize_task(task), "message": f"Status transitioned to {target_status.value}"}
+    return {
+        "task": _serialize_task(task, org),
+        "message": f"Status transitioned to {target_status.value}",
+    }
 
 
 @router.patch("/{task_id}", response_model=dict)
@@ -800,7 +841,7 @@ async def update_task(
     task.updated_at = datetime.utcnow()
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
-    return {"task": _serialize_task(task), "message": "Task updated"}
+    return {"task": _serialize_task(task, org), "message": "Task updated"}
 
 
 @router.delete("/{task_id}", response_model=dict)
@@ -849,4 +890,4 @@ async def add_comment(
     task.updated_at = now
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
-    return {"task": _serialize_task(task), "message": "Comment added"}
+    return {"task": _serialize_task(task, org), "message": "Comment added"}
