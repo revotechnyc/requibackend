@@ -748,6 +748,10 @@ class BillingService:
             )
         
         try:
+            metadata = {
+                "organization_id": str(organization.id),
+                "plan_type": plan_type.value,
+            }
             session = stripe.checkout.Session.create(
                 customer=organization.owner.stripe_customer_id,
                 payment_method_types=["card"],
@@ -758,10 +762,8 @@ class BillingService:
                 mode="subscription",
                 success_url=success_url,
                 cancel_url=cancel_url,
-                metadata={
-                    "organization_id": str(organization.id),
-                    "plan_type": plan_type.value,
-                },
+                metadata=metadata,
+                subscription_data={"metadata": metadata},
             )
             return {"session_id": session.id, "url": session.url}
         except stripe.error.StripeError as e:

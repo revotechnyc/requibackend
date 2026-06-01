@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.auth import get_current_active_user
 from app.core.config import settings
@@ -216,12 +217,28 @@ async def create_checkout_session(
 ):
     """Create Stripe checkout session"""
     result = await db.execute(
-        select(Organization).where(Organization.id == organization_id)
+        select(Organization)
+        .options(selectinload(Organization.owner))
+        .where(Organization.id == organization_id)
     )
     org = result.scalar_one_or_none()
     
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+
+    seat_result = await db.execute(
+        select(Seat).where(
+            Seat.organization_id == organization_id,
+            Seat.user_id == current_user.id,
+            Seat.is_active == True,
+        )
+    )
+    seat = seat_result.scalar_one_or_none()
+    if not seat or not PermissionChecker.can_administrate(seat.role):
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can manage billing",
+        )
     
     # Ensure customer exists
     if not org.owner.stripe_customer_id:
