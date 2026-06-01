@@ -94,9 +94,6 @@ VALID_TRANSITIONS = {
 REVIEWER_PICK_ROLES = {UserRole.REVIEWER.value, UserRole.ADMIN.value}
 APPROVER_PICK_ROLES = {UserRole.APPROVER.value, UserRole.ADMIN.value}
 ASSIGNEE_PICK_ROLES = {
-    UserRole.ADMIN.value,
-    UserRole.REVIEWER.value,
-    UserRole.APPROVER.value,
     UserRole.CONTRIBUTOR.value,
     UserRole.SEO.value,
 }
