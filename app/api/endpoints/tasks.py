@@ -228,6 +228,15 @@ def _serialize_task(task: WorkspaceTask) -> dict:
     }
 
 
+def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
+    """Start work, submit for review, resume after rejection — assignee or admin only."""
+    if user_role == UserRole.ADMIN:
+        return True
+    if user_role not in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        return False
+    return task.assignee_id is not None and task.assignee_id == user.id
+
+
 def _can_user_review(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
     if user_role == UserRole.ADMIN:
         return True
@@ -246,6 +255,150 @@ def _can_user_approve(task: WorkspaceTask, user: User, user_role: UserRole) -> b
     if task.approver_id and task.approver_id != user.id:
         return False
     return True
+
+
+def _task_workflow_permissions(
+    task: WorkspaceTask,
+    user: User,
+    user_role: UserRole,
+    enterprise: bool,
+) -> dict:
+    """Per-task workflow action flags (Enterprise)."""
+    if not enterprise:
+        return {
+            "can_start_work": user_role != UserRole.VIEWER,
+            "can_submit_for_review": False,
+            "can_complete_review": False,
+            "can_approve_task": False,
+            "can_reject_at_review": False,
+            "can_reject_at_approval": False,
+            "can_resume_work": user_role != UserRole.VIEWER,
+            "can_mark_complete": user_role != UserRole.VIEWER,
+        }
+
+    status = TaskStatus(task.status)
+    assignee_ok = _can_user_act_as_assignee(task, user, user_role)
+
+    return {
+        "can_start_work": status == TaskStatus.PENDING and assignee_ok,
+        "can_submit_for_review": status == TaskStatus.IN_PROGRESS and assignee_ok,
+        "can_complete_review": status == TaskStatus.SUBMITTED_FOR_REVIEW
+        and _can_user_review(task, user, user_role),
+        "can_reject_at_review": status == TaskStatus.SUBMITTED_FOR_REVIEW
+        and _can_user_review(task, user, user_role),
+        "can_approve_task": status == TaskStatus.REVIEWED
+        and _can_user_approve(task, user, user_role),
+        "can_reject_at_approval": status == TaskStatus.REVIEWED
+        and _can_user_approve(task, user, user_role),
+        "can_resume_work": status == TaskStatus.REJECTED and assignee_ok,
+        "can_mark_complete": status == TaskStatus.APPROVED and assignee_ok,
+    }
+
+
+def _workflow_notice(
+    task: WorkspaceTask,
+    user: User,
+    user_role: UserRole,
+    enterprise: bool,
+    workflow: dict,
+) -> Optional[str]:
+    if not enterprise:
+        return None
+
+    status = TaskStatus(task.status)
+    assignee_name = _user_display(task.assignee) or "the assignee"
+    reviewer_name = _user_display(task.reviewer) or "the assigned reviewer"
+    approver_name = _user_display(task.approver) or "the assigned approver"
+
+    if status == TaskStatus.PENDING:
+        if workflow["can_start_work"]:
+            return None
+        if user_role == UserRole.REVIEWER:
+            return (
+                f"The assignee has not started this task yet. "
+                f"You can review it after {assignee_name} submits it for review."
+            )
+        if user_role == UserRole.APPROVER:
+            return (
+                "The assignee has not started this task yet. "
+                "Approval will be available after the task is submitted and reviewed."
+            )
+        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+            return "Only the assigned contributor/SEO or an admin can start this task."
+        if user_role == UserRole.VIEWER:
+            return "This task has not been started yet."
+
+    if status == TaskStatus.IN_PROGRESS:
+        if workflow["can_submit_for_review"]:
+            return None
+        if user_role == UserRole.REVIEWER:
+            return (
+                f"{assignee_name} is still working on this task. "
+                "It has not been submitted for review yet."
+            )
+        if user_role == UserRole.APPROVER:
+            return (
+                "This task is in progress. It must be submitted for review and "
+                "reviewed before you can approve it."
+            )
+        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+            return "Only the assignee or an admin can submit this task for review."
+        if user_role == UserRole.VIEWER:
+            return f"This task is in progress. {assignee_name} is working on it."
+
+    if status == TaskStatus.SUBMITTED_FOR_REVIEW:
+        if workflow["can_complete_review"] or workflow["can_reject_at_review"]:
+            return None
+        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO) and _can_user_act_as_assignee(
+            task, user, user_role
+        ):
+            return f"Your submission is awaiting review by {reviewer_name}."
+        if user_role == UserRole.APPROVER:
+            return (
+                f"This task is awaiting review by {reviewer_name} "
+                "before it can be submitted for final approval."
+            )
+        if user_role == UserRole.REVIEWER:
+            return f"You are not the assigned reviewer for this task. Awaiting {reviewer_name}."
+        return f"This task is awaiting review by {reviewer_name}."
+
+    if status == TaskStatus.REVIEWED:
+        if workflow["can_approve_task"] or workflow["can_reject_at_approval"]:
+            return None
+        if user_role == UserRole.REVIEWER:
+            return (
+                f"Review is complete. This task is awaiting final approval by {approver_name}."
+            )
+        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+            return (
+                f"Your task has been reviewed and is pending final approval by {approver_name}."
+            )
+        if user_role == UserRole.APPROVER:
+            return "You are not the assigned approver for this task."
+        return f"This task is awaiting final approval by {approver_name}."
+
+    if status == TaskStatus.APPROVED:
+        if workflow["can_mark_complete"]:
+            return None
+        if user_role in (UserRole.REVIEWER, UserRole.APPROVER):
+            return "This task has been approved. The assignee or an admin can mark it complete."
+        if user_role == UserRole.VIEWER:
+            return "This task has been approved and is awaiting completion."
+
+    if status == TaskStatus.REJECTED:
+        if workflow["can_resume_work"]:
+            return None
+        if user_role == UserRole.REVIEWER:
+            return f"This task was rejected and returned to {assignee_name} for revision."
+        if user_role == UserRole.APPROVER:
+            return f"This task was rejected and returned to {assignee_name} for revision."
+        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+            return "Only the assignee or an admin can resume work on this rejected task."
+
+    if status == TaskStatus.COMPLETED:
+        return "This task is completed."
+
+    return None
 
 
 def _task_visible_to_user(task: WorkspaceTask, user_id: UUID, user_role: UserRole) -> bool:
@@ -435,6 +588,10 @@ async def get_task(
         raise HTTPException(status_code=403, detail="You do not have access to this task")
 
     is_owner = task.creator_id == current_user.id
+    enterprise = _is_enterprise(org)
+    workflow = _task_workflow_permissions(task, current_user, user_role, enterprise)
+    notice = _workflow_notice(task, current_user, user_role, enterprise, workflow)
+
     return {
         "task": _serialize_task(task),
         "permissions": {
@@ -445,8 +602,10 @@ async def get_task(
             "can_approve": _can_user_approve(task, current_user, user_role),
             "can_delete": user_role == UserRole.ADMIN,
             "can_submit": user_role != UserRole.VIEWER,
-            "is_enterprise": _is_enterprise(org),
+            "is_enterprise": enterprise,
+            **workflow,
         },
+        "workflow_message": notice,
     }
 
 
@@ -501,9 +660,35 @@ async def transition_task_status(
             f"Allowed: {[s.value for s in allowed]}",
         )
 
+    if target_status == TaskStatus.IN_PROGRESS and current_status == TaskStatus.PENDING:
+        if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assigned contributor/SEO or an admin can start this task",
+            )
+
+    if target_status == TaskStatus.IN_PROGRESS and current_status == TaskStatus.REJECTED:
+        if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assignee or an admin can resume work on this task",
+            )
+
     if target_status == TaskStatus.SUBMITTED_FOR_REVIEW:
         if user_role == UserRole.VIEWER:
             raise HTTPException(status_code=403, detail="View-Only users cannot submit for review")
+        if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assignee or an admin can submit this task for review",
+            )
+
+    if target_status == TaskStatus.COMPLETED and current_status == TaskStatus.APPROVED:
+        if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assignee or an admin can mark this task complete",
+            )
 
     if target_status == TaskStatus.REVIEWED:
         if not _can_user_review(task, current_user, user_role):
