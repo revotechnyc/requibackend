@@ -151,6 +151,48 @@ async def init_db() -> None:
         await _ensure_workspace_invitation_varchar_columns(conn)
         await _ensure_seats_role_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
+        await _ensure_workspace_tasks_table(conn)
+
+
+async def _ensure_workspace_tasks_table(conn) -> None:
+    """Create workspace_tasks for compliance task management."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_tasks (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                creator_id UUID NOT NULL REFERENCES users(id),
+                assignee_id UUID REFERENCES users(id),
+                reviewer_id UUID REFERENCES users(id),
+                approver_id UUID REFERENCES users(id),
+                title VARCHAR(500) NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                priority VARCHAR(20) NOT NULL DEFAULT 'medium',
+                category VARCHAR(100) NOT NULL DEFAULT 'General',
+                due_date VARCHAR(32),
+                tags JSONB DEFAULT '[]'::jsonb,
+                comments JSONB DEFAULT '[]'::jsonb,
+                history JSONB DEFAULT '[]'::jsonb,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_tasks_org_status "
+            "ON workspace_tasks (organization_id, status)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_tasks_org_created "
+            "ON workspace_tasks (organization_id, created_at DESC)"
+        )
+    )
 
 
 async def _ensure_workspace_invitation_varchar_columns(conn) -> None:
@@ -235,7 +277,7 @@ async def _ensure_seats_role_varchar_columns(conn) -> None:
 
 async def _ensure_userrole_enum_values(conn) -> None:
     """Add reviewer/contributor to PG userrole enum when missing (safe re-deploy)."""
-    for value in ("reviewer", "contributor"):
+    for value in ("reviewer", "contributor", "approver"):
         await conn.execute(
             text(
                 f"""

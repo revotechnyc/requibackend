@@ -50,6 +50,7 @@ class UserRole(str, PyEnum):
     """User roles within organization (9-tier hierarchy + SEO)"""
     ADMIN = "admin"
     REVIEWER = "reviewer"
+    APPROVER = "approver"
     CONTRIBUTOR = "contributor"
     PRESIDENT = "president"
     VICE_PRESIDENT = "vice_president"
@@ -424,6 +425,68 @@ class WorkspaceInvitation(Base):
 
     organization: Mapped["Organization"] = relationship("Organization")
     invited_by: Mapped["User"] = relationship("User", foreign_keys=[invited_by_id])
+
+
+class WorkspaceTaskStatus(str, PyEnum):
+    """Compliance task workflow statuses."""
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    SUBMITTED_FOR_REVIEW = "submitted_for_review"
+    REVIEWED = "reviewed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+
+
+class WorkspaceTask(Base):
+    """Organization compliance tasks (Pro single-owner, Enterprise workflow)."""
+    __tablename__ = "workspace_tasks"
+
+    __table_args__ = (
+        Index("idx_workspace_tasks_org_status", "organization_id", "status"),
+        Index("idx_workspace_tasks_org_created", "organization_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    creator_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    assignee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reviewer_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    approver_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=WorkspaceTaskStatus.PENDING.value
+    )
+    priority: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    category: Mapped[str] = mapped_column(String(100), nullable=False, default="General")
+    due_date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    tags: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+
+    comments: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    history: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    creator: Mapped["User"] = relationship("User", foreign_keys=[creator_id])
+    assignee: Mapped[Optional["User"]] = relationship("User", foreign_keys=[assignee_id])
+    reviewer: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reviewer_id])
+    approver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[approver_id])
 
 
 # ============================================

@@ -39,6 +39,7 @@ INVITEABLE_ROLE_VALUES = {
     UserRole.VIEWER.value,
     UserRole.ADMIN.value,
     UserRole.REVIEWER.value,
+    UserRole.APPROVER.value,
     UserRole.CONTRIBUTOR.value,
     UserRole.SEO.value,
 }
@@ -57,7 +58,7 @@ class WorkspaceMemberInvite(BaseModel):
         r = (v or UserRole.VIEWER.value).strip().lower()
         if r not in INVITEABLE_ROLE_VALUES:
             raise ValueError(
-                "role must be one of: admin, reviewer, contributor, seo, viewer"
+                "role must be one of: admin, reviewer, approver, contributor, seo, viewer"
             )
         return r
 

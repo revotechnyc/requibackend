@@ -29,6 +29,7 @@ TEAM_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
 PAID_ROLES = {
     UserRole.ADMIN,
     UserRole.REVIEWER,
+    UserRole.APPROVER,
     UserRole.CONTRIBUTOR,
     UserRole.SEO,
 }
@@ -114,7 +115,7 @@ def assert_workspace_invite_allowed(
         if plan != PlanType.ENTERPRISE:
             raise HTTPException(
                 status_code=403,
-                detail="Paid seat invites (Admin, Reviewer, Contributor, SEO) require Enterprise",
+                detail="Paid seat invites (Admin, Reviewer, Approver, Contributor, SEO) require Enterprise",
             )
     else:
         raise HTTPException(status_code=400, detail="Invalid role for invitation")
