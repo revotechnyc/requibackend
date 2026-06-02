@@ -81,6 +81,9 @@ PLAN_FEATURES = {
         "teams",
         "blog",
         "settings",
+        "scoring",
+        "frameworks",
+        "evidence",
     ],
     PlanType.ENTERPRISE: [
         "intelligence",
@@ -97,6 +100,13 @@ PLAN_FEATURES = {
         "admin",
         "audit_logs",
         "multiple_admins",
+        "scoring",
+        "frameworks",
+        "evidence",
+        "audit",
+        "reporting",
+        "ai_agents",
+        "analytics",
     ],
 }
 

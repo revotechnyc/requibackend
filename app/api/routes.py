@@ -25,6 +25,7 @@ from app.api.endpoints import (
     sources,
     tasks,
     calendar,
+    compliance,
     teams,
     users,
     viewers,
@@ -119,6 +120,10 @@ api_router.include_router(
 
 api_router.include_router(
     calendar.router, prefix="/calendar", tags=["v2.1 — Calendar"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    compliance.router, prefix="/compliance", tags=["v2.1 — Compliance"], dependencies=auth_dep,
 )
 
 # View-Only User Management API

@@ -23,6 +23,7 @@ from app.db.database import get_db
 from app.db.models import Conversation, Document, Message, NotificationType, Organization, Seat, User
 from app.services.ml import MLService
 from app.core.config import settings
+from app.services.compliance_ai_integration import process_intelligence_compliance_update
 from app.services.responses_service import (
     SONIA_SYSTEM_INSTRUCTION,
     ResponsesService,
@@ -679,6 +680,50 @@ async def chat_stream(
             await increment_usage_if_trialing(str(current_user.id), db)
             await db.commit()
 
+            try:
+                org_result = await db.execute(
+                    select(Organization)
+                    .where(Organization.id == seat.organization_id)
+                    .options(selectinload(Organization.subscription))
+                )
+                org = org_result.scalar_one()
+                has_doc_context = bool(
+                    attachment_uuids
+                    or internal_pick_uuids
+                    or request.search_internal_documents
+                )
+                compliance_summary = await process_intelligence_compliance_update(
+                    db,
+                    org,
+                    request.message,
+                    full_content,
+                    source_type="chat",
+                    has_documents=has_doc_context,
+                    use_mock=settings.mock_chat_stream,
+                )
+                if compliance_summary and compliance_summary.get("gaps_created", 0) > 0:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "type": "compliance_analysis",
+                                "gaps_created": compliance_summary["gaps_created"],
+                                "overall_ai_score": compliance_summary.get("overall_ai_score"),
+                            }
+                        )
+                        + "\n\n"
+                    )
+            except Exception as comp_exc:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "event": "chat_stream_compliance_skip",
+                            "request_id": req_id,
+                            "error": str(comp_exc),
+                        }
+                    )
+                )
+
         t2 = time_module.time()
         logger.info(
             json.dumps(
@@ -1020,6 +1065,25 @@ async def chat(
         db.add(assistant_msg)
         await increment_usage_if_trialing(str(current_user.id), db)
         await db.commit()
+
+        try:
+            org_result = await db.execute(
+                select(Organization)
+                .where(Organization.id == seat.organization_id)
+                .options(selectinload(Organization.subscription))
+            )
+            org = org_result.scalar_one()
+            await process_intelligence_compliance_update(
+                db,
+                org,
+                request.message,
+                content,
+                source_type="chat",
+                has_documents=False,
+                use_mock=settings.mock_chat_stream,
+            )
+        except Exception as comp_exc:
+            logger.warning("chat_compliance_skip: %s", comp_exc)
 
     return {
         "conversation_id": str(conversation.id),

@@ -26,6 +26,7 @@ from app.services.document_storage import (
     resolve_storage_path,
     save_document_file,
 )
+from app.services.compliance_ai_integration import process_intelligence_compliance_update
 from app.services.retrieval import RetrievalService
 from app.tasks.ingestion import ingest_document_task, ingest_source_task
 
@@ -339,6 +340,29 @@ async def upload_document_file(
         select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document.id)
     )
     chunk_total = int(chunk_count_result.scalar_one() or 0)
+
+    if extracted:
+        try:
+            org_full = await db.execute(
+                select(Organization)
+                .where(Organization.id == organization.id)
+                .options(selectinload(Organization.subscription))
+            )
+            org = org_full.scalar_one()
+            await process_intelligence_compliance_update(
+                db,
+                org,
+                user_message=(
+                    f"Review this uploaded compliance document ({filename}) for HIPAA, "
+                    f"FWA, and security gaps."
+                ),
+                assistant_message=extracted[:8000],
+                source_type="document_analysis",
+                has_documents=True,
+                use_mock=settings.mock_chat_stream,
+            )
+        except Exception as exc:
+            logger.warning("document_upload_compliance_skip: %s", exc)
 
     return {
         **_serialize_document(document, chunk_total),

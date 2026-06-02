@@ -152,7 +152,77 @@ async def init_db() -> None:
         await _ensure_seats_role_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
         await _ensure_workspace_tasks_table(conn)
+        await _ensure_compliance_tables(conn)
         await _ensure_notification_type_enum_values(conn)
+
+
+async def _ensure_compliance_tables(conn) -> None:
+    """Compliance frameworks, gaps, and score snapshots."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS compliance_frameworks (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                slug VARCHAR(64) NOT NULL,
+                name VARCHAR(120) NOT NULL,
+                score NUMERIC(5, 2),
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                UNIQUE (organization_id, slug)
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS compliance_gaps (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                framework_slug VARCHAR(64) NOT NULL,
+                title VARCHAR(500) NOT NULL,
+                description TEXT,
+                severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+                status VARCHAR(20) NOT NULL DEFAULT 'open',
+                category VARCHAR(100) NOT NULL DEFAULT 'General',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                resolved_at TIMESTAMP
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_compliance_gaps_org_status "
+            "ON compliance_gaps (organization_id, status)"
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS compliance_score_snapshots (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                framework_scores JSONB NOT NULL DEFAULT '{}'::jsonb,
+                overall_score NUMERIC(5, 2) NOT NULL DEFAULT 0,
+                risk_level VARCHAR(20) NOT NULL DEFAULT 'medium',
+                gaps_found JSONB NOT NULL DEFAULT '[]'::jsonb,
+                recommendations JSONB NOT NULL DEFAULT '[]'::jsonb,
+                source_type VARCHAR(40) NOT NULL DEFAULT 'aggregation',
+                calculated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_compliance_scores_org_calc "
+            "ON compliance_score_snapshots (organization_id, calculated_at DESC)"
+        )
+    )
 
 
 async def _ensure_notification_type_enum_values(conn) -> None:

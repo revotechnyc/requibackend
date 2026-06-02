@@ -490,6 +490,84 @@ class WorkspaceTask(Base):
 
 
 # ============================================
+# COMPLIANCE DASHBOARD MODELS
+# ============================================
+
+class ComplianceFramework(Base):
+    """Active regulatory framework tracked per organization (Pro: max 3, Enterprise: unlimited)."""
+    __tablename__ = "compliance_frameworks"
+
+    __table_args__ = (
+        Index("idx_compliance_frameworks_org_slug", "organization_id", "slug", unique=True),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    slug: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+
+
+class ComplianceGap(Base):
+    """Open compliance gaps linked to a framework."""
+    __tablename__ = "compliance_gaps"
+
+    __table_args__ = (
+        Index("idx_compliance_gaps_org_status", "organization_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    framework_slug: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    category: Mapped[str] = mapped_column(String(100), nullable=False, default="General")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    organization: Mapped["Organization"] = relationship("Organization")
+
+
+class ComplianceScoreSnapshot(Base):
+    """Persisted AI / aggregated compliance scores (Intelligence → Dashboard contract)."""
+    __tablename__ = "compliance_score_snapshots"
+
+    __table_args__ = (
+        Index("idx_compliance_scores_org_calc", "organization_id", "calculated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    framework_scores: Mapped[dict] = mapped_column(JSON, default=dict)
+    overall_score: Mapped[float] = mapped_column(Numeric(5, 2), default=0)
+    risk_level: Mapped[str] = mapped_column(String(20), default="medium")
+    gaps_found: Mapped[list] = mapped_column(JSON, default=list)
+    recommendations: Mapped[list] = mapped_column(JSON, default=list)
+    source_type: Mapped[str] = mapped_column(String(40), default="aggregation")
+    calculated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    organization: Mapped["Organization"] = relationship("Organization")
+
+
+# ============================================
 # KNOWLEDGE SOURCE MODELS
 # ============================================
 

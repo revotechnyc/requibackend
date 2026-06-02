@@ -120,6 +120,8 @@ class Settings(BaseSettings):
     # OpenAI GPT-5.5 (Primary AI Model)
     openai_api_key: str = Field(..., description="OpenAI API key")
     openai_model: str = "gpt-5.5"  # GPT-5.5 series for agents
+    compliance_extraction_model: str = "gpt-4o-mini"
+    compliance_ai_extraction_enabled: bool = True
     openai_max_tokens: int = 4096
     openai_temperature: float = 0.1  # Low temperature for deterministic outputs
     
