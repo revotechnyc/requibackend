@@ -94,6 +94,7 @@ async def list_frameworks(
     org, _seat = await _get_workspace(current_user, db)
     plan = _require_compliance_plan(org)
     await ensure_default_frameworks(db, org.id)
+    await db.commit()
 
     result = await db.execute(
         select(ComplianceFramework).where(

@@ -162,12 +162,19 @@ def _status_from_score(score: float) -> str:
 
 
 async def ensure_default_frameworks(db: AsyncSession, org_id: uuid.UUID) -> None:
-    result = await db.execute(
-        select(ComplianceFramework).where(ComplianceFramework.organization_id == org_id)
-    )
-    if result.scalars().first():
-        return
+    """Ensure HIPAA + FWA rows exist (per slug; reactivate if previously removed)."""
     for slug in DEFAULT_STARTER_SLUGS:
+        result = await db.execute(
+            select(ComplianceFramework).where(
+                ComplianceFramework.organization_id == org_id,
+                ComplianceFramework.slug == slug,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row:
+            if not row.is_active:
+                row.is_active = True
+            continue
         db.add(
             ComplianceFramework(
                 organization_id=org_id,
@@ -177,7 +184,7 @@ async def ensure_default_frameworks(db: AsyncSession, org_id: uuid.UUID) -> None
                 is_active=True,
             )
         )
-    await db.commit()
+    await db.flush()
 
 
 async def _fetch_task_metrics(db: AsyncSession, org_id: uuid.UUID) -> dict[str, Any]:

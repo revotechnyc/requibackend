@@ -202,7 +202,7 @@ async def _ensure_framework_slot(
     org: Organization,
     slug: str,
 ) -> bool:
-    """Return True if framework exists or was created."""
+    """Return True if framework exists (active or reactivated) or was created."""
     slug = slug.strip().lower()
     if slug not in FRAMEWORK_CATALOG:
         return False
@@ -211,10 +211,23 @@ async def _ensure_framework_slot(
         select(ComplianceFramework).where(
             ComplianceFramework.organization_id == org.id,
             ComplianceFramework.slug == slug,
-            ComplianceFramework.is_active == True,
         )
     )
-    if result.scalar_one_or_none():
+    existing = result.scalar_one_or_none()
+    if existing:
+        if not existing.is_active:
+            plan = org.subscription.plan_type if org.subscription else PlanType.STANDARD
+            limit = framework_limit_for_plan(plan)
+            count_result = await db.execute(
+                select(ComplianceFramework).where(
+                    ComplianceFramework.organization_id == org.id,
+                    ComplianceFramework.is_active == True,
+                )
+            )
+            if limit is not None and len(count_result.scalars().all()) >= limit:
+                return False
+            existing.is_active = True
+            await db.flush()
         return True
 
     plan = org.subscription.plan_type if org.subscription else PlanType.STANDARD

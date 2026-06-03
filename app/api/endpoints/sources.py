@@ -334,12 +334,14 @@ async def upload_document_file(
     await db.refresh(document)
 
     ingestion_status = await _queue_or_run_ingestion(db, document)
+    await db.commit()
     await db.refresh(document)
 
     chunk_count_result = await db.execute(
         select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document.id)
     )
     chunk_total = int(chunk_count_result.scalar_one() or 0)
+    saved_doc_id = document.id
 
     if extracted:
         try:
@@ -363,9 +365,18 @@ async def upload_document_file(
             )
         except Exception as exc:
             logger.warning("document_upload_compliance_skip: %s", exc)
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+
+    doc_fresh = await db.get(Document, saved_doc_id)
+    if not doc_fresh:
+        doc_result = await db.execute(select(Document).where(Document.id == saved_doc_id))
+        doc_fresh = doc_result.scalar_one()
 
     return {
-        **_serialize_document(document, chunk_total),
+        **_serialize_document(doc_fresh, chunk_total),
         "status": ingestion_status,
         "message": "Document uploaded successfully",
     }
