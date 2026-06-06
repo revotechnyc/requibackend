@@ -110,6 +110,18 @@ def default_feature_permissions(plan: PlanType, role: UserRole) -> dict[str, boo
     }
 
 
+def role_default_permissions_snapshot(
+    plan: PlanType,
+    role: UserRole,
+) -> dict[str, bool]:
+    """Persisted permission map for a new invite (role defaults, sanitized for plan)."""
+    return sanitize_permissions_payload(
+        default_feature_permissions(plan, role),
+        plan,
+        role,
+    )
+
+
 def normalize_stored_permissions(raw: Any) -> Optional[dict[str, bool]]:
     if raw is None:
         return None

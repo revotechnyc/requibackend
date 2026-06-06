@@ -766,6 +766,17 @@ async def accept_invitation(
     invite_role = UserRole(invite_role_value(inv.role))
     assert_workspace_invite_allowed(inv.organization, invite_role)
 
+    from app.services.workspace_permissions import role_default_permissions_snapshot
+
+    plan_enum = (
+        inv.organization.subscription.plan_type
+        if inv.organization and inv.organization.subscription
+        else PlanType.STANDARD
+    )
+    seat_permissions = inv.feature_permissions
+    if seat_permissions is None:
+        seat_permissions = role_default_permissions_snapshot(plan_enum, invite_role)
+
     user_result = await db.execute(select(User).where(User.email == inv.email))
     user = user_result.scalar_one_or_none()
 
@@ -808,14 +819,14 @@ async def accept_invitation(
     if seat:
         seat.is_active = True
         seat.role = invite_role
-        seat.feature_permissions = inv.feature_permissions
+        seat.feature_permissions = seat_permissions
     else:
         seat = Seat(
             organization_id=inv.organization_id,
             user_id=user.id,
             role=invite_role,
             is_active=True,
-            feature_permissions=inv.feature_permissions,
+            feature_permissions=seat_permissions,
         )
         db.add(seat)
 

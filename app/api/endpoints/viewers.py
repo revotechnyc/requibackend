@@ -25,6 +25,7 @@ from app.db.models import (
 )
 from app.services.workspace_permissions import (
     effective_feature_permissions,
+    role_default_permissions_snapshot,
     sanitize_permissions_payload,
 )
 from app.services.email_service import send_workspace_member_invite_email
@@ -174,14 +175,8 @@ def _member_detail_payload(
 
 
 def _default_invite_permissions(org: Organization, role: UserRole) -> dict:
-    from app.services.workspace_permissions import (
-        default_feature_permissions,
-        sanitize_permissions_payload,
-    )
-
     plan = _org_plan_type(org)
-    defaults = default_feature_permissions(plan, role)
-    return sanitize_permissions_payload(defaults, plan, role)
+    return role_default_permissions_snapshot(plan, role)
 
 
 @router.post("/invite", response_model=dict, status_code=status.HTTP_201_CREATED)
@@ -272,6 +267,10 @@ async def invite_workspace_member(
             "role": target_role.value,
             "invited_at": invitation.created_at.isoformat(),
             "expires_at": expires_at.isoformat(),
+            "feature_permissions": invitation.feature_permissions,
+            "effective_permissions": effective_feature_permissions(
+                _org_plan_type(org), target_role, invitation.feature_permissions
+            ),
         },
         "delivery": {
             "email_sent": email_sent,
@@ -353,7 +352,7 @@ async def update_workspace_member(
                 raise HTTPException(status_code=400, detail="Invalid role") from exc
             assert_workspace_invite_allowed(org, target_role, admin_seat.role)
             invitation.role = target_role.value
-            if data.feature_permissions is None and plan != PlanType.ENTERPRISE:
+            if data.feature_permissions is None:
                 invitation.feature_permissions = _default_invite_permissions(
                     org, target_role
                 )
