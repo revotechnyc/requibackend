@@ -353,7 +353,7 @@ async def update_workspace_member(
                 raise HTTPException(status_code=400, detail="Invalid role") from exc
             assert_workspace_invite_allowed(org, target_role, admin_seat.role)
             invitation.role = target_role.value
-            if data.feature_permissions is None:
+            if data.feature_permissions is None and plan != PlanType.ENTERPRISE:
                 invitation.feature_permissions = _default_invite_permissions(
                     org, target_role
                 )
@@ -404,8 +404,6 @@ async def update_workspace_member(
         seat.feature_permissions = sanitize_permissions_payload(
             data.feature_permissions, plan, seat.role
         )
-    elif data.role is not None:
-        seat.feature_permissions = _default_invite_permissions(org, seat.role)
 
     await db.commit()
     if user:

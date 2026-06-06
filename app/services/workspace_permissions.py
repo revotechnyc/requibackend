@@ -165,6 +165,12 @@ def member_can_access_feature(
     if role == UserRole.ADMIN:
         return True
     perms = effective_feature_permissions(plan, role, stored)
+    normalized = normalize_stored_permissions(stored)
+    if plan == PlanType.ENTERPRISE and normalized is not None:
+        if feature in perms:
+            return perms[feature]
+        if feature in MANAGEABLE_FEATURE_KEYS:
+            return False
     if feature in perms:
         return perms[feature]
     return role_default_allows(feature, role)
