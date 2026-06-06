@@ -23,6 +23,7 @@ from app.db.models import (
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
 )
+from app.services.workspace_permissions import effective_feature_permissions
 
 INVITE_TTL_DAYS = 7
 TEAM_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
@@ -158,8 +159,22 @@ def _expire_if_needed(inv: WorkspaceInvitation) -> None:
         inv.status = WorkspaceInvitationStatus.EXPIRED.value
 
 
+def _org_plan_type(org: Organization) -> PlanType:
+    if org.subscription and org.subscription.plan_type:
+        return org.subscription.plan_type
+    return PlanType.STANDARD
+
+
 async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict:
     """Pending invitations (all roles) + active seats (all roles)."""
+    org_result = await db.execute(
+        select(Organization)
+        .where(Organization.id == org_id)
+        .options(selectinload(Organization.subscription))
+    )
+    org = org_result.scalar_one_or_none()
+    plan = _org_plan_type(org) if org else PlanType.STANDARD
+
     inv_result = await db.execute(
         select(WorkspaceInvitation)
         .where(WorkspaceInvitation.organization_id == org_id)
@@ -189,6 +204,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
         if st == WorkspaceInvitationStatus.ACCEPTED.value:
             continue
         seen_emails.add(email)
+        inv_role = UserRole(invite_role_value(inv.role))
         members.append(
             {
                 "id": str(inv.id),
@@ -203,6 +219,11 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "invitation_id": str(inv.id),
                 "seat_id": None,
                 "revocable": st == WorkspaceInvitationStatus.PENDING.value,
+                "member_type": "invitation",
+                "feature_permissions": inv.feature_permissions,
+                "effective_permissions": effective_feature_permissions(
+                    plan, inv_role, inv.feature_permissions
+                ),
             }
         )
 
@@ -227,6 +248,12 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "invitation_id": None,
                 "seat_id": str(seat.id),
                 "revocable": seat.role == UserRole.VIEWER,
+                "member_type": "seat",
+                "user_id": str(seat.user_id),
+                "feature_permissions": seat.feature_permissions,
+                "effective_permissions": effective_feature_permissions(
+                    plan, seat.role, seat.feature_permissions
+                ),
             }
         )
 

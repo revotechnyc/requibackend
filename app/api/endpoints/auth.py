@@ -243,8 +243,12 @@ def _org_payload(
     seat: Seat,
     subscription: Optional[Subscription] = None,
 ) -> dict:
+    from app.services.workspace_permissions import effective_feature_permissions
+    from app.db.models import PlanType
+
     subscription = subscription or org.subscription
     plan_type = subscription.plan_type.value if subscription else "standard"
+    plan_enum = subscription.plan_type if subscription else PlanType.STANDARD
     return {
         "id": str(org.id),
         "name": org.name,
@@ -252,6 +256,10 @@ def _org_payload(
         "plan": plan_type,
         "subscription_status": subscription.status.value if subscription else None,
         "subscription": _subscription_payload(subscription),
+        "feature_permissions": seat.feature_permissions,
+        "effective_permissions": effective_feature_permissions(
+            plan_enum, seat.role, seat.feature_permissions
+        ),
     }
 
 
@@ -271,12 +279,20 @@ async def _organizations_for_user(user_id, db: AsyncSession) -> list:
         subscription_info = _subscription_payload(org.subscription)
         if org.subscription:
             plan_type = org.subscription.plan_type.value
+        from app.services.workspace_permissions import effective_feature_permissions
+        from app.db.models import PlanType
+
+        plan_enum = org.subscription.plan_type if org.subscription else PlanType.STANDARD
         organizations.append({
             "id": str(org.id),
             "name": org.name,
             "role": seat.role.value,
             "plan": plan_type,
             "subscription": subscription_info,
+            "feature_permissions": seat.feature_permissions,
+            "effective_permissions": effective_feature_permissions(
+                plan_enum, seat.role, seat.feature_permissions
+            ),
         })
     return organizations
 
@@ -633,6 +649,22 @@ async def get_me(
             primary_plan = org.subscription.plan_type.value
             primary_subscription = _subscription_payload(org.subscription)
 
+    feature_permissions = None
+    effective_permissions = None
+    if seat:
+        from app.services.workspace_permissions import effective_feature_permissions
+        from app.db.models import PlanType
+
+        plan_enum = (
+            seat.organization.subscription.plan_type
+            if seat.organization and seat.organization.subscription
+            else PlanType.STANDARD
+        )
+        feature_permissions = seat.feature_permissions
+        effective_permissions = effective_feature_permissions(
+            plan_enum, seat.role, seat.feature_permissions
+        )
+
     return {
         "id": str(current_user.id),
         "email": current_user.email,
@@ -644,6 +676,8 @@ async def get_me(
         "subscription": primary_subscription,
         "primary_organization_id": primary_org_id,
         "organizations": organizations,
+        "feature_permissions": feature_permissions,
+        "effective_permissions": effective_permissions,
     }
 
 
@@ -774,12 +808,14 @@ async def accept_invitation(
     if seat:
         seat.is_active = True
         seat.role = invite_role
+        seat.feature_permissions = inv.feature_permissions
     else:
         seat = Seat(
             organization_id=inv.organization_id,
             user_id=user.id,
             role=invite_role,
             is_active=True,
+            feature_permissions=inv.feature_permissions,
         )
         db.add(seat)
 

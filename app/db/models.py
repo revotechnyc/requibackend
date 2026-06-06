@@ -363,6 +363,9 @@ class Seat(Base):
     
     # Status
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Optional per-member tab overrides (null = use role defaults)
+    feature_permissions: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -415,6 +418,8 @@ class WorkspaceInvitation(Base):
     first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    feature_permissions: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

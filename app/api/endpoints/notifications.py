@@ -75,14 +75,13 @@ def _to_response(n) -> NotificationResponse:
     )
 
 
-@router.get("/", response_model=NotificationListResponse)
-async def list_notifications(
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    unread_only: bool = Query(False),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
-):
+async def _list_notifications_handler(
+    limit: int,
+    offset: int,
+    unread_only: bool,
+    db: AsyncSession,
+    current_user: User,
+) -> NotificationListResponse:
     svc = NotificationService(db)
     notifications = await svc.get_user_notifications(
         user_id=current_user.id,
@@ -95,6 +94,20 @@ async def list_notifications(
         notifications=[_to_response(n) for n in notifications],
         total=len(notifications),
         unread_count=unread_count,
+    )
+
+
+@router.get("", response_model=NotificationListResponse, include_in_schema=False)
+@router.get("/", response_model=NotificationListResponse)
+async def list_notifications(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    unread_only: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    return await _list_notifications_handler(
+        limit, offset, unread_only, db, current_user
     )
 
 

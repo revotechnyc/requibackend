@@ -153,7 +153,27 @@ async def init_db() -> None:
         await _ensure_userrole_enum_values(conn)
         await _ensure_workspace_tasks_table(conn)
         await _ensure_compliance_tables(conn)
+        await _ensure_member_feature_permissions_columns(conn)
         await _ensure_notification_type_enum_values(conn)
+
+
+async def _ensure_member_feature_permissions_columns(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE seats
+            ADD COLUMN IF NOT EXISTS feature_permissions JSONB
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_invitations
+            ADD COLUMN IF NOT EXISTS feature_permissions JSONB
+            """
+        )
+    )
 
 
 async def _ensure_compliance_tables(conn) -> None:
@@ -226,8 +246,12 @@ async def _ensure_compliance_tables(conn) -> None:
 
 
 async def _ensure_notification_type_enum_values(conn) -> None:
-    """Add task reminder values to PG notificationtype enum when missing."""
-    for value in ("task_due_soon", "task_due_today", "task_overdue"):
+    """Add task reminder values to PG notificationtype enum when missing.
+
+    Existing notification types use UPPERCASE labels (WELCOME, TRIAL_STARTED, …).
+    SQLAlchemy sends enum member names to PostgreSQL — task types must match.
+    """
+    for value in ("TASK_DUE_SOON", "TASK_DUE_TODAY", "TASK_OVERDUE"):
         await conn.execute(
             text(
                 f"""

@@ -4,30 +4,39 @@ Workspace member invites — Pro/Enterprise viewers; Enterprise paid seats.
 
 import uuid as uuid_lib
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, EmailStr, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.auth import get_current_active_user
 from app.db.database import get_db
 from app.db.models import (
+    Organization,
+    PlanType,
     Seat,
     User,
     UserRole,
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
 )
+from app.services.workspace_permissions import (
+    effective_feature_permissions,
+    sanitize_permissions_payload,
+)
 from app.services.email_service import send_workspace_member_invite_email
 from app.services.workspace_invite_service import (
     INVITE_TTL_DAYS,
+    _org_plan_type,
     assert_workspace_invite_allowed,
     generate_invite_token,
     get_admin_seat,
     invite_accept_url,
     invite_role_value,
+    invite_status_value,
     list_viewers_for_org,
     list_workspace_members_for_org,
     role_label,
@@ -66,6 +75,113 @@ class WorkspaceMemberInvite(BaseModel):
 class ViewerInvite(WorkspaceMemberInvite):
     """Backward-compatible alias (viewer default)."""
     pass
+
+
+class WorkspaceMemberUpdate(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: Optional[str] = None
+    feature_permissions: Optional[Dict[str, bool]] = None
+
+
+async def _resolve_member_in_org(
+    member_id: str,
+    org_id,
+    db: AsyncSession,
+) -> tuple[str, WorkspaceInvitation | Seat, User | None]:
+    try:
+        member_uuid = uuid_lib.UUID(member_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Member not found") from exc
+
+    inv_result = await db.execute(
+        select(WorkspaceInvitation)
+        .where(
+            WorkspaceInvitation.id == member_uuid,
+            WorkspaceInvitation.organization_id == org_id,
+        )
+        .options(selectinload(WorkspaceInvitation.organization).selectinload(Organization.subscription))
+    )
+    invitation = inv_result.scalar_one_or_none()
+    if invitation:
+        return "invitation", invitation, None
+
+    seat_result = await db.execute(
+        select(Seat)
+        .where(Seat.id == member_uuid, Seat.organization_id == org_id)
+        .options(
+            selectinload(Seat.user),
+            selectinload(Seat.organization).selectinload(Organization.subscription),
+        )
+    )
+    seat = seat_result.scalar_one_or_none()
+    if seat:
+        return "seat", seat, seat.user
+
+    raise HTTPException(status_code=404, detail="Member not found")
+
+
+def _member_detail_payload(
+    member_type: str,
+    invitation: WorkspaceInvitation | None,
+    seat: Seat | None,
+    user: User | None,
+    plan: PlanType,
+) -> dict:
+    if member_type == "invitation" and invitation:
+        role = UserRole(invite_role_value(invitation.role))
+        return {
+            "id": str(invitation.id),
+            "member_type": "invitation",
+            "email": invitation.email,
+            "first_name": invitation.first_name,
+            "last_name": invitation.last_name,
+            "status": invite_status_value(invitation.status),
+            "role": role.value,
+            "invited_at": invitation.created_at.isoformat() if invitation.created_at else None,
+            "expires_at": invitation.expires_at.isoformat() if invitation.expires_at else None,
+            "accepted_at": invitation.accepted_at.isoformat() if invitation.accepted_at else None,
+            "revocable": invitation.status == WorkspaceInvitationStatus.PENDING.value,
+            "feature_permissions": invitation.feature_permissions,
+            "effective_permissions": effective_feature_permissions(
+                plan, role, invitation.feature_permissions
+            ),
+            "editable_fields": ["first_name", "last_name", "role", "feature_permissions"],
+        }
+
+    if member_type == "seat" and seat:
+        user_email = user.email if user else ""
+        return {
+            "id": str(seat.id),
+            "member_type": "seat",
+            "user_id": str(seat.user_id),
+            "email": user_email,
+            "first_name": user.first_name if user else "",
+            "last_name": user.last_name if user else "",
+            "status": "active" if seat.is_active else "revoked",
+            "role": seat.role.value,
+            "invited_at": seat.created_at.isoformat() if seat.created_at else None,
+            "accepted_at": seat.created_at.isoformat() if seat.created_at else None,
+            "revocable": seat.role == UserRole.VIEWER,
+            "feature_permissions": seat.feature_permissions,
+            "effective_permissions": effective_feature_permissions(
+                plan, seat.role, seat.feature_permissions
+            ),
+            "editable_fields": ["first_name", "last_name", "role", "feature_permissions"],
+        }
+
+    raise HTTPException(status_code=404, detail="Member not found")
+
+
+def _default_invite_permissions(org: Organization, role: UserRole) -> dict:
+    from app.services.workspace_permissions import (
+        default_feature_permissions,
+        sanitize_permissions_payload,
+    )
+
+    plan = _org_plan_type(org)
+    defaults = default_feature_permissions(plan, role)
+    return sanitize_permissions_payload(defaults, plan, role)
 
 
 @router.post("/invite", response_model=dict, status_code=status.HTTP_201_CREATED)
@@ -122,6 +238,7 @@ async def invite_workspace_member(
         last_name=(data.last_name or "").strip() or None,
         message=(data.message or "").strip() or None,
         expires_at=expires_at,
+        feature_permissions=_default_invite_permissions(org, target_role),
     )
     db.add(invitation)
     await db.flush()
@@ -183,6 +300,121 @@ async def list_workspace_members(
     payload = await list_viewers_for_org(org.id, db)
     payload["workspace_id"] = str(org.id)
     return payload
+
+
+@router.get("/members/{member_id}", response_model=dict)
+async def get_workspace_member(
+    member_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get a single member (active seat or pending invitation) for admin edit."""
+    org, _seat = await get_admin_seat(current_user, db)
+    member_type, record, user = await _resolve_member_in_org(member_id, org.id, db)
+    plan = _org_plan_type(org)
+    if member_type == "invitation":
+        return {
+            "member": _member_detail_payload("invitation", record, None, None, plan),
+            "workspace_id": str(org.id),
+            "plan": plan.value,
+        }
+    return {
+        "member": _member_detail_payload("seat", None, record, user, plan),
+        "workspace_id": str(org.id),
+        "plan": plan.value,
+    }
+
+
+@router.patch("/members/{member_id}", response_model=dict)
+async def update_workspace_member(
+    member_id: str,
+    data: WorkspaceMemberUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update member profile, role, and tab permissions."""
+    org, admin_seat = await get_admin_seat(current_user, db)
+    member_type, record, user = await _resolve_member_in_org(member_id, org.id, db)
+    plan = _org_plan_type(org)
+
+    if member_type == "invitation":
+        invitation: WorkspaceInvitation = record
+        if invitation.status != WorkspaceInvitationStatus.PENDING.value:
+            raise HTTPException(status_code=400, detail="Only pending invitations can be edited")
+
+        if data.first_name is not None:
+            invitation.first_name = data.first_name.strip() or None
+        if data.last_name is not None:
+            invitation.last_name = data.last_name.strip() or None
+        if data.role is not None:
+            try:
+                target_role = UserRole(data.role.strip().lower())
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid role") from exc
+            assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+            invitation.role = target_role.value
+            if data.feature_permissions is None:
+                invitation.feature_permissions = _default_invite_permissions(
+                    org, target_role
+                )
+        if data.feature_permissions is not None:
+            if plan != PlanType.ENTERPRISE:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Custom module permissions require an Enterprise plan",
+                )
+            role_for_perm = UserRole(invite_role_value(invitation.role))
+            invitation.feature_permissions = sanitize_permissions_payload(
+                data.feature_permissions, plan, role_for_perm
+            )
+
+        await db.commit()
+        await db.refresh(invitation)
+        return {
+            "member": _member_detail_payload("invitation", invitation, None, None, plan),
+            "message": "Invitation updated.",
+        }
+
+    seat: Seat = record
+    if not seat.is_active:
+        raise HTTPException(status_code=400, detail="Cannot edit inactive members")
+
+    if data.first_name is not None and user:
+        user.first_name = data.first_name.strip() or user.first_name
+    if data.last_name is not None and user:
+        user.last_name = data.last_name.strip() or user.last_name
+    if data.role is not None:
+        try:
+            target_role = UserRole(data.role.strip().lower())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid role") from exc
+        if seat.user_id == current_user.id and target_role != UserRole.ADMIN:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot change your own role from admin here",
+            )
+        assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+        seat.role = target_role
+    if data.feature_permissions is not None:
+        if plan != PlanType.ENTERPRISE:
+            raise HTTPException(
+                status_code=403,
+                detail="Custom module permissions require an Enterprise plan",
+            )
+        seat.feature_permissions = sanitize_permissions_payload(
+            data.feature_permissions, plan, seat.role
+        )
+    elif data.role is not None:
+        seat.feature_permissions = _default_invite_permissions(org, seat.role)
+
+    await db.commit()
+    if user:
+        await db.refresh(user)
+    await db.refresh(seat)
+    return {
+        "member": _member_detail_payload("seat", None, seat, user, plan),
+        "message": "Member updated.",
+    }
 
 
 @router.get("/members", response_model=dict)
