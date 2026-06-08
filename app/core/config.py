@@ -41,6 +41,11 @@ class Settings(BaseSettings):
         default=None,
         description="PostgreSQL URL; overrides DB_* when set",
     )
+    # IPv4 Session Pooler URL (Supabase Connect → Session). Required on AWS EC2 / IPv4-only hosts.
+    database_pooler_url: Optional[str] = Field(
+        default=None,
+        description="When set, used instead of DATABASE_URL for app connections",
+    )
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "requi_health"
@@ -51,15 +56,21 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def assemble_database_url(self) -> "Settings":
+        pooler = (self.database_pooler_url or "").strip()
         url = (self.database_url or "").strip()
-        if not url:
+        if pooler:
+            # EC2 / Docker bridge: Supabase Session pooler (IPv4). Copy from dashboard Connect → Session.
+            self.database_url = pooler
+        elif not url:
             user = quote_plus(self.db_user)
             password = quote_plus(self.db_password)
             url = (
                 f"postgresql://{user}:{password}"
                 f"@{self.db_host}:{self.db_port}/{self.db_name}"
             )
-        self.database_url = url
+            self.database_url = url
+        else:
+            self.database_url = url
         return self
     
     # Redis
