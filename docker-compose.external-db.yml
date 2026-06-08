@@ -1,0 +1,47 @@
+# Live / remote Postgres (e.g. Supabase direct URL is IPv6-only).
+# Docker bridge networks often lack IPv6 — API uses host networking so DB
+# connectivity matches running uvicorn on the host.
+#
+# Redis is published on host port 6380 (6379 is often taken by a local Redis).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.external-db.yml up --build -d
+#
+services:
+  redis:
+    ports:
+      - "6380:6379"
+
+  api:
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://127.0.0.1:6380/0
+      CELERY_BROKER_URL: redis://127.0.0.1:6380/1
+      CELERY_RESULT_BACKEND: redis://127.0.0.1:6380/2
+
+  worker:
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://127.0.0.1:6380/0
+      CELERY_BROKER_URL: redis://127.0.0.1:6380/1
+      CELERY_RESULT_BACKEND: redis://127.0.0.1:6380/2
+
+  beat:
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://127.0.0.1:6380/0
+      CELERY_BROKER_URL: redis://127.0.0.1:6380/1
+      CELERY_RESULT_BACKEND: redis://127.0.0.1:6380/2
+
+  flower:
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2

@@ -1,5 +1,8 @@
 version: '3.8'
 
+# Live Supabase / remote DATABASE_URL: use docker-compose.external-db.yml overlay
+# (Docker bridge lacks IPv6; Supabase direct hostnames are IPv6-only).
+
 services:
   api:
     build:

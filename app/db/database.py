@@ -14,21 +14,61 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import settings
 
-# Convert PostgreSQL URL to async version
+def _is_external_database() -> bool:
+    """Managed/cloud Postgres (Supabase, RDS, Neon, etc.)."""
+    url = (settings.database_url or "").lower()
+    return any(
+        host in url
+        for host in (
+            "supabase.co",
+            "amazonaws.com",
+            "neon.tech",
+            "render.com",
+            "railway.app",
+        )
+    )
+
+
 def get_async_database_url() -> str:
-    """Convert sync PostgreSQL URL to async"""
+    """Convert sync PostgreSQL URL to async."""
     url = settings.database_url
+    if url.startswith("postgresql+asyncpg://"):
+        return url
     if url.startswith("postgresql://"):
         return url.replace("postgresql://", "postgresql+asyncpg://", 1)
     return url
 
+
+def _engine_connect_args() -> dict:
+    """SSL for managed Postgres when not already set in the URL."""
+    url = (settings.database_url or "").lower()
+    if "sslmode=" in url or "ssl=" in url:
+        return {}
+    if _is_external_database():
+        return {"ssl": "require"}
+    return {}
+
+
+def _effective_pool_size() -> int:
+    if _is_external_database():
+        return min(settings.database_pool_size, 8)
+    return settings.database_pool_size
+
+
+def _effective_max_overflow() -> int:
+    if _is_external_database():
+        return min(settings.database_max_overflow, 4)
+    return settings.database_max_overflow
+
+
 # Create async engine
 async_engine = create_async_engine(
     get_async_database_url(),
-    pool_size=settings.database_pool_size,
-    max_overflow=settings.database_max_overflow,
+    pool_size=_effective_pool_size(),
+    max_overflow=_effective_max_overflow(),
     pool_pre_ping=True,
     echo=settings.debug,
+    connect_args=_engine_connect_args(),
 )
 
 # Create async session factory
@@ -245,12 +285,23 @@ async def _ensure_compliance_tables(conn) -> None:
     )
 
 
+async def _pg_type_exists(conn, type_name: str) -> bool:
+    result = await conn.execute(
+        text("SELECT 1 FROM pg_type WHERE typname = :name"),
+        {"name": type_name},
+    )
+    return result.scalar() is not None
+
+
 async def _ensure_notification_type_enum_values(conn) -> None:
     """Add task reminder values to PG notificationtype enum when missing.
 
     Existing notification types use UPPERCASE labels (WELCOME, TRIAL_STARTED, …).
     SQLAlchemy sends enum member names to PostgreSQL — task types must match.
     """
+    if not await _pg_type_exists(conn, "notificationtype"):
+        return
+
     for value in ("TASK_DUE_SOON", "TASK_DUE_TODAY", "TASK_OVERDUE"):
         await conn.execute(
             text(
@@ -393,6 +444,9 @@ async def _ensure_seats_role_varchar_columns(conn) -> None:
 
 async def _ensure_userrole_enum_values(conn) -> None:
     """Add reviewer/contributor to PG userrole enum when missing (safe re-deploy)."""
+    if not await _pg_type_exists(conn, "userrole"):
+        return
+
     for value in ("reviewer", "contributor", "approver"):
         await conn.execute(
             text(

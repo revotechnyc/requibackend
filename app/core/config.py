@@ -187,6 +187,7 @@ class Settings(BaseSettings):
     document_upload_dir: str = "data/document_uploads"
     s3_bucket_name: Optional[str] = None
     s3_region: str = "us-east-1"
+    s3_endpoint_url: Optional[str] = None
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     

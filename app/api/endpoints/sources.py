@@ -9,7 +9,7 @@ import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,9 +21,10 @@ from app.core.permissions import Feature, require_feature_dependency
 from app.db.database import get_db
 from app.db.models import Document, DocumentChunk, Organization, Source, SourceType, User
 from app.services.document_storage import (
+    build_document_file_url,
     content_type_for_extension,
+    read_document_file,
     remove_document_file,
-    resolve_storage_path,
     save_document_file,
 )
 from app.services.compliance_ai_integration import process_intelligence_compliance_update
@@ -132,6 +133,8 @@ def _serialize_document(document: Document, chunk_count: int = 0) -> dict:
         "chunk_count": chunk_count,
         "is_active": document.is_active,
         "has_original_file": bool(document.storage_path),
+        "storage_path": document.storage_path,
+        "file_url": build_document_file_url(document.storage_path),
     }
 
 
@@ -309,7 +312,20 @@ async def upload_document_file(
     uploader = f"{current_user.first_name} {current_user.last_name}".strip() or current_user.email
 
     doc_id = uuid.uuid4()
-    storage_path = save_document_file(organization.id, doc_id, filename, raw)
+    file_content_type = file.content_type or content_type_for_extension(ext)
+    try:
+        storage_path = save_document_file(
+            organization.id,
+            doc_id,
+            filename,
+            raw,
+            content_type=file_content_type,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
 
     document = Document(
         id=doc_id,
@@ -493,7 +509,7 @@ async def download_document_file(
             detail="Original file is not available for this document. Re-upload to enable download.",
         )
     try:
-        path = resolve_storage_path(document.storage_path)
+        file_bytes = read_document_file(document.storage_path)
     except (ValueError, FileNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -503,10 +519,10 @@ async def download_document_file(
     meta = document.document_metadata or {}
     ext = meta.get("file_extension", "")
     media_type = meta.get("content_type") or content_type_for_extension(ext)
-    return FileResponse(
-        path=path,
+    return Response(
+        content=file_bytes,
         media_type=media_type,
-        filename=document.title,
+        headers={"Content-Disposition": f'attachment; filename="{document.title}"'},
     )
 
 
