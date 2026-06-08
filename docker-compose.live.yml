@@ -3,8 +3,9 @@
 # Supabase direct hostnames are IPv6-only; Docker bridge networks usually lack
 # IPv6. API/worker/beat use host networking (same connectivity as venv on host).
 #
-#   docker-compose -f docker-compose.live.yml up --build -d
-#   docker-compose -f docker-compose.live.yml down
+#   docker compose -f docker-compose.live.yml up --build -d
+#   docker compose -f docker-compose.live.yml down
+#   # or: ./scripts/start-api-live.sh
 #
 version: '3.8'
 
