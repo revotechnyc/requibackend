@@ -23,17 +23,11 @@ from app.db.models import (
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
 )
+from app.services.seat_allocation import PAID_ROLES, billing_snapshot_for_org, is_paid_role
 from app.services.workspace_permissions import effective_feature_permissions
 
 INVITE_TTL_DAYS = 7
 TEAM_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
-PAID_ROLES = {
-    UserRole.ADMIN,
-    UserRole.REVIEWER,
-    UserRole.APPROVER,
-    UserRole.CONTRIBUTOR,
-    UserRole.SEO,
-}
 
 
 def generate_invite_token() -> str:
@@ -224,6 +218,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "effective_permissions": effective_feature_permissions(
                     plan, inv_role, inv.feature_permissions
                 ),
+                "seat_allocated": is_paid_role(inv_role),
             }
         )
 
@@ -254,6 +249,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "effective_permissions": effective_feature_permissions(
                     plan, seat.role, seat.feature_permissions
                 ),
+                "seat_allocated": is_paid_role(seat.role),
             }
         )
 
@@ -266,7 +262,8 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
         "viewers": len(viewers),
         "paid": len(paid),
     }
-    return {"members": members, "viewers": viewers, "counts": counts}
+    billing = await billing_snapshot_for_org(org, db) if org else {}
+    return {"members": members, "viewers": viewers, "counts": counts, "billing": billing}
 
 
 # Backward-compatible alias for viewer-only list endpoint

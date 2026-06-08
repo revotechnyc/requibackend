@@ -29,6 +29,12 @@ from app.services.workspace_permissions import (
     sanitize_permissions_payload,
 )
 from app.services.email_service import send_workspace_member_invite_email
+from app.services.seat_allocation import (
+    billing_snapshot_for_org,
+    is_paid_role,
+    release_paid_seat_if_unused,
+    reserve_paid_seat,
+)
 from app.services.workspace_invite_service import (
     INVITE_TTL_DAYS,
     _org_plan_type,
@@ -219,6 +225,10 @@ async def invite_workspace_member(
     if pending.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A pending invitation already exists for this email")
 
+    seat_billing = None
+    if is_paid_role(target_role):
+        seat_billing = await reserve_paid_seat(org, db)
+
     token = generate_invite_token()
     expires_at = datetime.utcnow() + timedelta(days=INVITE_TTL_DAYS)
 
@@ -257,6 +267,14 @@ async def invite_workspace_member(
 
     await db.commit()
 
+    billing = await billing_snapshot_for_org(org, db)
+    seat_message = ""
+    if seat_billing and seat_billing.get("seat_added"):
+        seat_message = (
+            f" 1 paid seat added to your subscription "
+            f"({seat_billing['previous_seat_quantity']} → {seat_billing['new_seat_quantity']})."
+        )
+
     return {
         "member": {
             "id": str(invitation.id),
@@ -271,15 +289,17 @@ async def invite_workspace_member(
             "effective_permissions": effective_feature_permissions(
                 _org_plan_type(org), target_role, invitation.feature_permissions
             ),
+            "seat_allocated": is_paid_role(target_role),
         },
+        "seat_billing": seat_billing,
+        "billing": billing,
         "delivery": {
             "email_sent": email_sent,
             "accept_url": accept_link if not email_sent else None,
         },
         "message": (
-            "Invitation email sent."
-            if email_sent
-            else "Invitation created. Email was not sent (check SMTP settings)."
+            ("Invitation email sent." if email_sent else "Invitation created. Email was not sent (check SMTP settings).")
+            + seat_message
         ),
     }
 
@@ -351,6 +371,13 @@ async def update_workspace_member(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Invalid role") from exc
             assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+            previous_role = UserRole(invite_role_value(invitation.role))
+            was_paid = is_paid_role(previous_role)
+            will_be_paid = is_paid_role(target_role)
+            if will_be_paid and not was_paid:
+                await reserve_paid_seat(org, db)
+            elif was_paid and not will_be_paid:
+                await release_paid_seat_if_unused(org, db)
             invitation.role = target_role.value
             if data.feature_permissions is None:
                 invitation.feature_permissions = _default_invite_permissions(
@@ -393,6 +420,12 @@ async def update_workspace_member(
                 detail="You cannot change your own role from admin here",
             )
         assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+        was_paid = is_paid_role(seat.role)
+        will_be_paid = is_paid_role(target_role)
+        if will_be_paid and not was_paid:
+            await reserve_paid_seat(org, db)
+        elif was_paid and not will_be_paid:
+            await release_paid_seat_if_unused(org, db)
         seat.role = target_role
     if data.feature_permissions is not None:
         if plan != PlanType.ENTERPRISE:
@@ -414,6 +447,21 @@ async def update_workspace_member(
     }
 
 
+@router.get("/seat-usage", response_model=dict)
+async def get_seat_usage(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Billed vs allocated paid seats (for invite gating UI)."""
+    org, _seat = await get_admin_seat(current_user, db)
+    billing = await billing_snapshot_for_org(org, db)
+    return {
+        "workspace_id": str(org.id),
+        "plan": _org_plan_type(org).value,
+        "billing": billing,
+    }
+
+
 @router.get("/members", response_model=dict)
 async def list_all_workspace_members(
     current_user: User = Depends(get_current_active_user),
@@ -423,6 +471,7 @@ async def list_all_workspace_members(
     org, _seat = await get_admin_seat(current_user, db)
     payload = await list_workspace_members_for_org(org.id, db)
     payload["workspace_id"] = str(org.id)
+    payload["billing"] = await billing_snapshot_for_org(org, db)
     return payload
 
 
@@ -452,7 +501,11 @@ async def revoke_workspace_member(
             if invitation.status == WorkspaceInvitationStatus.REVOKED.value:
                 raise HTTPException(status_code=400, detail="Invitation already revoked")
             invitation.status = WorkspaceInvitationStatus.REVOKED.value
+            seat_billing = None
+            if is_paid_role(invite_role_value(invitation.role)):
+                seat_billing = await release_paid_seat_if_unused(org, db)
             await db.commit()
+            billing = await billing_snapshot_for_org(org, db)
             return {
                 "member": {
                     "id": str(invitation.id),
@@ -460,6 +513,8 @@ async def revoke_workspace_member(
                     "status": "revoked",
                     "role": invite_role_value(invitation.role),
                 },
+                "seat_billing": seat_billing,
+                "billing": billing,
                 "message": "Invitation revoked.",
             }
 
