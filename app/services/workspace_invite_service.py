@@ -23,6 +23,11 @@ from app.db.models import (
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
 )
+from app.services.enterprise_roles import (
+    can_assign_enterprise_admin,
+    is_workspace_admin,
+    role_display_payload,
+)
 from app.services.seat_allocation import PAID_ROLES, billing_snapshot_for_org, is_paid_role
 from app.services.workspace_permissions import effective_feature_permissions
 
@@ -69,7 +74,7 @@ async def get_admin_seat(user: User, db: AsyncSession) -> tuple[Organization, Se
         raise HTTPException(status_code=403, detail="No active workspace")
 
     for seat in seats:
-        if seat.role == UserRole.ADMIN:
+        if is_workspace_admin(seat.role):
             org = seat.organization
             sub = org.subscription
             if sub and sub.status in (
@@ -89,6 +94,7 @@ def assert_workspace_invite_allowed(
     org: Organization,
     target_role: UserRole,
     inviter_role: Optional[UserRole] = None,
+    inviter_user_id: Optional[UUID] = None,
 ) -> None:
     sub = org.subscription
     if not sub or sub.status not in (
@@ -110,10 +116,25 @@ def assert_workspace_invite_allowed(
         if plan != PlanType.ENTERPRISE:
             raise HTTPException(
                 status_code=403,
-                detail="Paid seat invites (Admin, Reviewer, Approver, Contributor, SEO) require Enterprise",
+                detail="Paid seat invites require an Enterprise plan",
             )
     else:
         raise HTTPException(status_code=400, detail="Invalid role for invitation")
+
+    if target_role == UserRole.ENTERPRISE_ADMIN:
+        if plan != PlanType.ENTERPRISE:
+            raise HTTPException(
+                status_code=403,
+                detail="Enterprise Admin seats require an Enterprise plan",
+            )
+        if inviter_role is not None and inviter_user_id is not None:
+            if not can_assign_enterprise_admin(
+                inviter_role, inviter_user_id, org.owner_id
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Only the account owner or an Enterprise Admin can invite Enterprise Admin seats",
+                )
 
     if inviter_role is not None:
         from app.core.permissions import PermissionChecker
@@ -168,6 +189,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
     )
     org = org_result.scalar_one_or_none()
     plan = _org_plan_type(org) if org else PlanType.STANDARD
+    owner_id = org.owner_id if org else None
 
     inv_result = await db.execute(
         select(WorkspaceInvitation)
@@ -219,6 +241,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                     plan, inv_role, inv.feature_permissions
                 ),
                 "seat_allocated": is_paid_role(inv_role),
+                "role_display": role_display_payload(inv_role),
             }
         )
 
@@ -250,6 +273,9 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                     plan, seat.role, seat.feature_permissions
                 ),
                 "seat_allocated": is_paid_role(seat.role),
+                "role_display": role_display_payload(
+                    seat.role, user_id=seat.user_id, owner_id=owner_id
+                ),
             }
         )
 

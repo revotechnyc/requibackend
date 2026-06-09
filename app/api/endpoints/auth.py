@@ -30,6 +30,7 @@ from app.db.models import (
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
 )
+from app.services.enterprise_roles import owner_role_for_plan
 from app.services.workspace_invite_service import (
     assert_workspace_invite_allowed,
     get_invitation_by_token,
@@ -339,7 +340,7 @@ async def register(
     seat = Seat(
         organization_id=org.id,
         user_id=user.id,
-        role=UserRole.ADMIN,
+        role=owner_role_for_plan(plan_type),
         is_active=True,
     )
     db.add(seat)
@@ -442,7 +443,7 @@ async def register_checkout(
     seat = Seat(
         organization_id=org.id,
         user_id=user.id,
-        role=UserRole.ADMIN,
+        role=owner_role_for_plan(plan_type),
         is_active=True,
     )
     db.add(seat)
@@ -672,7 +673,15 @@ async def get_me(
         "last_name": current_user.last_name,
         "plan": primary_plan,
         "role": primary_role,
-        "is_admin": primary_role == "admin",
+        "is_admin": primary_role in ("admin", "enterprise_admin"),
+        "is_billing_admin": bool(
+            seat
+            and seat.organization
+            and (
+                primary_role == "enterprise_admin"
+                or seat.organization.owner_id == current_user.id
+            )
+        ),
         "subscription": primary_subscription,
         "primary_organization_id": primary_org_id,
         "organizations": organizations,

@@ -20,6 +20,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import FeatureGate, PLAN_FEATURES
+from app.services.enterprise_roles import is_workspace_admin
 from app.db.database import get_db
 from app.db.models import (
     Organization,
@@ -91,8 +92,16 @@ VALID_TRANSITIONS = {
     TaskStatus.COMPLETED: [],
 }
 
-REVIEWER_PICK_ROLES = {UserRole.REVIEWER.value, UserRole.ADMIN.value}
-APPROVER_PICK_ROLES = {UserRole.APPROVER.value, UserRole.ADMIN.value}
+REVIEWER_PICK_ROLES = {
+    UserRole.REVIEWER.value,
+    UserRole.ADMIN.value,
+    UserRole.ENTERPRISE_ADMIN.value,
+}
+APPROVER_PICK_ROLES = {
+    UserRole.APPROVER.value,
+    UserRole.ADMIN.value,
+    UserRole.ENTERPRISE_ADMIN.value,
+}
 ASSIGNEE_PICK_ROLES = {
     UserRole.CONTRIBUTOR.value,
     UserRole.SEO.value,
@@ -240,7 +249,7 @@ def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> 
 
 def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
     """Start work, submit for review, resume after rejection — assignee or admin only."""
-    if user_role == UserRole.ADMIN:
+    if is_workspace_admin(user_role):
         return True
     if user_role not in (UserRole.CONTRIBUTOR, UserRole.SEO):
         return False
@@ -248,7 +257,7 @@ def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRo
 
 
 def _can_user_review(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
-    if user_role == UserRole.ADMIN:
+    if is_workspace_admin(user_role):
         return True
     if user_role != UserRole.REVIEWER:
         return False
@@ -258,7 +267,7 @@ def _can_user_review(task: WorkspaceTask, user: User, user_role: UserRole) -> bo
 
 
 def _can_user_approve(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
-    if user_role == UserRole.ADMIN:
+    if is_workspace_admin(user_role):
         return True
     if user_role != UserRole.APPROVER:
         return False
@@ -423,7 +432,14 @@ def _workflow_notice(
 
 
 def _task_visible_to_user(task: WorkspaceTask, user_id: UUID, user_role: UserRole) -> bool:
-    if user_role in (UserRole.ADMIN, UserRole.REVIEWER, UserRole.APPROVER, UserRole.VIEWER, UserRole.SEO):
+    if user_role in (
+        UserRole.ENTERPRISE_ADMIN,
+        UserRole.ADMIN,
+        UserRole.REVIEWER,
+        UserRole.APPROVER,
+        UserRole.VIEWER,
+        UserRole.SEO,
+    ):
         return True
     if user_role == UserRole.CONTRIBUTOR:
         return task.creator_id == user_id or task.assignee_id == user_id
@@ -507,7 +523,7 @@ async def create_task(
         )
     else:
         # Pro: single-owner — admin (or creator) is assignee by default
-        if user_role == UserRole.ADMIN:
+        if is_workspace_admin(user_role):
             assignee_id = current_user.id
         elif user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
             assignee_id = current_user.id
@@ -596,8 +612,16 @@ async def list_tasks(
         "tasks": serialized,
         "counts": counts,
         "can_create": user_role not in (UserRole.VIEWER, UserRole.REVIEWER, UserRole.APPROVER),
-        "can_review": user_role in (UserRole.ADMIN, UserRole.REVIEWER),
-        "can_approve": user_role in (UserRole.ADMIN, UserRole.APPROVER),
+        "can_review": user_role in (
+            UserRole.ENTERPRISE_ADMIN,
+            UserRole.ADMIN,
+            UserRole.REVIEWER,
+        ),
+        "can_approve": user_role in (
+            UserRole.ENTERPRISE_ADMIN,
+            UserRole.ADMIN,
+            UserRole.APPROVER,
+        ),
         "is_enterprise": enterprise,
     }
 
@@ -622,12 +646,14 @@ async def get_task(
     return {
         "task": _serialize_task(task, org),
         "permissions": {
-            "can_edit": user_role in (UserRole.ADMIN, UserRole.CONTRIBUTOR) and (
-                user_role == UserRole.ADMIN or is_owner
-            ),
+            "can_edit": user_role in (
+                UserRole.ENTERPRISE_ADMIN,
+                UserRole.ADMIN,
+                UserRole.CONTRIBUTOR,
+            ) and (is_workspace_admin(user_role) or is_owner),
             "can_review": _can_user_review(task, current_user, user_role),
             "can_approve": _can_user_approve(task, current_user, user_role),
-            "can_delete": user_role == UserRole.ADMIN,
+            "can_delete": is_workspace_admin(user_role),
             "can_submit": user_role != UserRole.VIEWER,
             "is_enterprise": enterprise,
             **workflow,
@@ -851,7 +877,7 @@ async def delete_task(
     db: AsyncSession = Depends(get_db),
 ):
     org, _seat, user_role = await _get_workspace_context(current_user, db)
-    if user_role != UserRole.ADMIN:
+    if not is_workspace_admin(user_role):
         raise HTTPException(status_code=403, detail="Only Admin can delete tasks")
 
     task = await _get_task_for_org(task_id, org.id, db)

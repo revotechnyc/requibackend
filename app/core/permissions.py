@@ -28,9 +28,11 @@ from app.db.models import (
 # ==========================
 
 ROLE_HIERARCHY = {
-    UserRole.ADMIN: 100,
+    UserRole.ENTERPRISE_ADMIN: 100,
+    UserRole.ADMIN: 90,
     UserRole.APPROVER: 75,
     UserRole.REVIEWER: 70,
+    UserRole.ANALYST: 55,
     UserRole.CONTRIBUTOR: 50,
     UserRole.PRESIDENT: 90,
     UserRole.VICE_PRESIDENT: 80,
@@ -115,9 +117,14 @@ PLAN_FEATURES = {
 # ==========================
 
 ROLE_PERMISSIONS = {
-    UserRole.ADMIN: [
+    UserRole.ENTERPRISE_ADMIN: [
         "view", "create", "edit", "delete", "manage",
         "admin", "billing", "upgrade", "invite", "remove_user",
+        "change_role", "view_audit", "publish_blog", "manage_blog",
+    ],
+    UserRole.ADMIN: [
+        "view", "create", "edit", "delete", "manage",
+        "admin", "upgrade", "invite", "remove_user",
         "change_role", "view_audit", "publish_blog", "manage_blog",
     ],
     UserRole.REVIEWER: [
@@ -130,6 +137,9 @@ ROLE_PERMISSIONS = {
     UserRole.CONTRIBUTOR: [
         "view", "create", "edit", "submit",
         "work_modules", "view_assigned", "publish_blog",
+    ],
+    UserRole.ANALYST: [
+        "view", "reports", "analytics",
     ],
     UserRole.PRESIDENT: [
         "view", "create", "edit", "manage", "approve",
@@ -224,14 +234,27 @@ class PermissionChecker:
     
     @staticmethod
     def can_administrate(user_role: UserRole) -> bool:
-        """Admin, President, VP — billing and org administration."""
+        """Admin, President, VP — org administration (not billing; see is_billing_owner)."""
         return ROLE_HIERARCHY.get(user_role, 0) >= ROLE_HIERARCHY.get(UserRole.VICE_PRESIDENT, 80)
+
+    @staticmethod
+    def is_billing_owner(
+        user_id,
+        organization: Organization,
+        seat_role: Optional[UserRole] = None,
+    ) -> bool:
+        """Account owner and Enterprise Admin seats manage billing."""
+        if organization.owner_id == user_id:
+            return True
+        return seat_role == UserRole.ENTERPRISE_ADMIN
 
     @staticmethod
     def can_manage_role(manager_role: UserRole, target_role: UserRole) -> bool:
         """Check if manager_role can manage target_role"""
-        if manager_role == UserRole.ADMIN:
+        if manager_role == UserRole.ENTERPRISE_ADMIN:
             return True
+        if manager_role == UserRole.ADMIN:
+            return target_role != UserRole.ENTERPRISE_ADMIN
         return ROLE_HIERARCHY.get(manager_role, 0) > ROLE_HIERARCHY.get(target_role, 0)
     
     @staticmethod

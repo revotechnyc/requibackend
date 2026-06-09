@@ -29,6 +29,11 @@ from app.services.workspace_permissions import (
     sanitize_permissions_payload,
 )
 from app.services.email_service import send_workspace_member_invite_email
+from app.services.enterprise_roles import (
+    INVITEABLE_ENTERPRISE_ROLES,
+    role_catalog_for_api,
+    role_display_payload,
+)
 from app.services.seat_allocation import (
     billing_snapshot_for_org,
     is_paid_role,
@@ -51,14 +56,7 @@ from app.services.workspace_invite_service import (
 
 router = APIRouter()
 
-INVITEABLE_ROLE_VALUES = {
-    UserRole.VIEWER.value,
-    UserRole.ADMIN.value,
-    UserRole.REVIEWER.value,
-    UserRole.APPROVER.value,
-    UserRole.CONTRIBUTOR.value,
-    UserRole.SEO.value,
-}
+INVITEABLE_ROLE_VALUES = frozenset(INVITEABLE_ENTERPRISE_ROLES)
 
 
 class WorkspaceMemberInvite(BaseModel):
@@ -74,7 +72,7 @@ class WorkspaceMemberInvite(BaseModel):
         r = (v or UserRole.VIEWER.value).strip().lower()
         if r not in INVITEABLE_ROLE_VALUES:
             raise ValueError(
-                "role must be one of: admin, reviewer, approver, contributor, seo, viewer"
+                "role must be one of: enterprise_admin, admin, reviewer, approver, contributor, analyst, viewer"
             )
         return r
 
@@ -198,7 +196,9 @@ async def invite_workspace_member(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid role")
 
-    assert_workspace_invite_allowed(org, target_role, seat.role)
+    assert_workspace_invite_allowed(
+        org, target_role, seat.role, inviter_user_id=current_user.id
+    )
 
     email = data.email.strip().lower()
 
@@ -370,7 +370,12 @@ async def update_workspace_member(
                 target_role = UserRole(data.role.strip().lower())
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Invalid role") from exc
-            assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+            assert_workspace_invite_allowed(
+                org,
+                target_role,
+                admin_seat.role,
+                inviter_user_id=current_user.id,
+            )
             previous_role = UserRole(invite_role_value(invitation.role))
             was_paid = is_paid_role(previous_role)
             will_be_paid = is_paid_role(target_role)
@@ -414,12 +419,21 @@ async def update_workspace_member(
             target_role = UserRole(data.role.strip().lower())
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="Invalid role") from exc
-        if seat.user_id == current_user.id and target_role != UserRole.ADMIN:
-            raise HTTPException(
-                status_code=400,
-                detail="You cannot change your own role from admin here",
-            )
-        assert_workspace_invite_allowed(org, target_role, admin_seat.role)
+        if seat.user_id == current_user.id and admin_seat.role in (
+            UserRole.ADMIN,
+            UserRole.ENTERPRISE_ADMIN,
+        ):
+            if target_role not in (UserRole.ADMIN, UserRole.ENTERPRISE_ADMIN):
+                raise HTTPException(
+                    status_code=400,
+                    detail="You cannot change your own admin role here",
+                )
+        assert_workspace_invite_allowed(
+            org,
+            target_role,
+            admin_seat.role,
+            inviter_user_id=current_user.id,
+        )
         was_paid = is_paid_role(seat.role)
         will_be_paid = is_paid_role(target_role)
         if will_be_paid and not was_paid:
@@ -459,6 +473,7 @@ async def get_seat_usage(
         "workspace_id": str(org.id),
         "plan": _org_plan_type(org).value,
         "billing": billing,
+        "role_catalog": role_catalog_for_api(),
     }
 
 
@@ -472,6 +487,7 @@ async def list_all_workspace_members(
     payload = await list_workspace_members_for_org(org.id, db)
     payload["workspace_id"] = str(org.id)
     payload["billing"] = await billing_snapshot_for_org(org, db)
+    payload["role_catalog"] = role_catalog_for_api()
     return payload
 
 

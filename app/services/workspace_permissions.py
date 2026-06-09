@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from app.db.models import PlanType, UserRole
+from app.services.enterprise_roles import has_full_access
 
 # Local copy avoids circular import (permissions.py imports auth).
 PLAN_FEATURES: dict[PlanType, list[str]] = {
@@ -73,19 +74,20 @@ MANAGEABLE_FEATURE_KEYS = (
 )
 
 ROLE_FEATURE_ACCESS: dict[str, tuple[str, ...]] = {
-    "intelligence": ("admin", "reviewer", "contributor", "seo"),
-    "dashboard": ("admin", "reviewer", "contributor", "viewer", "seo"),
-    "workflow": ("admin", "reviewer", "contributor", "viewer", "seo"),
-    "tasks": ("admin", "reviewer", "approver", "contributor", "viewer", "seo"),
-    "compliance": ("admin", "reviewer", "contributor", "viewer", "seo"),
-    "calendar": ("admin", "reviewer", "contributor", "viewer", "seo"),
-    "documents": ("admin", "reviewer", "contributor", "seo"),
-    "news": ("admin", "reviewer", "contributor", "seo"),
-    "blog": ("admin", "seo"),
-    "teams": ("admin",),
-    "analytics": ("admin", "reviewer"),
-    "integrations": ("admin",),
-    "settings": ("admin",),
+    # Enterprise Admin + Admin: full module access (billing gated separately)
+    "intelligence": ("enterprise_admin", "admin", "reviewer", "contributor", "analyst", "seo"),
+    "dashboard": ("enterprise_admin", "admin", "reviewer", "contributor", "viewer", "analyst", "seo"),
+    "workflow": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "seo"),
+    "tasks": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "seo"),
+    "compliance": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "analyst", "seo"),
+    "calendar": ("enterprise_admin", "admin", "reviewer", "contributor", "viewer", "seo"),
+    "documents": ("enterprise_admin", "admin", "reviewer", "contributor", "seo"),
+    "news": ("enterprise_admin", "admin", "reviewer", "contributor", "seo"),
+    "blog": ("enterprise_admin", "admin", "seo"),
+    "teams": ("enterprise_admin", "admin"),
+    "analytics": ("enterprise_admin", "admin", "reviewer", "analyst"),
+    "integrations": ("enterprise_admin", "admin"),
+    "settings": ("enterprise_admin", "admin"),
 }
 
 
@@ -94,7 +96,7 @@ def _plan_feature_set(plan: PlanType) -> set[str]:
 
 
 def role_default_allows(feature: str, role: UserRole) -> bool:
-    if role == UserRole.ADMIN:
+    if has_full_access(role):
         return True
     allowed = ROLE_FEATURE_ACCESS.get(feature)
     if not allowed:
@@ -142,7 +144,7 @@ def sanitize_permissions_payload(
     """Persisted map: only manageable keys; cannot enable features not on plan."""
     plan_feats = _plan_feature_set(plan)
     stored = normalize_stored_permissions(raw) or {}
-    if role == UserRole.ADMIN:
+    if has_full_access(role):
         return {key: key in plan_feats for key in MANAGEABLE_FEATURE_KEYS}
     result: dict[str, bool] = {}
     for key in MANAGEABLE_FEATURE_KEYS:
@@ -159,7 +161,7 @@ def effective_feature_permissions(
     stored: Any,
 ) -> dict[str, bool]:
     normalized = normalize_stored_permissions(stored)
-    if role == UserRole.ADMIN:
+    if has_full_access(role):
         return default_feature_permissions(plan, role)
     if normalized is not None:
         return sanitize_permissions_payload(normalized, plan, role)
@@ -174,7 +176,7 @@ def member_can_access_feature(
 ) -> bool:
     if feature not in _plan_feature_set(plan):
         return False
-    if role == UserRole.ADMIN:
+    if has_full_access(role):
         return True
     perms = effective_feature_permissions(plan, role, stored)
     normalized = normalize_stored_permissions(stored)

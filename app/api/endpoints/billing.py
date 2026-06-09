@@ -68,8 +68,13 @@ async def create_subscription(
     )
     seat = seat_result.scalar_one_or_none()
     
-    if not seat or not PermissionChecker.can_administrate(seat.role):
-        raise HTTPException(status_code=403, detail="Only administrators can manage billing")
+    if not seat or not PermissionChecker.is_billing_owner(
+        current_user.id, org, seat.role
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Enterprise Admins can manage billing",
+        )
     
     # Check if subscription already exists
     if org.subscription and org.subscription.is_active():
@@ -125,8 +130,13 @@ async def update_subscription(
     )
     seat = seat_result.scalar_one_or_none()
     
-    if not seat or not PermissionChecker.can_administrate(seat.role):
-        raise HTTPException(status_code=403, detail="Only administrators can manage billing")
+    if not seat or not PermissionChecker.is_billing_owner(
+        current_user.id, org, seat.role
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Enterprise Admins can manage billing",
+        )
     
     # Parse plan type if provided
     plan_type = None
@@ -179,8 +189,13 @@ async def cancel_subscription(
     )
     seat = seat_result.scalar_one_or_none()
     
-    if not seat or not PermissionChecker.can_administrate(seat.role):
-        raise HTTPException(status_code=403, detail="Only administrators can manage billing")
+    if not seat or not PermissionChecker.is_billing_owner(
+        current_user.id, org, seat.role
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Enterprise Admins can manage billing",
+        )
     
     try:
         cancelled = await BillingService.cancel_subscription(db, subscription, immediately)
@@ -234,10 +249,12 @@ async def create_checkout_session(
         )
     )
     seat = seat_result.scalar_one_or_none()
-    if not seat or not PermissionChecker.can_administrate(seat.role):
+    if not seat or not PermissionChecker.is_billing_owner(
+        current_user.id, org, seat.role
+    ):
         raise HTTPException(
             status_code=403,
-            detail="Only administrators can manage billing",
+            detail="Only Enterprise Admins can manage billing",
         )
     
     # Ensure customer exists

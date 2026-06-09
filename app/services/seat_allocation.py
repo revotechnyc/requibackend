@@ -20,14 +20,16 @@ from app.db.models import (
     WorkspaceInvitationStatus,
 )
 from app.services.billing import BillingService
+from app.services.enterprise_roles import (
+    PAID_INVITE_ROLES,
+    ROLE_SEAT_PRICE_CENTS,
+    STANDARD_ENTERPRISE_SEAT_CENTS,
+    seat_price_cents_for_member,
+)
 
-PAID_ROLES = frozenset({
-    UserRole.ADMIN,
-    UserRole.REVIEWER,
-    UserRole.APPROVER,
-    UserRole.CONTRIBUTOR,
-    UserRole.SEO,
-})
+PAID_ROLES = frozenset(
+    UserRole(r) for r in PAID_INVITE_ROLES if r != UserRole.VIEWER.value
+) | frozenset({UserRole.SEO, UserRole.ENTERPRISE_ADMIN})
 
 
 def is_paid_role(role: UserRole | str) -> bool:
@@ -163,20 +165,64 @@ async def release_paid_seat_if_unused(
     }
 
 
+async def _estimated_monthly_cents_for_org(
+    org: Organization,
+    db: AsyncSession,
+) -> int:
+    """Sum per-member seat prices (owner admin = $3,500, other paid = $500)."""
+    owner_id = org.owner_id
+    total = 0
+
+    seat_result = await db.execute(
+        select(Seat).where(
+            Seat.organization_id == org.id,
+            Seat.is_active == True,
+            Seat.role.in_(tuple(PAID_ROLES)),
+        )
+    )
+    for seat in seat_result.scalars().all():
+        total += seat_price_cents_for_member(
+            seat.role, user_id=seat.user_id, owner_id=owner_id
+        )
+
+    inv_result = await db.execute(
+        select(WorkspaceInvitation).where(
+            WorkspaceInvitation.organization_id == org.id,
+            WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING.value,
+            WorkspaceInvitation.role.in_([r.value for r in PAID_ROLES]),
+        )
+    )
+    for inv in inv_result.scalars().all():
+        try:
+            role = UserRole(str(inv.role).lower())
+        except ValueError:
+            continue
+        total += seat_price_cents_for_member(role)
+
+    return total
+
+
 def seat_billing_summary(
     subscription: Optional[Subscription],
     allocated_paid_seats: int,
     plan: PlanType,
+    *,
+    estimated_monthly_cents: int = 0,
 ) -> dict:
     billed = subscription.seat_quantity if subscription else 0
-    price_cents = settings.get_plan_price(plan.value)
+    default_cents = settings.get_plan_price(plan.value)
     return {
         "seat_quantity": billed,
         "allocated_paid_seats": allocated_paid_seats,
         "available_paid_seats": max(0, billed - allocated_paid_seats),
-        "price_per_seat_cents": price_cents,
-        "price_per_seat_display": price_cents / 100,
-        "estimated_monthly_cents": billed * price_cents,
+        "price_per_seat_cents": default_cents,
+        "price_per_seat_display": default_cents / 100,
+        "standard_seat_price_cents": STANDARD_ENTERPRISE_SEAT_CENTS,
+        "standard_seat_price_display": STANDARD_ENTERPRISE_SEAT_CENTS / 100,
+        "enterprise_owner_seat_price_cents": ROLE_SEAT_PRICE_CENTS["enterprise_admin"],
+        "enterprise_owner_seat_price_display": ROLE_SEAT_PRICE_CENTS["enterprise_admin"] / 100,
+        "estimated_monthly_cents": estimated_monthly_cents,
+        "estimated_monthly_display": estimated_monthly_cents / 100,
     }
 
 
@@ -190,4 +236,7 @@ async def billing_snapshot_for_org(
         else PlanType.STANDARD
     )
     allocated = await count_paid_seats_allocated(org.id, db)
-    return seat_billing_summary(org.subscription, allocated, plan)
+    estimated = await _estimated_monthly_cents_for_org(org, db)
+    return seat_billing_summary(
+        org.subscription, allocated, plan, estimated_monthly_cents=estimated
+    )

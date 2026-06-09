@@ -152,7 +152,7 @@ async def get_my_role(
         "level": ROLE_HIERARCHY[role],
         "permissions": ROLE_PERMISSIONS.get(role, []),
         "assignable_roles": [r.value for r in assignable],
-        "is_admin": role == UserRole.ADMIN,
+        "is_admin": role in (UserRole.ADMIN, UserRole.ENTERPRISE_ADMIN),
         "can_manage": PermissionChecker.can_manage_role(role, UserRole.VIEWER),
     }
 
