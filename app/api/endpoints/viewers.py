@@ -72,7 +72,7 @@ class WorkspaceMemberInvite(BaseModel):
         r = (v or UserRole.VIEWER.value).strip().lower()
         if r not in INVITEABLE_ROLE_VALUES:
             raise ValueError(
-                "role must be one of: enterprise_admin, admin, reviewer, approver, contributor, analyst, viewer"
+                "role must be one of: admin, reviewer, approver, contributor, analyst, viewer"
             )
         return r
 

@@ -377,6 +377,8 @@ async def get_plans():
             "name": "Enterprise",
             "price_per_seat": settings.enterprise_plan_price,
             "price_display": "$3,500/month",
+            "additional_seat_price": settings.standard_plan_price,
+            "additional_seat_price_display": "$500/month per additional user",
             "min_seats": settings.enterprise_plan_min_seats,
             "max_seats": settings.enterprise_plan_max_seats,
             "free_trial_days": 14,

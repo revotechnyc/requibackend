@@ -84,6 +84,10 @@ async def _set_subscription_seat_quantity(
 
     stripe_id = subscription.stripe_subscription_id or ""
     if BillingService._is_stripe_billed_subscription(stripe_id):
+        if subscription.plan_type == PlanType.ENTERPRISE:
+            return await BillingService.update_enterprise_total_seats(
+                db, subscription, new_quantity
+            )
         return await BillingService.update_subscription(
             db, subscription, new_seat_quantity=new_quantity
         )
@@ -194,10 +198,10 @@ async def _estimated_monthly_cents_for_org(
     )
     for inv in inv_result.scalars().all():
         try:
-            role = UserRole(str(inv.role).lower())
+            UserRole(str(inv.role).lower())
         except ValueError:
             continue
-        total += seat_price_cents_for_member(role)
+        total += STANDARD_ENTERPRISE_SEAT_CENTS
 
     return total
 

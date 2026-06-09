@@ -23,12 +23,61 @@ logger = logging.getLogger(__name__)
 
 class BillingService:
     """Stripe billing service"""
+
+    ENTERPRISE_BASE_SEAT_COUNT = 1
     
     PLAN_PRICE_MAP = {
         PlanType.STANDARD: settings.stripe_price_standard,
         PlanType.PRO: settings.stripe_price_pro,
         PlanType.ENTERPRISE: settings.stripe_price_enterprise,
     }
+
+    @staticmethod
+    def _enterprise_base_price_id() -> str:
+        return settings.stripe_price_enterprise
+
+    @staticmethod
+    def _enterprise_additional_price_id() -> str:
+        return settings.get_enterprise_additional_price_id()
+
+    @staticmethod
+    def _subscription_items(stripe_sub: dict) -> list:
+        items = stripe_sub.get("items")
+        if items is None:
+            return []
+        data = items.get("data") if hasattr(items, "get") else getattr(items, "data", None)
+        return list(data or [])
+
+    @staticmethod
+    def _find_subscription_item_by_price(stripe_sub: dict, price_id: str) -> Optional[dict]:
+        for item in BillingService._subscription_items(stripe_sub):
+            item_price = item.get("price") or {}
+            if item_price.get("id") == price_id:
+                return item
+        return None
+
+    @staticmethod
+    def _parse_enterprise_total_seats_from_stripe(stripe_sub: dict) -> int:
+        """
+        Enterprise billing: 1 base seat ($3,500) + N additional seats ($500).
+        Legacy subs with a single line item use that item's quantity as total.
+        """
+        base_price = BillingService._enterprise_base_price_id()
+        add_price = BillingService._enterprise_additional_price_id()
+        base_item = BillingService._find_subscription_item_by_price(stripe_sub, base_price)
+        add_item = BillingService._find_subscription_item_by_price(stripe_sub, add_price)
+
+        if base_item or add_item:
+            base_qty = int((base_item or {}).get("quantity") or 0)
+            add_qty = int((add_item or {}).get("quantity") or 0)
+            if base_qty <= 0 and add_qty > 0:
+                return BillingService.ENTERPRISE_BASE_SEAT_COUNT + add_qty
+            return max(base_qty, BillingService.ENTERPRISE_BASE_SEAT_COUNT) + add_qty
+
+        items = BillingService._subscription_items(stripe_sub)
+        if items:
+            return int(items[0].get("quantity") or 1)
+        return 1
     
     @staticmethod
     async def create_customer(
@@ -182,6 +231,10 @@ class BillingService:
         
         # Handle seat quantity change only
         elif new_seat_quantity and new_seat_quantity != subscription.seat_quantity:
+            if subscription.plan_type == PlanType.ENTERPRISE:
+                return await BillingService.update_enterprise_total_seats(
+                    db, subscription, new_seat_quantity
+                )
             # Validate limits
             limits = settings.get_plan_limits(subscription.plan_type.value)
             if new_seat_quantity < limits["min"] or new_seat_quantity > limits["max"]:
@@ -215,6 +268,82 @@ class BillingService:
             await db.commit()
             await db.refresh(subscription)
         
+        return subscription
+
+    @staticmethod
+    async def update_enterprise_total_seats(
+        db: AsyncSession,
+        subscription: Subscription,
+        total_seat_quantity: int,
+    ) -> Subscription:
+        """
+        Enterprise: keep 1 base seat at $3,500 and bill extras at $500/seat.
+        total_seat_quantity = 1 (owner) + additional paid users.
+        """
+        limits = settings.get_plan_limits(PlanType.ENTERPRISE.value)
+        if total_seat_quantity < limits["min"] or total_seat_quantity > limits["max"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Seat quantity must be between {limits['min']} and {limits['max']}",
+            )
+
+        additional_qty = max(0, total_seat_quantity - BillingService.ENTERPRISE_BASE_SEAT_COUNT)
+        base_price_id = BillingService._enterprise_base_price_id()
+        add_price_id = BillingService._enterprise_additional_price_id()
+
+        try:
+            stripe_sub = stripe.Subscription.retrieve(subscription.stripe_subscription_id)
+        except stripe.error.StripeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to load subscription: {str(e)}",
+            )
+
+        base_item = BillingService._find_subscription_item_by_price(stripe_sub, base_price_id)
+        add_item = BillingService._find_subscription_item_by_price(stripe_sub, add_price_id)
+        modify_items: list[dict] = []
+
+        if base_item:
+            modify_items.append({
+                "id": base_item["id"],
+                "quantity": BillingService.ENTERPRISE_BASE_SEAT_COUNT,
+            })
+        elif BillingService._subscription_items(stripe_sub):
+            first = BillingService._subscription_items(stripe_sub)[0]
+            modify_items.append({
+                "id": first["id"],
+                "quantity": BillingService.ENTERPRISE_BASE_SEAT_COUNT,
+            })
+        else:
+            modify_items.append({
+                "price": base_price_id,
+                "quantity": BillingService.ENTERPRISE_BASE_SEAT_COUNT,
+            })
+
+        if additional_qty > 0:
+            if add_item:
+                modify_items.append({"id": add_item["id"], "quantity": additional_qty})
+            else:
+                modify_items.append({"price": add_price_id, "quantity": additional_qty})
+        elif add_item:
+            modify_items.append({"id": add_item["id"], "deleted": True})
+
+        try:
+            stripe.Subscription.modify(
+                subscription.stripe_subscription_id,
+                items=modify_items,
+                proration_behavior="create_prorations",
+            )
+        except stripe.error.StripeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to update enterprise seats: {str(e)}",
+            )
+
+        subscription.seat_quantity = total_seat_quantity
+        subscription.stripe_price_id = base_price_id
+        await db.commit()
+        await db.refresh(subscription)
         return subscription
     
     @staticmethod
@@ -364,13 +493,22 @@ class BillingService:
     ) -> Subscription:
         """Upsert local subscription from a Stripe subscription object."""
         stripe_sub = stripe.Subscription.retrieve(stripe_subscription_id)
-        price_id = stripe_sub["items"]["data"][0]["price"]["id"]
+        item_price_ids = [
+            (item.get("price") or {}).get("id")
+            for item in BillingService._subscription_items(stripe_sub)
+        ]
+        price_id = item_price_ids[0] if item_price_ids else ""
         plan_type = plan_type_hint
         if not plan_type:
-            for pt, pid in BillingService.PLAN_PRICE_MAP.items():
-                if pid == price_id:
-                    plan_type = pt
-                    break
+            base_ent = BillingService._enterprise_base_price_id()
+            add_ent = BillingService._enterprise_additional_price_id()
+            if base_ent in item_price_ids or add_ent in item_price_ids:
+                plan_type = PlanType.ENTERPRISE
+            else:
+                for pt, pid in BillingService.PLAN_PRICE_MAP.items():
+                    if pid in item_price_ids:
+                        plan_type = pt
+                        break
         if not plan_type:
             meta_plan = (stripe_sub.get("metadata") or {}).get("plan_type")
             if meta_plan:
@@ -395,7 +533,12 @@ class BillingService:
         )
         period_start = BillingService._stripe_ts_to_dt(period_start_ts)
         period_end = BillingService._stripe_ts_to_dt(period_end_ts)
-        seat_qty = int(stripe_sub["items"]["data"][0].get("quantity") or 1)
+        if plan_type == PlanType.ENTERPRISE:
+            seat_qty = BillingService._parse_enterprise_total_seats_from_stripe(stripe_sub)
+            price_id = BillingService._enterprise_base_price_id()
+        else:
+            price_id = stripe_sub["items"]["data"][0]["price"]["id"]
+            seat_qty = int(stripe_sub["items"]["data"][0].get("quantity") or 1)
 
         if subscription:
             subscription.stripe_subscription_id = stripe_subscription_id
@@ -666,6 +809,10 @@ class BillingService:
             if stripe_sub.get("cancel_at_period_end") is not None
             else data.get("cancel_at_period_end", False)
         )
+        if subscription.plan_type == PlanType.ENTERPRISE:
+            subscription.seat_quantity = BillingService._parse_enterprise_total_seats_from_stripe(
+                stripe_sub
+            )
         await db.commit()
         logger.info(
             "customer.subscription.updated: sub_id=%s status=%s cancel_at_period_end=%s",

@@ -24,7 +24,6 @@ from app.db.models import (
     WorkspaceInvitationStatus,
 )
 from app.services.enterprise_roles import (
-    can_assign_enterprise_admin,
     is_workspace_admin,
     role_display_payload,
 )
@@ -122,19 +121,10 @@ def assert_workspace_invite_allowed(
         raise HTTPException(status_code=400, detail="Invalid role for invitation")
 
     if target_role == UserRole.ENTERPRISE_ADMIN:
-        if plan != PlanType.ENTERPRISE:
-            raise HTTPException(
-                status_code=403,
-                detail="Enterprise Admin seats require an Enterprise plan",
-            )
-        if inviter_role is not None and inviter_user_id is not None:
-            if not can_assign_enterprise_admin(
-                inviter_role, inviter_user_id, org.owner_id
-            ):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Only the account owner or an Enterprise Admin can invite Enterprise Admin seats",
-                )
+        raise HTTPException(
+            status_code=403,
+            detail="Enterprise Admin cannot be invited. This role is reserved for the account owner at signup.",
+        )
 
     if inviter_role is not None:
         from app.core.permissions import PermissionChecker

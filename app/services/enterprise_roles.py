@@ -24,8 +24,8 @@ ROLE_SEAT_PRICE_CENTS: dict[str, int] = {
 }
 
 # Roles Enterprise workspace admins may assign when inviting
+# Enterprise Admin is signup-only (account owner) — not invitable.
 INVITEABLE_ENTERPRISE_ROLES: tuple[str, ...] = (
-    UserRole.ENTERPRISE_ADMIN.value,
     UserRole.ADMIN.value,
     UserRole.APPROVER.value,
     UserRole.REVIEWER.value,
@@ -51,9 +51,9 @@ FULL_ACCESS_ROLES: frozenset[UserRole] = frozenset({
 ROLE_DISPLAY: dict[str, dict] = {
     UserRole.ENTERPRISE_ADMIN.value: {
         "label": "Enterprise Admin",
-        "description": "Full platform access — billing, teams, security, and all modules (same as account owner).",
+        "description": "Account owner at signup — billing, teams, security, and full platform access.",
         "price_cents": ENTERPRISE_OWNER_SEAT_CENTS,
-        "invitable": True,
+        "invitable": False,
     },
     UserRole.ADMIN.value: {
         "label": "Admin",
@@ -142,17 +142,12 @@ def seat_price_cents_for_member(
     owner_id: Optional[UUID] = None,
 ) -> int:
     value = role.value if isinstance(role, UserRole) else str(role).lower()
-    if value == UserRole.ENTERPRISE_ADMIN.value:
+    if value == UserRole.VIEWER.value:
+        return 0
+    # Only the account owner is billed at $3,500; all other paid users are $500.
+    if user_id is not None and owner_id is not None and user_id == owner_id:
         return ENTERPRISE_OWNER_SEAT_CENTS
-    # Legacy: signup owner stored as admin
-    if (
-        value == UserRole.ADMIN.value
-        and user_id is not None
-        and owner_id is not None
-        and user_id == owner_id
-    ):
-        return ENTERPRISE_OWNER_SEAT_CENTS
-    return ROLE_SEAT_PRICE_CENTS.get(value, STANDARD_ENTERPRISE_SEAT_CENTS)
+    return STANDARD_ENTERPRISE_SEAT_CENTS
 
 
 def display_role_key(
@@ -205,6 +200,9 @@ def role_display_payload(
         {"label": str(role), "description": "", "price_cents": 0},
     )
     price = seat_price_cents_for_member(role, user_id=user_id, owner_id=owner_id)
+    is_account_owner = bool(
+        user_id is not None and owner_id is not None and user_id == owner_id
+    )
     return {
         "role": role.value if isinstance(role, UserRole) else str(role).lower(),
         "display_role": key,
@@ -213,4 +211,5 @@ def role_display_payload(
         "price_cents": price,
         "price_display": price / 100,
         "is_paid": price > 0,
+        "is_account_owner": is_account_owner,
     }

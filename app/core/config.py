@@ -164,6 +164,10 @@ class Settings(BaseSettings):
     stripe_price_standard: str = Field(..., description="Stripe price ID for STANDARD plan")
     stripe_price_pro: str = Field(..., description="Stripe price ID for PRO plan")
     stripe_price_enterprise: str = Field(..., description="Stripe price ID for ENTERPRISE plan")
+    stripe_price_enterprise_additional: str = Field(
+        default="",
+        description="Stripe price ID for Enterprise additional users ($500/mo). Falls back to STANDARD price.",
+    )
 
     # Frontend base URL for Stripe Checkout redirects (no trailing slash)
     frontend_url: str = "http://localhost:5173"
@@ -178,7 +182,7 @@ class Settings(BaseSettings):
     pro_plan_max_seats: int = 50
     
     enterprise_plan_price: int = 350000  # $3,500/month
-    enterprise_plan_min_seats: int = 5
+    enterprise_plan_min_seats: int = 1
     enterprise_plan_max_seats: int = 1000
     
     # Knowledge Pipeline
@@ -299,6 +303,12 @@ class Settings(BaseSettings):
             "enterprise": self.enterprise_plan_price,
         }
         return prices.get(plan_type.lower(), 0)
+
+    def get_enterprise_additional_price_id(self) -> str:
+        """Stripe price for Enterprise additional seats ($500/mo per user)."""
+        if self.stripe_price_enterprise_additional.strip():
+            return self.stripe_price_enterprise_additional.strip()
+        return self.stripe_price_standard
     
     def get_plan_limits(self, plan_type: str) -> dict:
         """Get seat limits for a plan type"""
