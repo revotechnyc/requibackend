@@ -13,6 +13,7 @@ from app.api.endpoints import (
     platform_admin_auth,
     platform_admin_team,
     platform_admin_blog,
+    platform_admin_customers,
     platform_blog_public,
     chat_share,
     billing,
@@ -59,6 +60,13 @@ api_router.include_router(
     platform_admin_blog.router,
     prefix="/platform-admin/blog",
     tags=["platform-admin-blog"],
+    dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_customers.router,
+    prefix="/platform-admin/customers",
+    tags=["platform-admin-customers"],
     dependencies=platform_admin_dep,
 )
 
