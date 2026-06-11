@@ -192,6 +192,7 @@ async def init_db() -> None:
         await _ensure_seats_role_varchar_columns(conn)
         await _ensure_userrole_enum_values(conn)
         await _ensure_workspace_tasks_table(conn)
+        await _ensure_workspace_task_document_column(conn)
         await _ensure_compliance_tables(conn)
         await _ensure_member_feature_permissions_columns(conn)
         await _ensure_notification_type_enum_values(conn)
@@ -358,6 +359,18 @@ async def _ensure_workspace_tasks_table(conn) -> None:
         text(
             "CREATE INDEX IF NOT EXISTS idx_workspace_tasks_org_created "
             "ON workspace_tasks (organization_id, created_at DESC)"
+        )
+    )
+
+
+async def _ensure_workspace_task_document_column(conn) -> None:
+    """Optional document attachment on compliance tasks."""
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS document_id UUID REFERENCES documents(id)
+            """
         )
     )
 

@@ -23,6 +23,7 @@ from app.core.permissions import FeatureGate, PLAN_FEATURES
 from app.services.enterprise_roles import is_workspace_admin
 from app.db.database import get_db
 from app.db.models import (
+    Document,
     Organization,
     PlanType,
     Seat,
@@ -63,6 +64,7 @@ class TaskCreate(BaseModel):
     assignee_id: Optional[str] = None
     reviewer_id: Optional[str] = None
     approver_id: Optional[str] = None
+    document_id: Optional[str] = None
 
 
 class TaskUpdate(BaseModel):
@@ -75,6 +77,7 @@ class TaskUpdate(BaseModel):
     assignee_id: Optional[str] = None
     reviewer_id: Optional[str] = None
     approver_id: Optional[str] = None
+    document_id: Optional[str] = None
 
 
 class TaskStatusTransition(BaseModel):
@@ -92,19 +95,14 @@ VALID_TRANSITIONS = {
     TaskStatus.COMPLETED: [],
 }
 
-REVIEWER_PICK_ROLES = {
-    UserRole.REVIEWER.value,
-    UserRole.ADMIN.value,
+# Active workspace members pickable for assignee/reviewer/approver.
+# Excludes billing owner (enterprise_admin) and read-only viewers.
+TASK_PICK_EXCLUDED_ROLES = frozenset({
     UserRole.ENTERPRISE_ADMIN.value,
-}
-APPROVER_PICK_ROLES = {
-    UserRole.APPROVER.value,
-    UserRole.ADMIN.value,
-    UserRole.ENTERPRISE_ADMIN.value,
-}
-ASSIGNEE_PICK_ROLES = {
-    UserRole.CONTRIBUTOR.value,
-    UserRole.SEO.value,
+    UserRole.VIEWER.value,
+})
+TASK_PICK_ROLES = {
+    r.value for r in UserRole if r.value not in TASK_PICK_EXCLUDED_ROLES
 }
 
 
@@ -171,12 +169,41 @@ async def _get_task_for_org(
             selectinload(WorkspaceTask.assignee),
             selectinload(WorkspaceTask.reviewer),
             selectinload(WorkspaceTask.approver),
+            selectinload(WorkspaceTask.document),
         )
     )
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+async def _resolve_org_document(
+    org_id: UUID,
+    document_id: Optional[str],
+    db: AsyncSession,
+) -> Optional[UUID]:
+    if not document_id:
+        return None
+    try:
+        did = uuid_lib.UUID(document_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid document")
+
+    result = await db.execute(
+        select(Document).where(
+            Document.id == did,
+            Document.organization_id == org_id,
+            Document.is_active == True,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(
+            status_code=400,
+            detail="Document not found in your organization",
+        )
+    return did
 
 
 async def _resolve_org_member(
@@ -240,6 +267,8 @@ def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> 
         "reviewer_name": _user_display(task.reviewer),
         "approver_id": str(task.approver_id) if task.approver_id else None,
         "approver_name": _user_display(task.approver),
+        "document_id": str(task.document_id) if task.document_id else None,
+        "document_title": task.document.title if task.document else None,
         "comments": task.comments or [],
         "history": task.history or [],
         "created_at": task.created_at.isoformat() if task.created_at else None,
@@ -248,32 +277,33 @@ def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> 
 
 
 def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
-    """Start work, submit for review, resume after rejection — assignee or admin only."""
+    """Start work, submit for review, resume after rejection — assigned user or admin."""
     if is_workspace_admin(user_role):
         return True
-    if user_role not in (UserRole.CONTRIBUTOR, UserRole.SEO):
-        return False
-    return task.assignee_id is not None and task.assignee_id == user.id
+    if task.assignee_id is not None and task.assignee_id == user.id:
+        return True
+    # Legacy Pro tasks without explicit assignee — creator may complete
+    if task.assignee_id is None and task.creator_id == user.id:
+        return user_role in (UserRole.CONTRIBUTOR, UserRole.SEO)
+    return False
 
 
 def _can_user_review(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
     if is_workspace_admin(user_role):
         return True
-    if user_role != UserRole.REVIEWER:
-        return False
-    if task.reviewer_id and task.reviewer_id != user.id:
-        return False
-    return True
+    if task.reviewer_id:
+        return task.reviewer_id == user.id
+    # Legacy tasks with no named reviewer — seat role reviewer may act
+    return user_role == UserRole.REVIEWER
 
 
 def _can_user_approve(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
     if is_workspace_admin(user_role):
         return True
-    if user_role != UserRole.APPROVER:
-        return False
-    if task.approver_id and task.approver_id != user.id:
-        return False
-    return True
+    if task.approver_id:
+        return task.approver_id == user.id
+    # Legacy tasks with no named approver — seat role approver may act
+    return user_role == UserRole.APPROVER
 
 
 def _task_workflow_permissions(
@@ -439,11 +469,15 @@ def _task_visible_to_user(task: WorkspaceTask, user_id: UUID, user_role: UserRol
         UserRole.APPROVER,
         UserRole.VIEWER,
         UserRole.SEO,
+        UserRole.ANALYST,
     ):
         return True
-    if user_role == UserRole.CONTRIBUTOR:
-        return task.creator_id == user_id or task.assignee_id == user_id
-    return False
+    return (
+        task.creator_id == user_id
+        or task.assignee_id == user_id
+        or task.reviewer_id == user_id
+        or task.approver_id == user_id
+    )
 
 
 @router.get("/eligible-members", response_model=dict)
@@ -476,14 +510,12 @@ async def list_eligible_members(
             "role": _role_value(seat.role),
         }
 
-    assignees = [_member_row(s) for s in seats if _role_value(s.role) in ASSIGNEE_PICK_ROLES]
-    reviewers = [_member_row(s) for s in seats if _role_value(s.role) in REVIEWER_PICK_ROLES]
-    approvers = [_member_row(s) for s in seats if _role_value(s.role) in APPROVER_PICK_ROLES]
+    members = [_member_row(s) for s in seats if _role_value(s.role) in TASK_PICK_ROLES]
 
     return {
-        "assignees": assignees,
-        "reviewers": reviewers,
-        "approvers": approvers,
+        "assignees": members,
+        "reviewers": members,
+        "approvers": members,
         "is_enterprise": True,
     }
 
@@ -513,13 +545,13 @@ async def create_task(
     approver_id = None
     if enterprise:
         assignee_id = await _resolve_org_member(
-            org.id, data.assignee_id, ASSIGNEE_PICK_ROLES, db, "assignee"
+            org.id, data.assignee_id, TASK_PICK_ROLES, db, "assignee"
         )
         reviewer_id = await _resolve_org_member(
-            org.id, data.reviewer_id, REVIEWER_PICK_ROLES, db, "reviewer"
+            org.id, data.reviewer_id, TASK_PICK_ROLES, db, "reviewer"
         )
         approver_id = await _resolve_org_member(
-            org.id, data.approver_id, APPROVER_PICK_ROLES, db, "approver"
+            org.id, data.approver_id, TASK_PICK_ROLES, db, "approver"
         )
     else:
         # Pro: single-owner — admin (or creator) is assignee by default
@@ -527,6 +559,8 @@ async def create_task(
             assignee_id = current_user.id
         elif user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
             assignee_id = current_user.id
+
+    document_id = await _resolve_org_document(org.id, data.document_id, db)
 
     now = datetime.utcnow()
     history = [
@@ -544,6 +578,7 @@ async def create_task(
         assignee_id=assignee_id,
         reviewer_id=reviewer_id,
         approver_id=approver_id,
+        document_id=document_id,
         title=data.title.strip(),
         description=data.description or "",
         status=TaskStatus.PENDING.value,
@@ -558,7 +593,7 @@ async def create_task(
     )
     db.add(task)
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
 
     return {"task": _serialize_task(task, org), "message": "Task created"}
 
@@ -582,6 +617,7 @@ async def list_tasks(
             selectinload(WorkspaceTask.assignee),
             selectinload(WorkspaceTask.reviewer),
             selectinload(WorkspaceTask.approver),
+            selectinload(WorkspaceTask.document),
         )
         .order_by(desc(WorkspaceTask.created_at))
     )
@@ -654,7 +690,7 @@ async def get_task(
             "can_review": _can_user_review(task, current_user, user_role),
             "can_approve": _can_user_approve(task, current_user, user_role),
             "can_delete": is_workspace_admin(user_role),
-            "can_submit": user_role != UserRole.VIEWER,
+            "can_submit": _can_user_act_as_assignee(task, current_user, user_role),
             "is_enterprise": enterprise,
             **workflow,
         },
@@ -728,7 +764,7 @@ async def transition_task_status(
         if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
             raise HTTPException(
                 status_code=403,
-                detail="Only the assigned contributor/SEO or an admin can start this task",
+                detail="Only the assigned assignee or an admin can start this task",
             )
 
     if target_status == TaskStatus.IN_PROGRESS and current_status == TaskStatus.REJECTED:
@@ -739,8 +775,6 @@ async def transition_task_status(
             )
 
     if target_status == TaskStatus.SUBMITTED_FOR_REVIEW:
-        if user_role == UserRole.VIEWER:
-            raise HTTPException(status_code=403, detail="View-Only users cannot submit for review")
         if enterprise and not _can_user_act_as_assignee(task, current_user, user_role):
             raise HTTPException(
                 status_code=403,
@@ -853,20 +887,25 @@ async def update_task(
     if enterprise:
         if data.assignee_id is not None:
             task.assignee_id = await _resolve_org_member(
-                org.id, data.assignee_id or None, ASSIGNEE_PICK_ROLES, db, "assignee"
+                org.id, data.assignee_id or None, TASK_PICK_ROLES, db, "assignee"
             )
         if data.reviewer_id is not None:
             task.reviewer_id = await _resolve_org_member(
-                org.id, data.reviewer_id or None, REVIEWER_PICK_ROLES, db, "reviewer"
+                org.id, data.reviewer_id or None, TASK_PICK_ROLES, db, "reviewer"
             )
         if data.approver_id is not None:
             task.approver_id = await _resolve_org_member(
-                org.id, data.approver_id or None, APPROVER_PICK_ROLES, db, "approver"
+                org.id, data.approver_id or None, TASK_PICK_ROLES, db, "approver"
             )
+
+    if data.document_id is not None:
+        task.document_id = await _resolve_org_document(
+            org.id, data.document_id or None, db
+        )
 
     task.updated_at = datetime.utcnow()
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
     return {"task": _serialize_task(task, org), "message": "Task updated"}
 
 

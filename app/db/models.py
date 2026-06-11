@@ -470,6 +470,9 @@ class WorkspaceTask(Base):
     approver_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
+    document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
+    )
 
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -494,6 +497,7 @@ class WorkspaceTask(Base):
     assignee: Mapped[Optional["User"]] = relationship("User", foreign_keys=[assignee_id])
     reviewer: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reviewer_id])
     approver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[approver_id])
+    document: Mapped[Optional["Document"]] = relationship("Document")
 
 
 # ============================================
