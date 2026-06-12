@@ -474,6 +474,9 @@ class WorkspaceTask(Base):
         UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
     )
     document_ids: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    workflow_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_workflows.id"), nullable=True
+    )
 
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
@@ -499,6 +502,90 @@ class WorkspaceTask(Base):
     reviewer: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reviewer_id])
     approver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[approver_id])
     document: Mapped[Optional["Document"]] = relationship("Document")
+    workflow: Mapped[Optional["WorkspaceWorkflow"]] = relationship(
+        "WorkspaceWorkflow", back_populates="tasks"
+    )
+
+
+class WorkspaceWorkflowStatus(str, PyEnum):
+    OPEN = "open"
+    IN_REVIEW = "in_review"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+class WorkspaceWorkflow(Base):
+    """Case/ticket container linking tasks, documents, and activity."""
+    __tablename__ = "workspace_workflows"
+
+    __table_args__ = (
+        Index("idx_workspace_workflows_org_status", "organization_id", "status"),
+        Index("idx_workspace_workflows_org_created", "organization_id", "created_at"),
+        Index(
+            "idx_workspace_workflows_org_reference",
+            "organization_id",
+            "reference_code",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    creator_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    reference_code: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=WorkspaceWorkflowStatus.OPEN.value
+    )
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    external_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    priority: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    due_date: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    category: Mapped[str] = mapped_column(String(100), nullable=False, default="General")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    creator: Mapped["User"] = relationship("User", foreign_keys=[creator_id])
+    owner: Mapped["User"] = relationship("User", foreign_keys=[owner_id])
+    tasks: Mapped[List["WorkspaceTask"]] = relationship(
+        "WorkspaceTask", back_populates="workflow"
+    )
+
+
+class WorkflowActivity(Base):
+    """Audit feed for workspace workflows."""
+    __tablename__ = "workflow_activities"
+
+    __table_args__ = (
+        Index("idx_workflow_activities_workflow", "workflow_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_workflows.id"), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    actor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    actor: Mapped["User"] = relationship("User")
 
 
 # ============================================
@@ -632,7 +719,10 @@ class Document(Base):
     
     organization_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False)
     source_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("sources.id"), nullable=True)
-    
+    workflow_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_workflows.id"), nullable=True
+    )
+
     # Document info
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)

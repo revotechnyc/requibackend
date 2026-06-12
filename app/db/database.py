@@ -194,6 +194,10 @@ async def init_db() -> None:
         await _ensure_workspace_tasks_table(conn)
         await _ensure_workspace_task_document_column(conn)
         await _ensure_workspace_task_document_ids_column(conn)
+        await _ensure_workspace_workflows_table(conn)
+        await _ensure_workflow_activities_table(conn)
+        await _ensure_workspace_task_workflow_column(conn)
+        await _ensure_document_workflow_column(conn)
         await _ensure_compliance_tables(conn)
         await _ensure_member_feature_permissions_columns(conn)
         await _ensure_notification_type_enum_values(conn)
@@ -397,6 +401,105 @@ async def _ensure_workspace_task_document_ids_column(conn) -> None:
                 OR document_ids = '[]'::jsonb
                 OR document_ids = 'null'::jsonb
               )
+            """
+        )
+    )
+
+
+async def _ensure_workspace_workflows_table(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_workflows (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                creator_id UUID NOT NULL REFERENCES users(id),
+                owner_id UUID NOT NULL REFERENCES users(id),
+                reference_code VARCHAR(32) NOT NULL,
+                title VARCHAR(500) NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status VARCHAR(32) NOT NULL DEFAULT 'open',
+                source VARCHAR(32) NOT NULL DEFAULT 'manual',
+                external_ref VARCHAR(255),
+                priority VARCHAR(20) NOT NULL DEFAULT 'medium',
+                due_date VARCHAR(32),
+                category VARCHAR(100) NOT NULL DEFAULT 'General',
+                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'utc'),
+                completed_at TIMESTAMP WITHOUT TIME ZONE
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_workflows_org_reference
+            ON workspace_workflows (organization_id, reference_code)
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS idx_workspace_workflows_org_status
+            ON workspace_workflows (organization_id, status)
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS idx_workspace_workflows_org_created
+            ON workspace_workflows (organization_id, created_at DESC)
+            """
+        )
+    )
+
+
+async def _ensure_workflow_activities_table(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_activities (
+                id UUID PRIMARY KEY,
+                workflow_id UUID NOT NULL REFERENCES workspace_workflows(id) ON DELETE CASCADE,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                actor_id UUID NOT NULL REFERENCES users(id),
+                event_type VARCHAR(64) NOT NULL,
+                payload JSONB DEFAULT '{}'::jsonb,
+                created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS idx_workflow_activities_workflow
+            ON workflow_activities (workflow_id, created_at DESC)
+            """
+        )
+    )
+
+
+async def _ensure_workspace_task_workflow_column(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
+            """
+        )
+    )
+
+
+async def _ensure_document_workflow_column(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE documents
+            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
             """
         )
     )

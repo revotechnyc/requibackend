@@ -25,6 +25,7 @@ from app.api.endpoints import (
     scoring,
     sources,
     tasks,
+    workflows,
     calendar,
     compliance,
     teams,
@@ -124,6 +125,10 @@ api_router.include_router(
 # Tasks API — Full lifecycle with approval workflows
 api_router.include_router(
     tasks.router, prefix="/tasks", tags=["v2.1 — Tasks"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    workflows.router, prefix="/workflows", tags=["v2.1 — Workflows"], dependencies=auth_dep,
 )
 
 api_router.include_router(

@@ -21,6 +21,11 @@ from sqlalchemy.orm import selectinload
 from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import FeatureGate, PLAN_FEATURES
 from app.services.enterprise_roles import is_workspace_admin
+from app.services.workflow_service import (
+    create_workflow_for_task,
+    log_workflow_activity,
+    plan_has_workflow,
+)
 from app.db.database import get_db
 from app.db.models import (
     Document,
@@ -366,6 +371,7 @@ def _serialize_task(
         "documents": docs,
         "document_id": docs[0]["id"] if docs else None,
         "document_title": docs[0]["title"] if docs else None,
+        "workflow_id": str(task.workflow_id) if task.workflow_id else None,
         "comments": task.comments or [],
         "history": task.history or [],
         "created_at": task.created_at.isoformat() if task.created_at else None,
@@ -674,6 +680,23 @@ async def create_task(
         }
     ]
 
+    workflow_id = None
+    workflow_record = None
+    if plan_has_workflow(org):
+        owner_id = assignee_id or current_user.id
+        workflow_record = await create_workflow_for_task(
+            db,
+            org,
+            current_user,
+            title=data.title.strip(),
+            description=data.description or "",
+            priority=(data.priority or "medium").lower(),
+            category=data.category or "General",
+            due_date=data.due_date,
+            owner_id=owner_id,
+        )
+        workflow_id = workflow_record.id
+
     task = WorkspaceTask(
         organization_id=org.id,
         creator_id=current_user.id,
@@ -682,6 +705,7 @@ async def create_task(
         approver_id=approver_id,
         document_id=document_id,
         document_ids=resolved_doc_ids,
+        workflow_id=workflow_id,
         title=data.title.strip(),
         description=data.description or "",
         status=TaskStatus.PENDING.value,
@@ -696,11 +720,27 @@ async def create_task(
     )
     db.add(task)
     await db.flush()
+
+    if workflow_record:
+        await log_workflow_activity(
+            db,
+            workflow_record.id,
+            org.id,
+            current_user.id,
+            "task_linked",
+            {
+                "task_id": str(task.id),
+                "task_title": task.title,
+                "assignee_id": str(assignee_id) if assignee_id else None,
+            },
+        )
+
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "workflow_id": str(workflow_id) if workflow_id else None,
         "message": "Task created",
     }
 

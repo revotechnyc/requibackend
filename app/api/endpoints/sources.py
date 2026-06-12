@@ -19,7 +19,8 @@ from app.api.endpoints.auth import get_current_active_user
 from app.core.config import settings
 from app.core.permissions import Feature, require_feature_dependency
 from app.db.database import get_db
-from app.db.models import Document, DocumentChunk, Organization, Source, SourceType, User
+from app.db.models import Document, DocumentChunk, Organization, Source, SourceType, User, WorkspaceWorkflow
+from app.services.workflow_service import log_workflow_activity
 from app.services.document_storage import (
     build_document_file_url,
     content_type_for_extension,
@@ -271,10 +272,35 @@ async def list_documents(
     ]
 
 
+async def _resolve_workflow_id(
+    workflow_id: Optional[str],
+    org_id: uuid.UUID,
+    db: AsyncSession,
+) -> Optional[uuid.UUID]:
+    if not workflow_id:
+        return None
+    try:
+        wid = uuid.UUID(workflow_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid workflow")
+
+    result = await db.execute(
+        select(WorkspaceWorkflow).where(
+            WorkspaceWorkflow.id == wid,
+            WorkspaceWorkflow.organization_id == org_id,
+        )
+    )
+    workflow = result.scalar_one_or_none()
+    if not workflow:
+        raise HTTPException(status_code=400, detail="Workflow not found in your organization")
+    return wid
+
+
 @router.post("/documents/upload", response_model=dict)
 async def upload_document_file(
     file: UploadFile = File(...),
     category: Optional[str] = Form("General"),
+    workflow_id: Optional[str] = Form(None),
     organization: Organization = Depends(require_feature_dependency(Feature.KNOWLEDGE_STORAGE)),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
@@ -311,6 +337,8 @@ async def upload_document_file(
     content_hash = hashlib.sha256(raw).hexdigest()
     uploader = f"{current_user.first_name} {current_user.last_name}".strip() or current_user.email
 
+    linked_workflow_id = await _resolve_workflow_id(workflow_id, organization.id, db)
+
     doc_id = uuid.uuid4()
     file_content_type = file.content_type or content_type_for_extension(ext)
     try:
@@ -330,6 +358,7 @@ async def upload_document_file(
     document = Document(
         id=doc_id,
         organization_id=organization.id,
+        workflow_id=linked_workflow_id,
         title=filename,
         content=extracted or None,
         content_hash=content_hash,
@@ -390,6 +419,17 @@ async def upload_document_file(
     if not doc_fresh:
         doc_result = await db.execute(select(Document).where(Document.id == saved_doc_id))
         doc_fresh = doc_result.scalar_one()
+
+    if linked_workflow_id:
+        await log_workflow_activity(
+            db,
+            linked_workflow_id,
+            organization.id,
+            current_user.id,
+            "document_linked",
+            {"document_id": str(saved_doc_id), "filename": filename},
+        )
+        await db.commit()
 
     return {
         **_serialize_document(doc_fresh, chunk_total),

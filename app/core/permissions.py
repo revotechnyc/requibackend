@@ -75,6 +75,7 @@ PLAN_FEATURES = {
     PlanType.PRO: [
         "intelligence",
         "dashboard",
+        "workflow",
         "tasks",
         "compliance",
         "calendar",
@@ -90,6 +91,7 @@ PLAN_FEATURES = {
     PlanType.ENTERPRISE: [
         "intelligence",
         "dashboard",
+        "workflow",
         "tasks",
         "compliance",
         "calendar",
