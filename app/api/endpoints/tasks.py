@@ -65,6 +65,7 @@ class TaskCreate(BaseModel):
     reviewer_id: Optional[str] = None
     approver_id: Optional[str] = None
     document_id: Optional[str] = None
+    document_ids: Optional[List[str]] = None
 
 
 class TaskUpdate(BaseModel):
@@ -78,6 +79,7 @@ class TaskUpdate(BaseModel):
     reviewer_id: Optional[str] = None
     approver_id: Optional[str] = None
     document_id: Optional[str] = None
+    document_ids: Optional[List[str]] = None
 
 
 class TaskStatusTransition(BaseModel):
@@ -206,6 +208,91 @@ async def _resolve_org_document(
     return did
 
 
+def _task_document_uuids(task: WorkspaceTask) -> list[UUID]:
+    ids: list[UUID] = []
+    if task.document_ids:
+        for raw in task.document_ids:
+            try:
+                ids.append(uuid_lib.UUID(str(raw)))
+            except (ValueError, AttributeError, TypeError):
+                continue
+    elif task.document_id:
+        ids.append(task.document_id)
+    return ids
+
+
+async def _resolve_org_documents(
+    org_id: UUID,
+    document_ids: Optional[List[str]],
+    legacy_document_id: Optional[str],
+    db: AsyncSession,
+) -> tuple[list[str], Optional[UUID]]:
+    candidates: list[str] = []
+    if document_ids is not None:
+        candidates.extend(document_ids)
+    elif legacy_document_id:
+        candidates.append(legacy_document_id)
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for raw in candidates:
+        key = str(raw).strip()
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(key)
+
+    resolved: list[str] = []
+    for did in ordered:
+        uid = await _resolve_org_document(org_id, did, db)
+        if uid:
+            resolved.append(str(uid))
+
+    primary = uuid_lib.UUID(resolved[0]) if resolved else None
+    return resolved, primary
+
+
+async def _documents_map_for_tasks(
+    org_id: UUID,
+    tasks: list[WorkspaceTask],
+    db: AsyncSession,
+) -> dict[str, list[dict]]:
+    all_uuids: list[UUID] = []
+    for task in tasks:
+        all_uuids.extend(_task_document_uuids(task))
+
+    if not all_uuids:
+        return {
+            str(task.id): (
+                [{"id": str(task.document.id), "title": task.document.title}]
+                if task.document
+                else []
+            )
+            for task in tasks
+        }
+
+    unique = list(dict.fromkeys(all_uuids))
+    result = await db.execute(
+        select(Document).where(
+            Document.id.in_(unique),
+            Document.organization_id == org_id,
+            Document.is_active == True,
+        )
+    )
+    by_id = {doc.id: doc for doc in result.scalars().all()}
+
+    out: dict[str, list[dict]] = {}
+    for task in tasks:
+        payloads: list[dict] = []
+        for uid in _task_document_uuids(task):
+            doc = by_id.get(uid)
+            if doc:
+                payloads.append({"id": str(doc.id), "title": doc.title})
+        if not payloads and task.document:
+            payloads = [{"id": str(task.document.id), "title": task.document.title}]
+        out[str(task.id)] = payloads
+    return out
+
+
 async def _resolve_org_member(
     org_id: UUID,
     user_id: Optional[str],
@@ -238,7 +325,11 @@ async def _resolve_org_member(
     return uid
 
 
-def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> dict:
+def _serialize_task(
+    task: WorkspaceTask,
+    org: Optional[Organization] = None,
+    documents: Optional[list[dict]] = None,
+) -> dict:
     assignee_name = _user_display(task.assignee)
     # Pro: show creator/admin as owner when no explicit assignee (legacy tasks)
     if (
@@ -248,6 +339,10 @@ def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> 
         and task.creator
     ):
         assignee_name = _user_display(task.creator)
+
+    docs = list(documents) if documents is not None else []
+    if not docs and task.document:
+        docs = [{"id": str(task.document.id), "title": task.document.title}]
 
     return {
         "id": str(task.id),
@@ -267,8 +362,10 @@ def _serialize_task(task: WorkspaceTask, org: Optional[Organization] = None) -> 
         "reviewer_name": _user_display(task.reviewer),
         "approver_id": str(task.approver_id) if task.approver_id else None,
         "approver_name": _user_display(task.approver),
-        "document_id": str(task.document_id) if task.document_id else None,
-        "document_title": task.document.title if task.document else None,
+        "document_ids": [d["id"] for d in docs],
+        "documents": docs,
+        "document_id": docs[0]["id"] if docs else None,
+        "document_title": docs[0]["title"] if docs else None,
         "comments": task.comments or [],
         "history": task.history or [],
         "created_at": task.created_at.isoformat() if task.created_at else None,
@@ -560,7 +657,12 @@ async def create_task(
         elif user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
             assignee_id = current_user.id
 
-    document_id = await _resolve_org_document(org.id, data.document_id, db)
+    resolved_doc_ids, document_id = await _resolve_org_documents(
+        org.id,
+        data.document_ids,
+        data.document_id,
+        db,
+    )
 
     now = datetime.utcnow()
     history = [
@@ -579,6 +681,7 @@ async def create_task(
         reviewer_id=reviewer_id,
         approver_id=approver_id,
         document_id=document_id,
+        document_ids=resolved_doc_ids,
         title=data.title.strip(),
         description=data.description or "",
         status=TaskStatus.PENDING.value,
@@ -595,7 +698,11 @@ async def create_task(
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
 
-    return {"task": _serialize_task(task, org), "message": "Task created"}
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    return {
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "message": "Task created",
+    }
 
 
 @router.get("/", response_model=dict)
@@ -636,7 +743,10 @@ async def list_tasks(
     if assignee:
         tasks = [t for t in tasks if t.assignee_id and str(t.assignee_id) == assignee]
 
-    serialized = [_serialize_task(t, org) for t in tasks]
+    docs_map = await _documents_map_for_tasks(org.id, tasks, db)
+    serialized = [
+        _serialize_task(t, org, documents=docs_map.get(str(t.id), [])) for t in tasks
+    ]
 
     counts = {s.value: 0 for s in TaskStatus}
     for t in all_tasks:
@@ -679,8 +789,9 @@ async def get_task(
     workflow = _task_workflow_permissions(task, current_user, user_role, enterprise)
     notice = _workflow_notice(task, current_user, user_role, enterprise, workflow)
 
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
-        "task": _serialize_task(task, org),
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
         "permissions": {
             "can_edit": user_role in (
                 UserRole.ENTERPRISE_ADMIN,
@@ -845,10 +956,11 @@ async def transition_task_status(
     task.updated_at = now
     task.history = history
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
 
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
-        "task": _serialize_task(task, org),
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
         "message": f"Status transitioned to {target_status.value}",
     }
 
@@ -898,15 +1010,27 @@ async def update_task(
                 org.id, data.approver_id or None, TASK_PICK_ROLES, db, "approver"
             )
 
-    if data.document_id is not None:
-        task.document_id = await _resolve_org_document(
-            org.id, data.document_id or None, db
+    if data.document_ids is not None:
+        resolved_doc_ids, primary_doc_id = await _resolve_org_documents(
+            org.id, data.document_ids, None, db
         )
+        task.document_ids = resolved_doc_ids
+        task.document_id = primary_doc_id
+    elif data.document_id is not None:
+        resolved_doc_ids, primary_doc_id = await _resolve_org_documents(
+            org.id, None, data.document_id or None, db
+        )
+        task.document_ids = resolved_doc_ids
+        task.document_id = primary_doc_id
 
     task.updated_at = datetime.utcnow()
     await db.flush()
     await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
-    return {"task": _serialize_task(task, org), "message": "Task updated"}
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    return {
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "message": "Task updated",
+    }
 
 
 @router.delete("/{task_id}", response_model=dict)
@@ -954,5 +1078,9 @@ async def add_comment(
     task.comments = comments
     task.updated_at = now
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver"])
-    return {"task": _serialize_task(task, org), "message": "Comment added"}
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    return {
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "message": "Comment added",
+    }

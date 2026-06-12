@@ -473,6 +473,7 @@ class WorkspaceTask(Base):
     document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
     )
+    document_ids: Mapped[Optional[list]] = mapped_column(JSON, default=list)
 
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)

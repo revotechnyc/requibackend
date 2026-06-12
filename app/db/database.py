@@ -193,6 +193,7 @@ async def init_db() -> None:
         await _ensure_userrole_enum_values(conn)
         await _ensure_workspace_tasks_table(conn)
         await _ensure_workspace_task_document_column(conn)
+        await _ensure_workspace_task_document_ids_column(conn)
         await _ensure_compliance_tables(conn)
         await _ensure_member_feature_permissions_columns(conn)
         await _ensure_notification_type_enum_values(conn)
@@ -370,6 +371,32 @@ async def _ensure_workspace_task_document_column(conn) -> None:
             """
             ALTER TABLE workspace_tasks
             ADD COLUMN IF NOT EXISTS document_id UUID REFERENCES documents(id)
+            """
+        )
+    )
+
+
+async def _ensure_workspace_task_document_ids_column(conn) -> None:
+    """Multiple document attachments on compliance tasks."""
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS document_ids JSONB DEFAULT '[]'::jsonb
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE workspace_tasks
+            SET document_ids = jsonb_build_array(document_id::text)
+            WHERE document_id IS NOT NULL
+              AND (
+                document_ids IS NULL
+                OR document_ids = '[]'::jsonb
+                OR document_ids = 'null'::jsonb
+              )
             """
         )
     )
