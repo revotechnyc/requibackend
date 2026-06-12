@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.api.endpoints.auth import get_current_active_user
 from app.db.database import get_db
 from app.db.models import Organization, Seat, User, WorkspaceWorkflow
+from app.services.task_visibility import workflow_ids_visible_to_user, workflow_visible_to_user
 from app.services.workflow_service import (
     get_workflow_for_org,
     plan_has_workflow,
@@ -58,7 +59,9 @@ async def list_workflows(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    org, _seat = await _get_org_context(current_user, db)
+    org, seat = await _get_org_context(current_user, db)
+    user_id = current_user.id
+    user_role = seat.role
     query = (
         select(WorkspaceWorkflow)
         .where(WorkspaceWorkflow.organization_id == org.id)
@@ -82,6 +85,15 @@ async def list_workflows(
             or (w.description and q in w.description.lower())
         ]
 
+    visible_ids = await workflow_ids_visible_to_user(
+        org.id,
+        user_id,
+        user_role,
+        db,
+        [w.id for w in workflows],
+    )
+    workflows = [w for w in workflows if w.id in visible_ids]
+
     return {
         "workflows": [serialize_workflow_list_item(w) for w in workflows],
         "count": len(workflows),
@@ -94,13 +106,24 @@ async def get_workflow(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    org, _seat = await _get_org_context(current_user, db)
+    org, seat = await _get_org_context(current_user, db)
     try:
         workflow = await get_workflow_for_org(workflow_id, org.id, db)
     except ValueError:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    detail = await serialize_workflow_detail(workflow, org.id, db)
+    if not await workflow_visible_to_user(
+        workflow, org.id, current_user.id, seat.role, db
+    ):
+        raise HTTPException(status_code=403, detail="You do not have access to this workflow")
+
+    detail = await serialize_workflow_detail(
+        workflow,
+        org.id,
+        db,
+        user_id=current_user.id,
+        user_role=seat.role,
+    )
     return {"workflow": detail}
 
 

@@ -15,12 +15,17 @@ from app.db.models import (
     Document,
     Organization,
     User,
+    UserRole,
     WorkflowActivity,
     WorkspaceTask,
     WorkspaceWorkflow,
     WorkspaceWorkflowStatus,
 )
 from app.core.permissions import FeatureGate, PLAN_FEATURES
+from app.services.task_visibility import (
+    task_assignee_is_user,
+    user_has_full_task_access,
+)
 
 
 def plan_has_workflow(org: Organization) -> bool:
@@ -170,6 +175,8 @@ async def serialize_workflow_detail(
     workflow: WorkspaceWorkflow,
     org_id: UUID,
     db: AsyncSession,
+    user_id: Optional[UUID] = None,
+    user_role: Optional[UserRole] = None,
 ) -> dict:
     tasks_result = await db.execute(
         select(WorkspaceTask)
@@ -201,8 +208,18 @@ async def serialize_workflow_detail(
     )
     activities = activities_result.scalars().all()
 
+    restrict_tasks = (
+        user_id is not None
+        and user_role is not None
+        and not user_has_full_task_access(user_role)
+    )
+
     linked_tasks = []
+    visible_tasks = []
     for task in tasks:
+        if restrict_tasks and not task_assignee_is_user(task, user_id):
+            continue
+        visible_tasks.append(task)
         status = task.status
         if status == "submitted_for_review":
             ui_status = "in_progress"
@@ -241,8 +258,8 @@ async def serialize_workflow_detail(
     elif workflow.status == WorkspaceWorkflowStatus.IN_REVIEW.value:
         progress = 55
     elif linked_tasks:
-        completed = sum(1 for t in tasks if t.status == "completed")
-        progress = min(95, 20 + int((completed / max(len(tasks), 1)) * 70))
+        completed = sum(1 for t in visible_tasks if t.status == "completed")
+        progress = min(95, 20 + int((completed / max(len(visible_tasks), 1)) * 70))
 
     timeline = [
         {"id": "s1", "label": "Case Created", "status": "completed"},

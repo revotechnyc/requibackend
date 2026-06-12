@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload
 from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import FeatureGate, PLAN_FEATURES
 from app.services.enterprise_roles import is_workspace_admin
+from app.services.task_visibility import task_visible_to_user
 from app.services.workflow_service import (
     create_workflow_for_task,
     log_workflow_activity,
@@ -565,22 +566,7 @@ def _workflow_notice(
 
 
 def _task_visible_to_user(task: WorkspaceTask, user_id: UUID, user_role: UserRole) -> bool:
-    if user_role in (
-        UserRole.ENTERPRISE_ADMIN,
-        UserRole.ADMIN,
-        UserRole.REVIEWER,
-        UserRole.APPROVER,
-        UserRole.VIEWER,
-        UserRole.SEO,
-        UserRole.ANALYST,
-    ):
-        return True
-    return (
-        task.creator_id == user_id
-        or task.assignee_id == user_id
-        or task.reviewer_id == user_id
-        or task.approver_id == user_id
-    )
+    return task_visible_to_user(task, user_id, user_role)
 
 
 @router.get("/eligible-members", response_model=dict)
@@ -790,7 +776,7 @@ async def list_tasks(
 
     counts = {s.value: 0 for s in TaskStatus}
     for t in all_tasks:
-        if t.status in counts:
+        if _task_visible_to_user(t, user_id, user_role) and t.status in counts:
             counts[t.status] += 1
 
     enterprise = _is_enterprise(org)
