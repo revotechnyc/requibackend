@@ -17,6 +17,7 @@ from app.db.models import (
     User,
     UserRole,
     WorkflowActivity,
+    WorkflowFinding,
     WorkspaceTask,
     WorkspaceWorkflow,
     WorkspaceWorkflowStatus,
@@ -231,12 +232,16 @@ async def serialize_workflow_detail(
             ui_status = "pending"
         if status == "completed":
             ui_status = "completed"
+        res = task.resolution_result if isinstance(task.resolution_result, dict) else {}
         linked_tasks.append(
             {
                 "id": str(task.id),
                 "title": task.title,
                 "assignee": _user_display(task.assignee) or "Unassigned",
                 "status": ui_status,
+                "has_resolution": bool(task.resolution_result),
+                "resolution_summary": str(res.get("summary") or "") if res else "",
+                "risk_level": res.get("risk_level") if res else None,
             }
         )
 
@@ -302,6 +307,25 @@ async def serialize_workflow_detail(
         },
     ]
 
+    findings_result = await db.execute(
+        select(WorkflowFinding)
+        .where(WorkflowFinding.workflow_id == workflow.id)
+        .order_by(WorkflowFinding.created_at.desc())
+        .limit(1)
+    )
+    latest_finding = findings_result.scalar_one_or_none()
+    latest_finding_payload = None
+    if latest_finding:
+        latest_finding_payload = {
+            "id": str(latest_finding.id),
+            "task_id": str(latest_finding.task_id) if latest_finding.task_id else None,
+            "summary": latest_finding.summary,
+            "findings": latest_finding.findings or [],
+            "risk_level": latest_finding.risk_level,
+            "recommendations": latest_finding.recommendations or [],
+            "created_at": latest_finding.created_at.isoformat() if latest_finding.created_at else None,
+        }
+
     return {
         **serialize_workflow_list_item(workflow),
         "description": workflow.description,
@@ -309,6 +333,7 @@ async def serialize_workflow_detail(
         "progress": progress,
         "linked_tasks": linked_tasks,
         "linked_documents": linked_documents,
+        "latest_finding": latest_finding_payload,
         "timeline": timeline,
         "communication": {
             "emails_sent": 0,

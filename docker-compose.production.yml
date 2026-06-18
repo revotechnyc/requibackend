@@ -38,6 +38,7 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/app/app
+      - ./credentials:/app/credentials:ro
       - /etc/letsencrypt:/etc/letsencrypt:ro
     command: python scripts/run_uvicorn.py
 
@@ -56,6 +57,7 @@ services:
         condition: service_healthy
     volumes:
       - ./app:/app/app
+      - ./credentials:/app/credentials:ro
     command: celery -A app.tasks.celery_app worker --loglevel=info
 
   beat:

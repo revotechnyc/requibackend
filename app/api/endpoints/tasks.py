@@ -22,13 +22,17 @@ from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import FeatureGate, PLAN_FEATURES
 from app.services.enterprise_roles import is_workspace_admin
 from app.services.task_visibility import task_visible_to_user
+from app.services.task_resolution_service import parse_resolution_json, save_task_resolution
+from app.services.workflow_context_builder import build_workflow_context
 from app.services.workflow_service import (
     create_workflow_for_task,
+    get_workflow_for_org,
     log_workflow_activity,
     plan_has_workflow,
 )
 from app.db.database import get_db
 from app.db.models import (
+    Conversation,
     Document,
     Organization,
     PlanType,
@@ -178,6 +182,7 @@ async def _get_task_for_org(
             selectinload(WorkspaceTask.reviewer),
             selectinload(WorkspaceTask.approver),
             selectinload(WorkspaceTask.document),
+            selectinload(WorkspaceTask.resolution_document),
         )
     )
     task = result.scalar_one_or_none()
@@ -373,6 +378,17 @@ def _serialize_task(
         "document_id": docs[0]["id"] if docs else None,
         "document_title": docs[0]["title"] if docs else None,
         "workflow_id": str(task.workflow_id) if task.workflow_id else None,
+        "resolution_result": task.resolution_result,
+        "resolution_history": task.resolution_history or [],
+        "resolution_document_id": (
+            str(task.resolution_document_id) if task.resolution_document_id else None
+        ),
+        "resolution_document_title": (
+            task.resolution_document.title if task.resolution_document else None
+        ),
+        "execution_conversation_id": (
+            str(task.execution_conversation_id) if task.execution_conversation_id else None
+        ),
         "comments": task.comments or [],
         "history": task.history or [],
         "created_at": task.created_at.isoformat() if task.created_at else None,
@@ -721,7 +737,7 @@ async def create_task(
             },
         )
 
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
@@ -982,7 +998,7 @@ async def transition_task_status(
     task.updated_at = now
     task.history = history
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
@@ -1051,11 +1067,162 @@ async def update_task(
 
     task.updated_at = datetime.utcnow()
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
         "message": "Task updated",
+    }
+
+
+class TaskResolutionSave(BaseModel):
+    resolution: Optional[dict] = None
+    raw_content: Optional[str] = None
+    conversation_id: Optional[str] = None
+
+
+@router.post("/{task_id}/execute", response_model=dict)
+async def execute_task(
+    task_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Start task execution — transitions to in_progress and returns context for Intelligence."""
+    org, _seat, user_role = await _get_workspace_context(current_user, db)
+    task = await _get_task_for_org(task_id, org.id, db)
+
+    if not _task_visible_to_user(task, current_user.id, user_role):
+        raise HTTPException(status_code=403, detail="You do not have access to this task")
+
+    enterprise = _is_enterprise(org)
+    perms = _task_workflow_permissions(task, current_user, user_role, enterprise)
+    if not (perms.get("can_start_work") or perms.get("can_resume_work")):
+        if task.status not in (TaskStatus.IN_PROGRESS.value,):
+            raise HTTPException(
+                status_code=403,
+                detail="You cannot execute this task in its current state",
+            )
+
+    if task.status == TaskStatus.PENDING.value:
+        task.status = TaskStatus.IN_PROGRESS.value
+        history = list(task.history or [])
+        history.append(
+            {
+                "action": "started",
+                "user_id": str(current_user.id),
+                "user_name": _user_display(current_user),
+                "timestamp": datetime.utcnow().isoformat(),
+                "note": "Task execution started via Intelligence",
+            }
+        )
+        task.history = history
+        task.updated_at = datetime.utcnow()
+        if task.workflow_id:
+            await log_workflow_activity(
+                db,
+                task.workflow_id,
+                org.id,
+                current_user.id,
+                "task_execution_started",
+                {"task_id": str(task.id), "task_title": task.title},
+            )
+
+    execution_conversation = Conversation(
+        id=uuid_lib.uuid4(),
+        organization_id=org.id,
+        user_id=current_user.id,
+        title=f"Task: {task.title[:80]}",
+        workflow_id=task.workflow_id,
+        task_id=task.id,
+    )
+    db.add(execution_conversation)
+    task.execution_conversation_id = execution_conversation.id
+    exec_history = list(task.history or [])
+    exec_history.append(
+        {
+            "action": "execution_session_started",
+            "user_id": str(current_user.id),
+            "user_name": _user_display(current_user),
+            "timestamp": datetime.utcnow().isoformat(),
+            "conversation_id": str(execution_conversation.id),
+        }
+    )
+    task.history = exec_history
+    task.updated_at = datetime.utcnow()
+
+    await db.commit()
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    context = None
+    if task.workflow_id:
+        try:
+            workflow = await get_workflow_for_org(str(task.workflow_id), org.id, db)
+            context = await build_workflow_context(
+                workflow, org.id, db, focus_task_id=task.id
+            )
+        except ValueError:
+            context = None
+
+    return {
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "workflow_id": str(task.workflow_id) if task.workflow_id else None,
+        "conversation_id": str(execution_conversation.id),
+        "context": context,
+        "message": "Task ready for Intelligence execution",
+    }
+
+
+@router.post("/{task_id}/resolution", response_model=dict)
+async def save_task_resolution_endpoint(
+    task_id: str,
+    data: TaskResolutionSave,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Save structured AI resolution to task (and workflow findings)."""
+    org, _seat, user_role = await _get_workspace_context(current_user, db)
+    task = await _get_task_for_org(task_id, org.id, db)
+
+    if not _task_visible_to_user(task, current_user.id, user_role):
+        raise HTTPException(status_code=403, detail="You do not have access to this task")
+
+    enterprise = _is_enterprise(org)
+    perms = _task_workflow_permissions(task, current_user, user_role, enterprise)
+    assignee_ok = _can_user_act_as_assignee(task, current_user, user_role)
+    if not (assignee_ok or is_workspace_admin(user_role)):
+        raise HTTPException(status_code=403, detail="Only the assignee can save task resolution")
+
+    resolution = data.resolution
+    if not resolution and data.raw_content:
+        resolution = parse_resolution_json(data.raw_content)
+    if not resolution or not isinstance(resolution, dict):
+        raise HTTPException(status_code=400, detail="Valid resolution JSON is required")
+
+    conv_uuid = None
+    if data.conversation_id:
+        try:
+            conv_uuid = uuid_lib.UUID(data.conversation_id)
+        except (ValueError, AttributeError):
+            conv_uuid = None
+
+    task, finding = await save_task_resolution(
+        db,
+        task,
+        org.id,
+        current_user,
+        resolution,
+        conversation_id=conv_uuid,
+        raw_content=data.raw_content,
+    )
+    await db.commit()
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+
+    return {
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "finding_id": str(finding.id) if finding else None,
+        "message": "Task resolution saved",
     }
 
 
@@ -1104,7 +1271,7 @@ async def add_comment(
     task.comments = comments
     task.updated_at = now
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document"])
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),

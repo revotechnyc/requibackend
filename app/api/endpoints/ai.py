@@ -19,8 +19,8 @@ from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.auth import get_current_active_user
 from app.core.permissions import Feature, check_feature_access, require_feature_dependency
-from app.db.database import get_db
-from app.db.models import Conversation, Document, Message, NotificationType, Organization, Seat, User
+from app.db.database import AsyncSessionLocal, get_db
+from app.db.models import Conversation, Document, Message, NotificationType, Organization, Seat, User, WorkspaceTask, WorkspaceWorkflow
 from app.services.ml import MLService
 from app.core.config import settings
 from app.services.compliance_ai_integration import process_intelligence_compliance_update
@@ -36,6 +36,12 @@ from app.services.realtime_voice_service import (
 )
 from app.services.usage import check_trial_usage_limit, get_trial_info, increment_usage_if_trialing
 from app.services.retrieval import RetrievalService
+from app.services.workflow_context_builder import (
+    build_workflow_context,
+    format_workflow_context_for_prompt,
+)
+from app.services.workflow_service import get_workflow_for_org, log_workflow_activity
+from app.services.task_visibility import workflow_visible_to_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -420,6 +426,12 @@ class ChatStreamRequest(BaseModel):
     internal_document_ids: Optional[List[str]] = None
     """When true, run hybrid retrieval over indexed chunks (searchInternalDocuments)."""
     search_internal_documents: bool = False
+    """Optional workflow case context (EPIC-003)."""
+    workflow_id: Optional[str] = None
+    """Optional focus task for task execution mode."""
+    task_id: Optional[str] = None
+    """When true with task_id, AI returns structured resolution JSON."""
+    task_execution_mode: bool = False
 
 
 class ChatRequest(BaseModel):
@@ -432,7 +444,6 @@ async def chat_stream(
     request: ChatStreamRequest,
     fastapi_request: Request,
     current_user: User = Depends(get_current_active_user),
-    db: AsyncSession = Depends(get_db),
     _: Organization = Depends(lambda: require_feature_dependency(Feature.AI_QA)),
     __trial_limit: None = Depends(check_trial_usage_limit),
 ):
@@ -450,44 +461,148 @@ async def chat_stream(
         )
     )
 
-    result = await db.execute(
-        select(Seat).where(
-            Seat.user_id == current_user.id,
-            Seat.is_active == True,
-        )
-    )
-    seat = result.scalar_one_or_none()
-    if not seat:
-        raise HTTPException(status_code=400, detail="No active organization")
-
     t0 = time_module.time()
-    conversation = None
-    if request.conversation_id:
-        conv_result = await db.execute(
-            select(Conversation).where(
-                Conversation.id == request.conversation_id,
-                Conversation.user_id == current_user.id,
+    conv_id: str
+    conversation_id: uuid.UUID
+    organization_id: uuid.UUID
+    workflow_uuid: Optional[uuid.UUID] = None
+    task_uuid: Optional[uuid.UUID] = None
+    workflow_ctx: Optional[dict] = None
+    workflow_context_text: Optional[str] = None
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Seat).where(
+                Seat.user_id == current_user.id,
+                Seat.is_active == True,
             )
         )
-        conversation = conv_result.scalar_one_or_none()
+        seat = result.scalar_one_or_none()
+        if not seat:
+            raise HTTPException(status_code=400, detail="No active organization")
 
-    if not conversation:
-        conversation = Conversation(
-            organization_id=seat.organization_id,
-            user_id=current_user.id,
-            title=request.message[:50] or "New Conversation",
-        )
-        db.add(conversation)
-        await db.commit()
-        await db.refresh(conversation)
+        organization_id = seat.organization_id
 
-    conv_id = str(conversation.id)
+        if request.workflow_id:
+            try:
+                workflow_uuid = uuid.UUID(request.workflow_id.strip())
+            except (ValueError, AttributeError):
+                workflow_uuid = None
+        if request.task_id:
+            try:
+                task_uuid = uuid.UUID(request.task_id.strip())
+            except (ValueError, AttributeError):
+                task_uuid = None
+
+        conversation = None
+        if request.task_execution_mode and task_uuid:
+            if request.conversation_id:
+                conv_result = await db.execute(
+                    select(Conversation).where(
+                        Conversation.id == request.conversation_id,
+                        Conversation.user_id == current_user.id,
+                        Conversation.task_id == task_uuid,
+                    )
+                )
+                conversation = conv_result.scalar_one_or_none()
+            if not conversation:
+                conversation = Conversation(
+                    organization_id=organization_id,
+                    user_id=current_user.id,
+                    title=f"Task: {(request.message[:40] or 'Execution')}",
+                    workflow_id=workflow_uuid,
+                    task_id=task_uuid,
+                )
+                db.add(conversation)
+                await db.commit()
+                await db.refresh(conversation)
+        elif request.conversation_id:
+            conv_result = await db.execute(
+                select(Conversation).where(
+                    Conversation.id == request.conversation_id,
+                    Conversation.user_id == current_user.id,
+                )
+            )
+            conversation = conv_result.scalar_one_or_none()
+
+        if not conversation:
+            conversation = Conversation(
+                organization_id=seat.organization_id,
+                user_id=current_user.id,
+                title=request.message[:50] or "New Conversation",
+            )
+            db.add(conversation)
+            await db.commit()
+            await db.refresh(conversation)
+
+        conv_updated = False
+        if workflow_uuid and conversation.workflow_id != workflow_uuid:
+            conversation.workflow_id = workflow_uuid
+            conv_updated = True
+        if task_uuid and conversation.task_id != task_uuid:
+            if not request.task_execution_mode:
+                conversation.task_id = task_uuid
+                conv_updated = True
+        if conv_updated:
+            await db.commit()
+
+        if workflow_uuid:
+            try:
+                org_result = await db.execute(
+                    select(Organization).where(Organization.id == seat.organization_id)
+                )
+                org_row = org_result.scalar_one_or_none()
+                if org_row:
+                    workflow = await get_workflow_for_org(str(workflow_uuid), seat.organization_id, db)
+                    seat_result = await db.execute(
+                        select(Seat).where(Seat.user_id == current_user.id, Seat.is_active == True)
+                    )
+                    user_seat = seat_result.scalar_one_or_none()
+                    if user_seat and await workflow_visible_to_user(
+                        workflow, seat.organization_id, current_user.id, user_seat.role, db
+                    ):
+                        workflow_ctx = await build_workflow_context(
+                            workflow,
+                            seat.organization_id,
+                            db,
+                            focus_task_id=task_uuid,
+                        )
+                        workflow_context_text = format_workflow_context_for_prompt(
+                            workflow_ctx,
+                            task_execution=request.task_execution_mode and bool(task_uuid),
+                        )
+                        await log_workflow_activity(
+                            db,
+                            workflow.id,
+                            seat.organization_id,
+                            current_user.id,
+                            "ai_query",
+                            {
+                                "message_preview": request.message[:200],
+                                "task_id": str(task_uuid) if task_uuid else None,
+                                "task_execution_mode": request.task_execution_mode,
+                            },
+                        )
+                        await db.commit()
+            except Exception as wf_exc:
+                logger.warning(
+                    json.dumps(
+                        {
+                            "event": "chat_stream_workflow_context_failed",
+                            "request_id": req_id,
+                            "error": str(wf_exc),
+                        }
+                    )
+                )
+
+        conversation_id = conversation.id
+        conv_id = str(conversation.id)
 
     async def generate():
-        nonlocal db
         full_content = ""
         token_count = 0
         first_token_time = None
+        client_aborted = False
 
         yield f"data: {json.dumps({'type': 'start', 'conversation_id': conv_id})}\n\n"
         yield f"data: {json.dumps({'type': 'phase', 'phase': 'initializing'})}\n\n"
@@ -496,7 +611,6 @@ async def chat_stream(
         internal_explicit_uuids = _uuid_list(request.internal_document_ids)
         legacy_uuids = _uuid_list(request.document_ids)
 
-        # Backward compatibility: old clients send only document_ids → treat as internal library picks.
         if legacy_uuids and not attachment_uuids and not internal_explicit_uuids and not request.search_internal_documents:
             internal_pick_uuids = legacy_uuids
         elif legacy_uuids:
@@ -522,220 +636,294 @@ async def chat_stream(
         yield f"data: {json.dumps({'type': 'phase', 'phase': 'searching'})}\n\n"
 
         t_prep_start = time_module.time()
-        messages = []
+
         try:
-            msg_result = await db.execute(
-                select(Message)
-                .where(Message.conversation_id == conversation.id)
-                .order_by(Message.created_at.desc())
-                .limit(25)
-            )
-            for msg in reversed(msg_result.scalars().all()):
-                messages.append({"role": msg.role, "content": msg.content})
-        except Exception:
-            messages = []
+            async with AsyncSessionLocal() as stream_db:
+                try:
+                    messages = []
+                    try:
+                        msg_result = await stream_db.execute(
+                            select(Message)
+                            .where(Message.conversation_id == conversation_id)
+                            .order_by(Message.created_at.desc())
+                            .limit(25)
+                        )
+                        for msg in reversed(msg_result.scalars().all()):
+                            messages.append({"role": msg.role, "content": msg.content})
+                    except Exception:
+                        messages = []
 
-        file_refs: List[dict] = []
+                    file_refs: List[dict] = []
 
-        if attachment_uuids or internal_pick_uuids:
-            all_load_ids = list(dict.fromkeys([*attachment_uuids, *internal_pick_uuids]))
-            if all_load_ids:
-                doc_result = await db.execute(
-                    select(Document).where(
-                        Document.id.in_(all_load_ids),
-                        Document.organization_id == seat.organization_id,
-                    )
-                )
-                by_id = {d.id: d for d in doc_result.scalars().all()}
+                    if attachment_uuids or internal_pick_uuids:
+                        all_load_ids = list(dict.fromkeys([*attachment_uuids, *internal_pick_uuids]))
+                        if all_load_ids:
+                            doc_result = await stream_db.execute(
+                                select(Document).where(
+                                    Document.id.in_(all_load_ids),
+                                    Document.organization_id == organization_id,
+                                )
+                            )
+                            by_id = {d.id: d for d in doc_result.scalars().all()}
 
-                for uid in attachment_uuids:
-                    d = by_id.get(uid)
-                    if d and d.content:
-                        file_refs.append(
+                            for uid in attachment_uuids:
+                                d = by_id.get(uid)
+                                if d and d.content:
+                                    file_refs.append(
+                                        {
+                                            "type": "input_text",
+                                            "text": f"--- Attached to this chat: {d.title} ---\n{d.content[:5000]}",
+                                        }
+                                    )
+
+                            for uid in internal_pick_uuids:
+                                d = by_id.get(uid)
+                                if d and d.content:
+                                    file_refs.append(
+                                        {
+                                            "type": "input_text",
+                                            "text": f"--- Internal library document: {d.title} ---\n{d.content[:5000]}",
+                                        }
+                                    )
+
+                    if request.search_internal_documents and request.message.strip():
+                        try:
+                            retrieval = RetrievalService()
+                            context_str, _citations = await retrieval.get_context_for_query(
+                                stream_db,
+                                organization_id,
+                                request.message.strip(),
+                                max_chunks=5,
+                            )
+                            if context_str:
+                                cap = 12000
+                                trimmed = context_str if len(context_str) <= cap else context_str[:cap] + "\n…(truncated)"
+                                file_refs.append(
+                                    {
+                                        "type": "input_text",
+                                        "text": f"--- Relevant excerpts from indexed company documents (knowledge base search) ---\n{trimmed}",
+                                    }
+                                )
+                        except Exception as kb_exc:
+                            logger.warning(
+                                json.dumps(
+                                    {
+                                        "event": "chat_stream_kb_search_failed",
+                                        "request_id": req_id,
+                                        "error": str(kb_exc),
+                                    }
+                                )
+                            )
+
+                    if file_refs:
+                        user_content = [{"type": "input_text", "text": request.message}] + file_refs
+                    else:
+                        user_content = request.message
+
+                    if workflow_context_text:
+                        messages.insert(
+                            0,
                             {
-                                "type": "input_text",
-                                "text": f"--- Attached to this chat: {d.title} ---\n{d.content[:5000]}",
-                            }
+                                "role": "developer",
+                                "content": workflow_context_text,
+                            },
                         )
 
-                for uid in internal_pick_uuids:
-                    d = by_id.get(uid)
-                    if d and d.content:
-                        file_refs.append(
+                    messages.append({"role": "user", "content": user_content})
+
+                    conv_result = await stream_db.execute(
+                        select(Conversation).where(Conversation.id == conversation_id)
+                    )
+                    conversation_row = conv_result.scalar_one_or_none()
+                    if not conversation_row:
+                        yield f"data: {json.dumps({'type': 'error', 'error': 'Conversation not found'})}\n\n"
+                        return
+
+                    user_msg = Message(
+                        conversation_id=conversation_id,
+                        role="user",
+                        content=request.message,
+                    )
+                    stream_db.add(user_msg)
+                    conversation_row.updated_at = datetime.utcnow()
+                    await stream_db.commit()
+
+                    responses_service = ResponsesService(
+                        system_instruction=SONIA_SYSTEM_INSTRUCTION,
+                        request_id=req_id,
+                    )
+
+                    t1 = time_module.time()
+                    logger.info(
+                        json.dumps(
                             {
-                                "type": "input_text",
-                                "text": f"--- Internal library document: {d.title} ---\n{d.content[:5000]}",
+                                "event": "chat_stream_prep_done",
+                                "request_id": req_id,
+                                "prep_time_ms": round((t1 - t_prep_start) * 1000),
+                                "mock_stream": settings.mock_chat_stream,
                             }
                         )
-
-        if request.search_internal_documents and request.message.strip():
-            try:
-                retrieval = RetrievalService()
-                context_str, _citations = await retrieval.get_context_for_query(
-                    db,
-                    seat.organization_id,
-                    request.message.strip(),
-                    max_chunks=5,
-                )
-                if context_str:
-                    cap = 12000
-                    trimmed = context_str if len(context_str) <= cap else context_str[:cap] + "\n…(truncated)"
-                    file_refs.append(
-                        {
-                            "type": "input_text",
-                            "text": f"--- Relevant excerpts from indexed company documents (knowledge base search) ---\n{trimmed}",
-                        }
                     )
-            except Exception as kb_exc:
-                logger.warning(
-                    json.dumps(
-                        {
-                            "event": "chat_stream_kb_search_failed",
-                            "request_id": req_id,
-                            "error": str(kb_exc),
-                        }
-                    )
-                )
 
-        if file_refs:
-            user_content = [{"type": "input_text", "text": request.message}] + file_refs
-        else:
-            user_content = request.message
-
-        messages.append({"role": "user", "content": user_content})
-
-        user_msg = Message(
-            conversation_id=conversation.id,
-            role="user",
-            content=request.message,
-        )
-        db.add(user_msg)
-        conversation.updated_at = datetime.utcnow()
-        await db.commit()
-
-        responses_service = ResponsesService(
-            system_instruction=SONIA_SYSTEM_INSTRUCTION,
-            request_id=req_id,
-        )
-
-        t1 = time_module.time()
-        logger.info(
-            json.dumps(
-                {
-                    "event": "chat_stream_prep_done",
-                    "request_id": req_id,
-                    "prep_time_ms": round((t1 - t_prep_start) * 1000),
-                    "mock_stream": settings.mock_chat_stream,
-                }
-            )
-        )
-
-        if settings.mock_chat_stream:
-            stream_iter = mock_chat_stream_for_testing(
-                request.message,
-                delay_ms=settings.mock_chat_stream_delay_ms,
-            )
-        else:
-            stream_iter = responses_service.chat_stream(messages)
-
-        async for sse_event in stream_iter:
-            if await fastapi_request.is_disconnected():
-                break
-            await asyncio.sleep(0)
-            try:
-                data = json.loads(sse_event.replace("data: ", "").strip())
-                if data.get("type") == "done":
-                    data["conversation_id"] = conv_id
-                    t2 = time_module.time()
-                    data["ttft_ms"] = (
-                        round((first_token_time - t0) * 1000, 1) if first_token_time else None
-                    )
-                    data["total_time_ms"] = round((t2 - t0) * 1000)
-                    data["token_count"] = token_count
-                    if first_token_time and token_count > 1:
-                        data["tokens_per_second"] = round(
-                            token_count / ((t2 - first_token_time) or 1), 1
+                    if settings.mock_chat_stream:
+                        stream_iter = mock_chat_stream_for_testing(
+                            request.message,
+                            delay_ms=settings.mock_chat_stream_delay_ms,
                         )
                     else:
-                        data["tokens_per_second"] = 0
-                    yield f"data: {json.dumps(data)}\n\n"
-                else:
-                    yield sse_event
-                if data.get("type") == "token":
-                    full_content += data.get("content", "")
-                    token_count += 1
-                    if first_token_time is None:
-                        first_token_time = time_module.time()
-            except Exception:
-                yield sse_event
+                        stream_iter = responses_service.chat_stream(messages)
 
-        if full_content:
-            assistant_msg = Message(
-                conversation_id=conversation.id,
-                role="assistant",
-                content=full_content,
-            )
-            db.add(assistant_msg)
-            conversation.updated_at = datetime.utcnow()
-            await increment_usage_if_trialing(str(current_user.id), db)
-            await db.commit()
+                    async for sse_event in stream_iter:
+                        if await fastapi_request.is_disconnected():
+                            client_aborted = True
+                            await stream_db.rollback()
+                            break
+                        await asyncio.sleep(0)
+                        try:
+                            data = json.loads(sse_event.replace("data: ", "").strip())
+                            if data.get("type") == "done":
+                                data["conversation_id"] = conv_id
+                                t2 = time_module.time()
+                                data["ttft_ms"] = (
+                                    round((first_token_time - t0) * 1000, 1) if first_token_time else None
+                                )
+                                data["total_time_ms"] = round((t2 - t0) * 1000)
+                                data["token_count"] = token_count
+                                if first_token_time and token_count > 1:
+                                    data["tokens_per_second"] = round(
+                                        token_count / ((t2 - first_token_time) or 1), 1
+                                    )
+                                else:
+                                    data["tokens_per_second"] = 0
+                                yield f"data: {json.dumps(data)}\n\n"
+                            else:
+                                yield sse_event
+                            if data.get("type") == "token":
+                                full_content += data.get("content", "")
+                                token_count += 1
+                                if first_token_time is None:
+                                    first_token_time = time_module.time()
+                        except Exception:
+                            yield sse_event
 
-            try:
-                org_result = await db.execute(
-                    select(Organization)
-                    .where(Organization.id == seat.organization_id)
-                    .options(selectinload(Organization.subscription))
-                )
-                org = org_result.scalar_one()
-                has_doc_context = bool(
-                    attachment_uuids
-                    or internal_pick_uuids
-                    or request.search_internal_documents
-                )
-                compliance_summary = await process_intelligence_compliance_update(
-                    db,
-                    org,
-                    request.message,
-                    full_content,
-                    source_type="chat",
-                    has_documents=has_doc_context,
-                    use_mock=settings.mock_chat_stream,
-                )
-                if compliance_summary and compliance_summary.get("gaps_created", 0) > 0:
-                    yield (
-                        "data: "
-                        + json.dumps(
+                    if client_aborted:
+                        logger.info(
+                            json.dumps(
+                                {
+                                    "event": "chat_stream_client_abort",
+                                    "request_id": req_id,
+                                    "token_count": token_count,
+                                }
+                            )
+                        )
+                        return
+
+                    if full_content:
+                        assistant_msg = Message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=full_content,
+                        )
+                        stream_db.add(assistant_msg)
+                        conversation_row.updated_at = datetime.utcnow()
+                        await increment_usage_if_trialing(str(current_user.id), stream_db)
+                        await stream_db.commit()
+
+                        if workflow_uuid and workflow_ctx:
+                            try:
+                                await log_workflow_activity(
+                                    stream_db,
+                                    uuid.UUID(workflow_ctx["workflow_id"]),
+                                    organization_id,
+                                    current_user.id,
+                                    "ai_response",
+                                    {
+                                        "summary_preview": full_content[:300],
+                                        "task_id": str(task_uuid) if task_uuid else None,
+                                    },
+                                )
+                                await stream_db.commit()
+                            except Exception:
+                                await stream_db.rollback()
+
+                        try:
+                            org_result = await stream_db.execute(
+                                select(Organization)
+                                .where(Organization.id == organization_id)
+                                .options(selectinload(Organization.subscription))
+                            )
+                            org = org_result.scalar_one()
+                            has_doc_context = bool(
+                                attachment_uuids
+                                or internal_pick_uuids
+                                or request.search_internal_documents
+                            )
+                            compliance_summary = await process_intelligence_compliance_update(
+                                stream_db,
+                                org,
+                                request.message,
+                                full_content,
+                                source_type="chat",
+                                has_documents=has_doc_context,
+                                use_mock=settings.mock_chat_stream,
+                            )
+                            if compliance_summary and compliance_summary.get("gaps_created", 0) > 0:
+                                yield (
+                                    "data: "
+                                    + json.dumps(
+                                        {
+                                            "type": "compliance_analysis",
+                                            "gaps_created": compliance_summary["gaps_created"],
+                                            "overall_ai_score": compliance_summary.get("overall_ai_score"),
+                                        }
+                                    )
+                                    + "\n\n"
+                                )
+                        except Exception as comp_exc:
+                            logger.warning(
+                                json.dumps(
+                                    {
+                                        "event": "chat_stream_compliance_skip",
+                                        "request_id": req_id,
+                                        "error": str(comp_exc),
+                                    }
+                                )
+                            )
+
+                    t2 = time_module.time()
+                    logger.info(
+                        json.dumps(
                             {
-                                "type": "compliance_analysis",
-                                "gaps_created": compliance_summary["gaps_created"],
-                                "overall_ai_score": compliance_summary.get("overall_ai_score"),
+                                "event": "chat_stream_complete",
+                                "request_id": req_id,
+                                "total_time_ms": round((t2 - t0) * 1000),
+                                "token_count": token_count,
+                                "content_length": len(full_content),
                             }
                         )
-                        + "\n\n"
                     )
-            except Exception as comp_exc:
-                logger.warning(
-                    json.dumps(
-                        {
-                            "event": "chat_stream_compliance_skip",
-                            "request_id": req_id,
-                            "error": str(comp_exc),
-                        }
+                except asyncio.CancelledError:
+                    await stream_db.rollback()
+                    logger.info(
+                        json.dumps(
+                            {
+                                "event": "chat_stream_cancelled",
+                                "request_id": req_id,
+                                "token_count": token_count,
+                            }
+                        )
                     )
+                    return
+        except asyncio.CancelledError:
+            logger.info(
+                json.dumps(
+                    {
+                        "event": "chat_stream_cancelled",
+                        "request_id": req_id,
+                    }
                 )
-
-        t2 = time_module.time()
-        logger.info(
-            json.dumps(
-                {
-                    "event": "chat_stream_complete",
-                    "request_id": req_id,
-                    "total_time_ms": round((t2 - t0) * 1000),
-                    "token_count": token_count,
-                    "content_length": len(full_content),
-                }
             )
-        )
+            return
 
     return StreamingResponse(
         generate(),

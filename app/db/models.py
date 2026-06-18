@@ -490,6 +490,14 @@ class WorkspaceTask(Base):
 
     comments: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     history: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    resolution_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    resolution_history: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    resolution_document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
+    )
+    execution_conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
@@ -501,7 +509,10 @@ class WorkspaceTask(Base):
     assignee: Mapped[Optional["User"]] = relationship("User", foreign_keys=[assignee_id])
     reviewer: Mapped[Optional["User"]] = relationship("User", foreign_keys=[reviewer_id])
     approver: Mapped[Optional["User"]] = relationship("User", foreign_keys=[approver_id])
-    document: Mapped[Optional["Document"]] = relationship("Document")
+    document: Mapped[Optional["Document"]] = relationship("Document", foreign_keys=[document_id])
+    resolution_document: Mapped[Optional["Document"]] = relationship(
+        "Document", foreign_keys=[resolution_document_id]
+    )
     workflow: Mapped[Optional["WorkspaceWorkflow"]] = relationship(
         "WorkspaceWorkflow", back_populates="tasks"
     )
@@ -586,6 +597,39 @@ class WorkflowActivity(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     actor: Mapped["User"] = relationship("User")
+
+
+class WorkflowFinding(Base):
+    """AI or manual findings saved for a workflow case."""
+    __tablename__ = "workflow_findings"
+
+    __table_args__ = (
+        Index("idx_workflow_findings_workflow", "workflow_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_workflows.id"), nullable=False
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_tasks.id"), nullable=True
+    )
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    findings: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    risk_level: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    recommendations: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    evidence_refs: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    workflow: Mapped["WorkspaceWorkflow"] = relationship("WorkspaceWorkflow")
+    created_by: Mapped["User"] = relationship("User")
 
 
 # ============================================
@@ -993,6 +1037,12 @@ class Conversation(Base):
     
     # Conversation info
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    workflow_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_workflows.id"), nullable=True
+    )
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_tasks.id"), nullable=True
+    )
 
     # Imported from a public share link (User 2 continuing a shared chat)
     is_shared_import: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

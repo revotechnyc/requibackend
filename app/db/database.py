@@ -198,6 +198,9 @@ async def init_db() -> None:
         await _ensure_workflow_activities_table(conn)
         await _ensure_workspace_task_workflow_column(conn)
         await _ensure_document_workflow_column(conn)
+        await _ensure_task_resolution_columns(conn)
+        await _ensure_workflow_findings_table(conn)
+        await _ensure_conversation_workflow_columns(conn)
         await _ensure_compliance_tables(conn)
         await _ensure_member_feature_permissions_columns(conn)
         await _ensure_notification_type_enum_values(conn)
@@ -500,6 +503,91 @@ async def _ensure_document_workflow_column(conn) -> None:
             """
             ALTER TABLE documents
             ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
+            """
+        )
+    )
+
+
+async def _ensure_task_resolution_columns(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS resolution_result JSONB
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS resolution_document_id UUID REFERENCES documents(id)
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS execution_conversation_id UUID REFERENCES conversations(id)
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS resolution_history JSONB DEFAULT '[]'
+            """
+        )
+    )
+
+
+async def _ensure_workflow_findings_table(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workflow_findings (
+                id UUID PRIMARY KEY,
+                workflow_id UUID NOT NULL REFERENCES workspace_workflows(id) ON DELETE CASCADE,
+                organization_id UUID NOT NULL REFERENCES organizations(id),
+                task_id UUID REFERENCES workspace_tasks(id),
+                created_by_id UUID NOT NULL REFERENCES users(id),
+                summary TEXT NOT NULL DEFAULT '',
+                findings JSONB DEFAULT '[]',
+                risk_level VARCHAR(32),
+                recommendations JSONB DEFAULT '[]',
+                evidence_refs JSONB DEFAULT '[]',
+                raw_payload JSONB DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE INDEX IF NOT EXISTS idx_workflow_findings_workflow
+            ON workflow_findings (workflow_id, created_at DESC)
+            """
+        )
+    )
+
+
+async def _ensure_conversation_workflow_columns(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS task_id UUID REFERENCES workspace_tasks(id)
             """
         )
     )

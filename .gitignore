@@ -12,6 +12,11 @@ env/
 .env.*
 !.env.example
 
+# GCP service account keys (never commit)
+credentials/
+requi-new-user-*.json
+*-service-account*.json
+
 # Uploaded document binaries (local storage)
 data/document_uploads/
 

@@ -197,14 +197,43 @@ class Settings(BaseSettings):
     daily_update_minute: int = 0
     knowledge_stale_days: int = 30
     
-    # Document Storage
-    document_storage_type: str = "local"  # local, s3
+    # Document Storage — local | s3 | gcs
+    document_storage_type: str = "local"
     document_upload_dir: str = "data/document_uploads"
+    # AWS S3 (legacy; keep configured for reading migrated objects if needed)
     s3_bucket_name: Optional[str] = None
     s3_region: str = "us-east-1"
     s3_endpoint_url: Optional[str] = None
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
+    # Google Cloud Storage
+    gcs_bucket_name: Optional[str] = None
+    gcs_credentials_path: Optional[str] = Field(
+        default=None,
+        description="Path to GCP service account JSON key file",
+    )
+    gcs_project_id: Optional[str] = Field(
+        default=None,
+        description="GCP project ID; inferred from credentials file when unset",
+    )
+    gcs_public_base_url: Optional[str] = Field(
+        default=None,
+        description="Optional public base URL for file_url (e.g. https://storage.googleapis.com/bucket)",
+    )
+
+    @model_validator(mode="after")
+    def align_gcs_settings(self) -> "Settings":
+        """Keep public URL in sync with GCS_BUCKET_NAME to avoid stale bucket names in .env."""
+        if (self.document_storage_type or "").strip().lower() != "gcs":
+            return self
+        bucket = (self.gcs_bucket_name or "").strip()
+        if not bucket:
+            return self
+        expected = f"https://storage.googleapis.com/{bucket}"
+        base = (self.gcs_public_base_url or "").strip().rstrip("/")
+        if not base or not base.endswith(bucket):
+            self.gcs_public_base_url = expected
+        return self
     
     # Logging
     log_level: str = "INFO"
