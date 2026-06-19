@@ -108,6 +108,9 @@ def _cors_allow_origins() -> list[str]:
 # Any http(s) frontend origin (credentials + Authorization header both work)
 _CORS_ALLOW_ALL_REGEX = r"https?://.*"
 
+# SaaS admin portal deployed on Netlify (preview + production URLs)
+_NETLIFY_ADMIN_ORIGIN_REGEX = r"https://[a-z0-9-]+\.netlify\.app"
+
 if settings.cors_allow_all_enabled:
     print("[CORS] Allowing all origins (CORS_ALLOW_ALL=true or CORS_ORIGINS=*)")
     app.add_middleware(
@@ -124,6 +127,7 @@ else:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=_origins,
+        allow_origin_regex=_NETLIFY_ADMIN_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
