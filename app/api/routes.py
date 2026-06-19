@@ -14,6 +14,9 @@ from app.api.endpoints import (
     platform_admin_team,
     platform_admin_blog,
     platform_admin_customers,
+    platform_admin_overview,
+    platform_admin_billing,
+    platform_admin_analytics,
     platform_blog_public,
     chat_share,
     billing,
@@ -68,6 +71,27 @@ api_router.include_router(
     platform_admin_customers.router,
     prefix="/platform-admin/customers",
     tags=["platform-admin-customers"],
+    dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_overview.router,
+    prefix="/platform-admin/overview",
+    tags=["platform-admin-overview"],
+    dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_billing.router,
+    prefix="/platform-admin/billing",
+    tags=["platform-admin-billing"],
+    dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_analytics.router,
+    prefix="/platform-admin/analytics",
+    tags=["platform-admin-analytics"],
     dependencies=platform_admin_dep,
 )
 
