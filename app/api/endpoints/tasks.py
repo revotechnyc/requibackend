@@ -123,6 +123,24 @@ TASK_PICK_ROLES = {
     r.value for r in UserRole if r.value not in TASK_PICK_EXCLUDED_ROLES
 }
 
+# Relationships required before _serialize_task (async session cannot lazy-load).
+_TASK_SERIALIZE_LOAD_OPTIONS = (
+    selectinload(WorkspaceTask.creator),
+    selectinload(WorkspaceTask.assignee),
+    selectinload(WorkspaceTask.reviewer),
+    selectinload(WorkspaceTask.approver),
+    selectinload(WorkspaceTask.document),
+    selectinload(WorkspaceTask.resolution_document),
+)
+_TASK_REFRESH_ATTRS = [
+    "creator",
+    "assignee",
+    "reviewer",
+    "approver",
+    "document",
+    "resolution_document",
+]
+
 
 def _role_value(role: UserRole | str) -> str:
     return role.value if isinstance(role, UserRole) else str(role).lower()
@@ -182,14 +200,7 @@ async def _get_task_for_org(
     result = await db.execute(
         select(WorkspaceTask)
         .where(WorkspaceTask.id == tid, WorkspaceTask.organization_id == org_id)
-        .options(
-            selectinload(WorkspaceTask.creator),
-            selectinload(WorkspaceTask.assignee),
-            selectinload(WorkspaceTask.reviewer),
-            selectinload(WorkspaceTask.approver),
-            selectinload(WorkspaceTask.document),
-            selectinload(WorkspaceTask.resolution_document),
-        )
+        .options(*_TASK_SERIALIZE_LOAD_OPTIONS)
     )
     task = result.scalar_one_or_none()
     if not task:
@@ -760,7 +771,7 @@ async def create_task(
             },
         )
 
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
@@ -784,13 +795,7 @@ async def list_tasks(
     query = (
         select(WorkspaceTask)
         .where(WorkspaceTask.organization_id == org.id)
-        .options(
-            selectinload(WorkspaceTask.creator),
-            selectinload(WorkspaceTask.assignee),
-            selectinload(WorkspaceTask.reviewer),
-            selectinload(WorkspaceTask.approver),
-            selectinload(WorkspaceTask.document),
-        )
+        .options(*_TASK_SERIALIZE_LOAD_OPTIONS)
         .order_by(desc(WorkspaceTask.created_at))
     )
     result = await db.execute(query)
@@ -1049,7 +1054,7 @@ async def transition_task_status(
     task.updated_at = now
     task.history = history
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
@@ -1109,7 +1114,7 @@ async def run_task_approval_ai_review(
     task.updated_at = datetime.utcnow()
     await db.flush()
     await db.commit()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     enterprise = True
@@ -1185,7 +1190,7 @@ async def update_task(
 
     task.updated_at = datetime.utcnow()
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
@@ -1269,7 +1274,7 @@ async def execute_task(
     task.updated_at = datetime.utcnow()
 
     await db.commit()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
 
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     context = None
@@ -1334,7 +1339,7 @@ async def save_task_resolution_endpoint(
         raw_content=data.raw_content,
     )
     await db.commit()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
 
     return {
@@ -1389,7 +1394,7 @@ async def add_comment(
     task.comments = comments
     task.updated_at = now
     await db.flush()
-    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+    await db.refresh(task, attribute_names=_TASK_REFRESH_ATTRS)
     docs_map = await _documents_map_for_tasks(org.id, [task], db)
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
