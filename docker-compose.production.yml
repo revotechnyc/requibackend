@@ -33,6 +33,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: api
     depends_on:
       redis:
         condition: service_healthy
@@ -52,6 +53,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: worker
     depends_on:
       redis:
         condition: service_healthy
@@ -70,6 +72,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: beat
     depends_on:
       redis:
         condition: service_healthy

@@ -53,6 +53,8 @@ class Settings(BaseSettings):
     db_password: str = ""
     database_pool_size: int = 20
     database_max_overflow: int = 30
+    # Per-process pool budget when using Supabase Session pooler (api | worker | beat).
+    database_pool_role: str = "api"
 
     @model_validator(mode="after")
     def assemble_database_url(self) -> "Settings":

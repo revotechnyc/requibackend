@@ -23,6 +23,11 @@ from app.core.permissions import FeatureGate, PLAN_FEATURES
 from app.services.enterprise_roles import is_workspace_admin
 from app.services.task_visibility import task_visible_to_user
 from app.services.task_resolution_service import parse_resolution_json, save_task_resolution
+from app.services.task_approval_review_service import (
+    latest_resolution_entry_id,
+    run_approval_ai_review,
+    valid_approval_review_for_task,
+)
 from app.services.workflow_context_builder import build_workflow_context
 from app.services.workflow_service import (
     create_workflow_for_task,
@@ -95,6 +100,7 @@ class TaskUpdate(BaseModel):
 class TaskStatusTransition(BaseModel):
     status: str
     comment: Optional[str] = None
+    approval_review_id: Optional[str] = None
 
 
 VALID_TRANSITIONS = {
@@ -380,6 +386,7 @@ def _serialize_task(
         "workflow_id": str(task.workflow_id) if task.workflow_id else None,
         "resolution_result": task.resolution_result,
         "resolution_history": task.resolution_history or [],
+        "approval_ai_reviews": task.approval_ai_reviews or [],
         "resolution_document_id": (
             str(task.resolution_document_id) if task.resolution_document_id else None
         ),
@@ -440,16 +447,21 @@ def _task_workflow_permissions(
             "can_start_work": False,
             "can_submit_for_review": False,
             "can_complete_review": False,
+            "can_run_approval_ai_review": False,
             "can_approve_task": False,
             "can_reject_at_review": False,
             "can_reject_at_approval": False,
             "can_resume_work": False,
             "can_mark_complete": False,
             "can_complete_task": status != TaskStatus.COMPLETED and assignee_ok,
+            "has_valid_approval_ai_review": False,
         }
 
     status = TaskStatus(task.status)
     assignee_ok = _can_user_act_as_assignee(task, user, user_role)
+    approver_ok = _can_user_approve(task, user, user_role)
+    has_valid_ai_review = valid_approval_review_for_task(task) is not None
+    has_resolution = bool(task.resolution_result and latest_resolution_entry_id(task))
 
     return {
         "can_start_work": status == TaskStatus.PENDING and assignee_ok,
@@ -458,13 +470,19 @@ def _task_workflow_permissions(
         and _can_user_review(task, user, user_role),
         "can_reject_at_review": status == TaskStatus.SUBMITTED_FOR_REVIEW
         and _can_user_review(task, user, user_role),
+        "can_run_approval_ai_review": status == TaskStatus.REVIEWED
+        and approver_ok
+        and has_resolution,
         "can_approve_task": status == TaskStatus.REVIEWED
-        and _can_user_approve(task, user, user_role),
+        and approver_ok
+        and has_valid_ai_review,
         "can_reject_at_approval": status == TaskStatus.REVIEWED
-        and _can_user_approve(task, user, user_role),
+        and approver_ok
+        and has_valid_ai_review,
         "can_resume_work": status == TaskStatus.REJECTED and assignee_ok,
         "can_mark_complete": status == TaskStatus.APPROVED and assignee_ok,
         "can_complete_task": False,
+        "has_valid_approval_ai_review": has_valid_ai_review,
     }
 
 
@@ -545,6 +563,11 @@ def _workflow_notice(
     if status == TaskStatus.REVIEWED:
         if workflow["can_approve_task"] or workflow["can_reject_at_approval"]:
             return None
+        if workflow.get("can_run_approval_ai_review"):
+            return (
+                "Run an AI approval review on the task resolution before you approve or reject. "
+                "Intelligence will verify whether the work adequately resolves the task."
+            )
         if user_role == UserRole.REVIEWER:
             return (
                 f"Review is complete. This task is awaiting final approval by {approver_name}."
@@ -958,20 +981,46 @@ async def transition_task_status(
                 status_code=403,
                 detail="Only the assigned approver or admin can approve or reject",
             )
+        if enterprise:
+            ai_review = valid_approval_review_for_task(task, data.approval_review_id)
+            if not ai_review:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "An AI approval review is required before approving or rejecting. "
+                        "Run AI Approval Review first."
+                    ),
+                )
+        else:
+            ai_review = None
 
     now = datetime.utcnow()
     history = list(task.history or [])
-    history.append(
-        {
-            "from": current_status.value,
-            "to": target_status.value,
-            "by": str(current_user.id),
-            "by_name": _user_display(current_user),
-            "at": now.isoformat(),
-            "comment": data.comment,
-        }
-    )
-    if data.comment:
+    history_entry = {
+        "from": current_status.value,
+        "to": target_status.value,
+        "by": str(current_user.id),
+        "by_name": _user_display(current_user),
+        "at": now.isoformat(),
+        "comment": data.comment,
+    }
+    if target_status in (TaskStatus.APPROVED, TaskStatus.REJECTED) and current_status == TaskStatus.REVIEWED:
+        if enterprise and ai_review:
+            history_entry["approval_review_id"] = ai_review.get("id")
+    history.append(history_entry)
+
+    comment_text = (data.comment or "").strip()
+    if target_status in (TaskStatus.APPROVED, TaskStatus.REJECTED) and current_status == TaskStatus.REVIEWED:
+        if enterprise and ai_review and not comment_text:
+            report = ai_review.get("report") or {}
+            rec = report.get("recommendation", "review")
+            comment_text = (
+                f"{'Approved' if target_status == TaskStatus.APPROVED else 'Rejected'} "
+                f"with AI review (AI recommended: {rec}). "
+                f"{report.get('summary', '')}"
+            ).strip()
+
+    if comment_text:
         comments = list(task.comments or [])
         comment_type = "comment"
         if target_status == TaskStatus.SUBMITTED_FOR_REVIEW:
@@ -982,16 +1031,18 @@ async def transition_task_status(
             comment_type = "approval"
         elif target_status == TaskStatus.REJECTED:
             comment_type = "rejection"
-        comments.append(
-            {
-                "id": f"c_{len(comments)}",
-                "author": str(current_user.id),
-                "author_name": _user_display(current_user),
-                "text": data.comment,
-                "created_at": now.isoformat(),
-                "type": comment_type,
-            }
-        )
+        comment_entry = {
+            "id": f"c_{len(comments)}",
+            "author": str(current_user.id),
+            "author_name": _user_display(current_user),
+            "text": comment_text,
+            "created_at": now.isoformat(),
+            "type": comment_type,
+        }
+        if enterprise and ai_review and target_status in (TaskStatus.APPROVED, TaskStatus.REJECTED):
+            comment_entry["approval_review_id"] = ai_review.get("id")
+            comment_entry["approval_ai_report"] = ai_review.get("report")
+        comments.append(comment_entry)
         task.comments = comments
 
     task.status = target_status.value
@@ -1004,6 +1055,73 @@ async def transition_task_status(
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
         "message": f"Status transitioned to {target_status.value}",
+    }
+
+
+@router.post("/{task_id}/approval-ai-review", response_model=dict)
+async def run_task_approval_ai_review(
+    task_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run Intelligence AI review on task resolution before approver sign-off."""
+    org, _seat, user_role = await _get_workspace_context(current_user, db)
+    task = await _get_task_for_org(task_id, org.id, db)
+
+    if not _task_visible_to_user(task, current_user.id, user_role):
+        raise HTTPException(status_code=403, detail="You do not have access to this task")
+
+    if not _is_enterprise(org):
+        raise HTTPException(
+            status_code=400,
+            detail="AI approval review is available for Enterprise workflow tasks only",
+        )
+
+    if TaskStatus(task.status) != TaskStatus.REVIEWED:
+        raise HTTPException(
+            status_code=400,
+            detail="AI approval review is only available when the task is awaiting final approval",
+        )
+
+    if not _can_user_approve(task, current_user, user_role):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the assigned approver or admin can run AI approval review",
+        )
+
+    if not task.resolution_result or not latest_resolution_entry_id(task):
+        raise HTTPException(
+            status_code=400,
+            detail="Task must have a saved Intelligence resolution before AI approval review",
+        )
+
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    documents = docs_map.get(str(task.id), [])
+
+    try:
+        review_record = await run_approval_ai_review(task, current_user, documents)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    reviews = list(task.approval_ai_reviews or [])
+    reviews.append(review_record)
+    task.approval_ai_reviews = reviews
+    task.updated_at = datetime.utcnow()
+    await db.flush()
+    await db.commit()
+    await db.refresh(task, ["creator", "assignee", "reviewer", "approver", "document", "resolution_document"])
+
+    docs_map = await _documents_map_for_tasks(org.id, [task], db)
+    enterprise = True
+    workflow = _task_workflow_permissions(task, current_user, user_role, enterprise)
+    notice = _workflow_notice(task, current_user, user_role, enterprise, workflow)
+
+    return {
+        "review": review_record,
+        "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
+        "permissions": workflow,
+        "workflow_message": notice,
+        "message": "AI approval review completed",
     }
 
 

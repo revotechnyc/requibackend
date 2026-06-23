@@ -14,19 +14,36 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.config import settings
 
+def _database_url_lower() -> str:
+    return (settings.database_url or "").lower()
+
+
 def _is_external_database() -> bool:
     """Managed/cloud Postgres (Supabase, RDS, Neon, etc.)."""
-    url = (settings.database_url or "").lower()
+    url = _database_url_lower()
     return any(
         host in url
         for host in (
             "supabase.co",
+            "supabase.com",
+            "pooler.supabase",
             "amazonaws.com",
             "neon.tech",
             "render.com",
             "railway.app",
         )
     )
+
+
+def _is_supabase_session_pooler() -> bool:
+    """Supabase Session mode (port 5432) — strict client limit (~15 on free/pro)."""
+    url = _database_url_lower()
+    if "pooler.supabase" not in url:
+        return False
+    # Transaction pooler (port 6543) allows more concurrent clients.
+    if ":6543" in url:
+        return False
+    return True
 
 
 def get_async_database_url() -> str:
@@ -49,27 +66,54 @@ def _engine_connect_args() -> dict:
     return {}
 
 
+# Session-pooler caps per process so api + worker + beat stay under ~15 total.
+_SESSION_POOLER_CAPS: dict[str, tuple[int, int]] = {
+    "api": (4, 2),
+    "worker": (2, 1),
+    "beat": (1, 0),
+}
+
+
 def _effective_pool_size() -> int:
+    if _is_supabase_session_pooler():
+        role = (settings.database_pool_role or "api").strip().lower()
+        cap, _ = _SESSION_POOLER_CAPS.get(role, (3, 1))
+        return min(settings.database_pool_size, cap)
     if _is_external_database():
         return min(settings.database_pool_size, 8)
     return settings.database_pool_size
 
 
 def _effective_max_overflow() -> int:
+    if _is_supabase_session_pooler():
+        role = (settings.database_pool_role or "api").strip().lower()
+        _, cap = _SESSION_POOLER_CAPS.get(role, (3, 1))
+        return min(settings.database_max_overflow, cap)
     if _is_external_database():
         return min(settings.database_max_overflow, 4)
     return settings.database_max_overflow
 
 
+_pool_size = _effective_pool_size()
+_max_overflow = _effective_max_overflow()
+
 # Create async engine
 async_engine = create_async_engine(
     get_async_database_url(),
-    pool_size=_effective_pool_size(),
-    max_overflow=_effective_max_overflow(),
+    pool_size=_pool_size,
+    max_overflow=_max_overflow,
     pool_pre_ping=True,
+    pool_recycle=300,
+    pool_timeout=30,
     echo=settings.debug,
     connect_args=_engine_connect_args(),
 )
+
+if _is_supabase_session_pooler():
+    print(
+        f"[DB  ] Supabase session pooler: role={settings.database_pool_role!r} "
+        f"pool_size={_pool_size} max_overflow={_max_overflow}"
+    )
 
 # Create async session factory
 AsyncSessionLocal = async_sessionmaker(
@@ -199,6 +243,7 @@ async def init_db() -> None:
         await _ensure_workspace_task_workflow_column(conn)
         await _ensure_document_workflow_column(conn)
         await _ensure_task_resolution_columns(conn)
+        await _ensure_task_approval_ai_reviews_column(conn)
         await _ensure_workflow_findings_table(conn)
         await _ensure_conversation_workflow_columns(conn)
         await _ensure_compliance_tables(conn)
@@ -503,6 +548,17 @@ async def _ensure_document_workflow_column(conn) -> None:
             """
             ALTER TABLE documents
             ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
+            """
+        )
+    )
+
+
+async def _ensure_task_approval_ai_reviews_column(conn) -> None:
+    await conn.execute(
+        text(
+            """
+            ALTER TABLE workspace_tasks
+            ADD COLUMN IF NOT EXISTS approval_ai_reviews JSONB DEFAULT '[]'
             """
         )
     )

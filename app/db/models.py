@@ -492,6 +492,7 @@ class WorkspaceTask(Base):
     history: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     resolution_result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     resolution_history: Mapped[Optional[list]] = mapped_column(JSON, default=list)
+    approval_ai_reviews: Mapped[Optional[list]] = mapped_column(JSON, default=list)
     resolution_document_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("documents.id"), nullable=True
     )

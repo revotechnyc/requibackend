@@ -3,6 +3,7 @@ Requi Health API - Main application
 """
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -136,9 +137,30 @@ else:
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+def _cors_headers_for_request(request: Request) -> dict[str, str]:
+    """Ensure error responses include CORS headers (browser otherwise reports CORS, not 500)."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    normalized = _normalize_origin(origin)
+    if settings.cors_allow_all_enabled:
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        }
+    allowed = {_normalize_origin(o) for o in _cors_allow_origins()}
+    if normalized in allowed or re.fullmatch(_NETLIFY_ADMIN_ORIGIN_REGEX, origin):
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+        }
+    return {}
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Return error detail in development to simplify debugging."""
+    cors_headers = _cors_headers_for_request(request)
     if settings.debug:
         import traceback
 
@@ -149,8 +171,13 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
                 "type": type(exc).__name__,
                 "traceback": traceback.format_exc().splitlines()[-8:],
             },
+            headers=cors_headers,
         )
-    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+        headers=cors_headers,
+    )
 
 
 # Include API routes
