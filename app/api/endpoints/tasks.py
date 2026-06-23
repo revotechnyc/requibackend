@@ -903,6 +903,7 @@ async def transition_task_status(
     current_status = TaskStatus(task.status)
     allowed = list(VALID_TRANSITIONS.get(current_status, []))
     enterprise = _is_enterprise(org)
+    ai_review: Optional[dict] = None
 
     if (
         current_status == TaskStatus.IN_PROGRESS
