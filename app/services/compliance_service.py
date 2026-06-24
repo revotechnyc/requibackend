@@ -49,6 +49,15 @@ FRAMEWORK_CATALOG: dict[str, str] = {
 
 DEFAULT_STARTER_SLUGS = ("hipaa", "fwa")
 
+# Baseline scores before open-gap penalties (must not use already-penalized fw.score).
+DEFAULT_FRAMEWORK_BASELINES: dict[str, float] = {
+    "hipaa": 92.0,
+    "fwa": 78.0,
+}
+DEFAULT_OTHER_FRAMEWORK_BASELINE = 80.0
+
+AI_SNAPSHOT_SOURCES = frozenset({"chat", "document_analysis", "gap_assessment"})
+
 PRO_MAX_FRAMEWORKS = 3
 
 TERMINAL_TASK_STATUSES = {
@@ -257,6 +266,50 @@ async def _fetch_document_metrics(db: AsyncSession, org_id: uuid.UUID) -> dict[s
     return {"total": total, "analyzed": analyzed, "readiness_score": readiness}
 
 
+def _gap_severity_penalty(gap: ComplianceGap) -> int:
+    if gap.severity == "critical":
+        return 15
+    if gap.severity == "high":
+        return 8
+    if gap.severity == "medium":
+        return 4
+    return 2
+
+
+async def _framework_baseline_scores(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    frameworks: list[ComplianceFramework],
+) -> dict[str, float]:
+    """Pre-penalty framework scores from latest AI analysis or catalog defaults."""
+    snap_result = await db.execute(
+        select(ComplianceScoreSnapshot)
+        .where(ComplianceScoreSnapshot.organization_id == org_id)
+        .where(ComplianceScoreSnapshot.source_type.in_(AI_SNAPSHOT_SOURCES))
+        .order_by(ComplianceScoreSnapshot.calculated_at.desc())
+        .limit(1)
+    )
+    snap = snap_result.scalar_one_or_none()
+    snap_scores: dict[str, float] = {}
+    if snap and snap.framework_scores:
+        snap_scores = {
+            k: float(v) for k, v in snap.framework_scores.items() if v is not None
+        }
+
+    baselines: dict[str, float] = {}
+    for fw in frameworks:
+        if not fw.is_active:
+            continue
+        slug = fw.slug
+        if slug in snap_scores:
+            baselines[slug] = snap_scores[slug]
+        elif slug in DEFAULT_FRAMEWORK_BASELINES:
+            baselines[slug] = DEFAULT_FRAMEWORK_BASELINES[slug]
+        else:
+            baselines[slug] = DEFAULT_OTHER_FRAMEWORK_BASELINE
+    return baselines
+
+
 async def _sync_framework_scores_from_gaps(
     db: AsyncSession,
     org_id: uuid.UUID,
@@ -273,22 +326,15 @@ async def _sync_framework_scores_from_gaps(
     for g in open_gaps:
         gaps_by_slug.setdefault(g.framework_slug, []).append(g)
 
+    baselines = await _framework_baseline_scores(db, org_id, frameworks)
+
     scores: dict[str, float] = {}
     for fw in frameworks:
         if not fw.is_active:
             continue
         gap_list = gaps_by_slug.get(fw.slug, [])
-        penalty = 0
-        for g in gap_list:
-            if g.severity == "critical":
-                penalty += 15
-            elif g.severity == "high":
-                penalty += 8
-            elif g.severity == "medium":
-                penalty += 4
-            else:
-                penalty += 2
-        base = float(fw.score) if fw.score is not None else 80.0
+        penalty = sum(_gap_severity_penalty(g) for g in gap_list)
+        base = baselines.get(fw.slug, DEFAULT_OTHER_FRAMEWORK_BASELINE)
         scores[fw.slug] = round(max(0.0, min(100.0, base - penalty)), 1)
         fw.score = scores[fw.slug]
     await db.flush()
@@ -314,21 +360,6 @@ async def build_compliance_overview(
     frameworks = list(fw_result.scalars().all())
     framework_scores = await _sync_framework_scores_from_gaps(db, org_id, frameworks)
     ai_score = calculate_ai_score(framework_scores)
-
-    snap_result = await db.execute(
-        select(ComplianceScoreSnapshot)
-        .where(ComplianceScoreSnapshot.organization_id == org_id)
-        .order_by(ComplianceScoreSnapshot.calculated_at.desc())
-        .limit(1)
-    )
-    latest_snap = snap_result.scalar_one_or_none()
-    if latest_snap and latest_snap.source_type in ("chat", "document_analysis", "gap_assessment"):
-        snap_scores = latest_snap.framework_scores or {}
-        if snap_scores:
-            for k, v in snap_scores.items():
-                if k not in framework_scores:
-                    framework_scores[k] = float(v)
-            ai_score = float(latest_snap.overall_score) or calculate_ai_score(framework_scores)
 
     task_metrics = await _fetch_task_metrics(db, org_id)
     doc_metrics = await _fetch_document_metrics(db, org_id)
