@@ -4,7 +4,7 @@ Multi-tenant SaaS with Stripe billing and knowledge management
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum as PyEnum
 from typing import List, Optional
 
@@ -13,6 +13,7 @@ from sqlalchemy import (
     JSON,
     Boolean,
     Column,
+    Date,
     DateTime,
     Enum,
     ForeignKey,
@@ -1295,3 +1296,168 @@ class NotificationPreference(Base):
     digest_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     digest_frequency: Mapped[str] = mapped_column(String(16), default="daily")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ==========================
+# CLM (Contract Lifecycle Management) — Enterprise
+# ==========================
+
+
+class ClmContractStatus(str, PyEnum):
+    PROCESSING = "processing"
+    ACTIVE = "active"
+    EXPIRING = "expiring"
+    EXPIRED = "expired"
+    ARCHIVED = "archived"
+
+
+class ClmSubLocation(Base):
+    """User-managed facility / sub-location hierarchy for contract storage."""
+    __tablename__ = "clm_sub_locations"
+
+    __table_args__ = (
+        Index("idx_clm_sub_locations_org", "organization_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    parent_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_sub_locations.id"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    parent: Mapped[Optional["ClmSubLocation"]] = relationship(
+        "ClmSubLocation", remote_side="ClmSubLocation.id"
+    )
+
+
+class ClmVendor(Base):
+    """Vendor registry — manual or auto-created from contract upload."""
+    __tablename__ = "clm_vendors"
+
+    __table_args__ = (
+        Index("idx_clm_vendors_org_active", "organization_id", "is_active"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    sub_location_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_sub_locations.id"), nullable=True
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="manual")
+    metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    sub_location: Mapped[Optional["ClmSubLocation"]] = relationship("ClmSubLocation")
+
+
+class ClmContract(Base):
+    """CLM contract record — file lives in Documents; this is structured metadata."""
+    __tablename__ = "clm_contracts"
+
+    __table_args__ = (
+        Index("idx_clm_contracts_org_status", "organization_id", "status"),
+        Index("idx_clm_contracts_org_exp", "organization_id", "expiration_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id"), nullable=False
+    )
+    vendor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_vendors.id"), nullable=True
+    )
+    sub_location_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_sub_locations.id"), nullable=True
+    )
+    owner_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    created_by_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    contract_number: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=ClmContractStatus.PROCESSING.value
+    )
+    effective_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    expiration_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    renewal_clause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    contract_value: Mapped[Optional[float]] = mapped_column(nullable=True)
+    risk_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    ai_extraction: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    renewal_task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_tasks.id"), nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    document: Mapped["Document"] = relationship("Document")
+    vendor: Mapped[Optional["ClmVendor"]] = relationship("ClmVendor")
+    sub_location: Mapped[Optional["ClmSubLocation"]] = relationship("ClmSubLocation")
+
+
+class ClmObligation(Base):
+    """Contractual obligation extracted by AI — linked to compliance gaps when created."""
+    __tablename__ = "clm_obligations"
+
+    __table_args__ = (
+        Index("idx_clm_obligations_contract", "contract_id"),
+        Index("idx_clm_obligations_org_status", "organization_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    contract_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_contracts.id"), nullable=False
+    )
+    compliance_gap_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("compliance_gaps.id"), nullable=True
+    )
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_tasks.id"), nullable=True
+    )
+
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    obligation_type: Mapped[str] = mapped_column(String(64), nullable=False, default="other")
+    due_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    severity: Mapped[str] = mapped_column(String(20), nullable=False, default="medium")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    contract: Mapped["ClmContract"] = relationship("ClmContract")

@@ -111,6 +111,7 @@ PLAN_FEATURES = {
         "reporting",
         "ai_agents",
         "analytics",
+        "clm",
     ],
 }
 

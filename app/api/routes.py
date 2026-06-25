@@ -31,6 +31,7 @@ from app.api.endpoints import (
     workflows,
     calendar,
     compliance,
+    clm,
     teams,
     users,
     viewers,
@@ -161,6 +162,10 @@ api_router.include_router(
 
 api_router.include_router(
     compliance.router, prefix="/compliance", tags=["v2.1 — Compliance"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    clm.router, prefix="/clm", tags=["v2.1 — CLM"], dependencies=auth_dep,
 )
 
 # View-Only User Management API

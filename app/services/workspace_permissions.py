@@ -54,6 +54,7 @@ PLAN_FEATURES: dict[PlanType, list[str]] = {
         "reporting",
         "ai_agents",
         "analytics",
+        "clm",
     ],
 }
 
@@ -70,6 +71,7 @@ MANAGEABLE_FEATURE_KEYS = (
     "teams",
     "analytics",
     "integrations",
+    "clm",
     "settings",
 )
 
@@ -87,6 +89,7 @@ ROLE_FEATURE_ACCESS: dict[str, tuple[str, ...]] = {
     "teams": ("enterprise_admin", "admin"),
     "analytics": ("enterprise_admin", "admin", "reviewer", "analyst"),
     "integrations": ("enterprise_admin", "admin"),
+    "clm": ("enterprise_admin", "admin", "reviewer", "contributor", "seo"),
     "settings": ("enterprise_admin", "admin"),
 }
 

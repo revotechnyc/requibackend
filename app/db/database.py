@@ -2,8 +2,9 @@
 Database connection and session management
 """
 
+import logging
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Awaitable, Callable
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
@@ -13,6 +14,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 def _database_url_lower() -> str:
     return (settings.database_url or "").lower()
@@ -151,14 +154,123 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
-async def _ensure_platform_admin_invited_by_column(conn) -> None:
-    await conn.execute(
+async def _set_migration_session(conn) -> None:
+    """Avoid Supabase statement_timeout during short schema ensures on restart."""
+    await conn.execute(text("SET LOCAL statement_timeout = 0"))
+    await conn.execute(text("SET LOCAL lock_timeout = '60s'"))
+
+
+async def _column_exists(conn, table: str, column: str) -> bool:
+    result = await conn.execute(
         text(
             """
-            ALTER TABLE platform_admins
-            ADD COLUMN IF NOT EXISTS invited_by_id UUID REFERENCES platform_admins(id)
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = :table
+              AND column_name = :column
+            """
+        ),
+        {"table": table, "column": column},
+    )
+    return result.scalar() is not None
+
+
+async def _constraint_exists(conn, table: str, constraint_name: str) -> bool:
+    result = await conn.execute(
+        text(
+            """
+            SELECT 1 FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON t.relnamespace = n.oid
+            WHERE n.nspname = 'public'
+              AND t.relname = :table
+              AND c.conname = :name
+            """
+        ),
+        {"table": table, "name": constraint_name},
+    )
+    return result.scalar() is not None
+
+
+async def _ensure_uuid_column(conn, table: str, column: str) -> bool:
+    """Add nullable UUID column when missing. Returns True if column was created."""
+    if await _column_exists(conn, table, column):
+        return False
+    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} UUID"))
+    return True
+
+
+async def _fk_on_column_exists(conn, table: str, column: str) -> bool:
+    result = await conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_schema = kcu.constraint_schema
+             AND tc.constraint_name = kcu.constraint_name
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = 'public'
+              AND tc.table_name = :table
+              AND kcu.column_name = :column
+            """
+        ),
+        {"table": table, "column": column},
+    )
+    return result.scalar() is not None
+
+
+async def _ensure_fk(
+    conn,
+    table: str,
+    column: str,
+    ref_table: str,
+    constraint_name: str,
+    ref_column: str = "id",
+) -> None:
+    """Add FK without blocking startup: column first, then NOT VALID + validate."""
+    await _ensure_uuid_column(conn, table, column)
+    if await _fk_on_column_exists(conn, table, column):
+        return
+    if await _constraint_exists(conn, table, constraint_name):
+        return
+    await conn.execute(
+        text(
+            f"""
+            ALTER TABLE {table}
+            ADD CONSTRAINT {constraint_name}
+            FOREIGN KEY ({column}) REFERENCES {ref_table}({ref_column})
+            NOT VALID
             """
         )
+    )
+    await conn.execute(
+        text(f"ALTER TABLE {table} VALIDATE CONSTRAINT {constraint_name}")
+    )
+
+
+async def _run_migration_step(
+    name: str,
+    fn: Callable[..., Awaitable[None]],
+) -> None:
+    """Each step commits independently so one slow ALTER cannot roll back everything."""
+    try:
+        async with async_engine.begin() as conn:
+            await _set_migration_session(conn)
+            await fn(conn)
+        logger.info("db_migration_step_ok: %s", name)
+    except Exception:
+        logger.exception("db_migration_step_failed: %s", name)
+        raise
+
+
+async def _ensure_platform_admin_invited_by_column(conn) -> None:
+    await _ensure_fk(
+        conn,
+        "platform_admins",
+        "invited_by_id",
+        "platform_admins",
+        "fk_platform_admins_invited_by_id",
     )
 
 
@@ -187,87 +299,87 @@ async def _ensure_platform_admins_role_column(conn) -> None:
 
 async def _ensure_conversation_share_columns(conn) -> None:
     """Add share-import columns to existing deployments (create_all does not alter tables)."""
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE conversations
-            ADD COLUMN IF NOT EXISTS is_shared_import BOOLEAN NOT NULL DEFAULT FALSE
-            """
+    if not await _column_exists(conn, "conversations", "is_shared_import"):
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE conversations
+                ADD COLUMN is_shared_import BOOLEAN NOT NULL DEFAULT FALSE
+                """
+            )
         )
-    )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE conversations
-            ADD COLUMN IF NOT EXISTS shared_from_token VARCHAR(64)
-            """
+    if not await _column_exists(conn, "conversations", "shared_from_token"):
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE conversations
+                ADD COLUMN shared_from_token VARCHAR(64)
+                """
+            )
         )
-    )
 
 
 async def _ensure_platform_blog_post_columns(conn) -> None:
     """Add columns for iterative development (create_all does not alter tables)."""
-    # Scheduled publishing (added after initial rollout)
+    if await _column_exists(conn, "platform_blog_posts", "scheduled_for"):
+        return
     await conn.execute(
         text(
             """
             ALTER TABLE platform_blog_posts
-            ADD COLUMN IF NOT EXISTS scheduled_for TIMESTAMP
+            ADD COLUMN scheduled_for TIMESTAMP
             """
         )
     )
 
 
 async def init_db() -> None:
-    """Initialize database (create tables)"""
+    """Initialize database (create tables and apply idempotent schema patches)."""
     from app.db.models import Base
-    
-    async with async_engine.begin() as conn:
-        # Create pgvector extension if not exists
+
+    async def _create_extension_and_tables(conn) -> None:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        # Create all tables
         await conn.run_sync(Base.metadata.create_all)
-        await _ensure_platform_admins_role_column(conn)
-        await _ensure_platform_admin_invited_by_column(conn)
-        await _ensure_platform_blog_post_columns(conn)
-        await _ensure_conversation_share_columns(conn)
-        await _ensure_workspace_invitations_table(conn)
-        await _ensure_workspace_invitation_varchar_columns(conn)
-        await _ensure_seats_role_varchar_columns(conn)
-        await _ensure_userrole_enum_values(conn)
-        await _ensure_workspace_tasks_table(conn)
-        await _ensure_workspace_task_document_column(conn)
-        await _ensure_workspace_task_document_ids_column(conn)
-        await _ensure_workspace_workflows_table(conn)
-        await _ensure_workflow_activities_table(conn)
-        await _ensure_workspace_task_workflow_column(conn)
-        await _ensure_document_workflow_column(conn)
-        await _ensure_task_resolution_columns(conn)
-        await _ensure_task_approval_ai_reviews_column(conn)
-        await _ensure_workflow_findings_table(conn)
-        await _ensure_conversation_workflow_columns(conn)
-        await _ensure_compliance_tables(conn)
-        await _ensure_member_feature_permissions_columns(conn)
-        await _ensure_notification_type_enum_values(conn)
+
+    migration_steps: list[tuple[str, Callable[..., Awaitable[None]]]] = [
+        ("create_extension_and_tables", _create_extension_and_tables),
+        ("platform_admins_role", _ensure_platform_admins_role_column),
+        ("platform_admin_invited_by", _ensure_platform_admin_invited_by_column),
+        ("platform_blog_posts", _ensure_platform_blog_post_columns),
+        ("conversation_share", _ensure_conversation_share_columns),
+        ("workspace_invitations_table", _ensure_workspace_invitations_table),
+        ("workspace_invitation_varchar", _ensure_workspace_invitation_varchar_columns),
+        ("seats_role_varchar", _ensure_seats_role_varchar_columns),
+        ("userrole_enum_values", _ensure_userrole_enum_values),
+        ("workspace_tasks_table", _ensure_workspace_tasks_table),
+        ("workspace_task_document", _ensure_workspace_task_document_column),
+        ("workspace_task_document_ids", _ensure_workspace_task_document_ids_column),
+        ("workspace_workflows_table", _ensure_workspace_workflows_table),
+        ("workflow_activities_table", _ensure_workflow_activities_table),
+        ("workspace_task_workflow", _ensure_workspace_task_workflow_column),
+        ("document_workflow", _ensure_document_workflow_column),
+        ("task_resolution", _ensure_task_resolution_columns),
+        ("task_approval_ai_reviews", _ensure_task_approval_ai_reviews_column),
+        ("workflow_findings_table", _ensure_workflow_findings_table),
+        ("conversation_workflow", _ensure_conversation_workflow_columns),
+        ("compliance_tables", _ensure_compliance_tables),
+        ("member_feature_permissions", _ensure_member_feature_permissions_columns),
+        ("notification_type_enum", _ensure_notification_type_enum_values),
+    ]
+
+    for name, step in migration_steps:
+        await _run_migration_step(name, step)
 
 
 async def _ensure_member_feature_permissions_columns(conn) -> None:
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE seats
-            ADD COLUMN IF NOT EXISTS feature_permissions JSONB
-            """
+    if not await _column_exists(conn, "seats", "feature_permissions"):
+        await conn.execute(
+            text("ALTER TABLE seats ADD COLUMN feature_permissions JSONB")
         )
-    )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_invitations
-            ADD COLUMN IF NOT EXISTS feature_permissions JSONB
-            """
+    if not await _column_exists(conn, "workspace_invitations", "feature_permissions"):
+        await conn.execute(
+            text("ALTER TABLE workspace_invitations ADD COLUMN feature_permissions JSONB")
         )
-    )
 
 
 async def _ensure_compliance_tables(conn) -> None:
@@ -418,40 +530,42 @@ async def _ensure_workspace_tasks_table(conn) -> None:
 
 async def _ensure_workspace_task_document_column(conn) -> None:
     """Optional document attachment on compliance tasks."""
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS document_id UUID REFERENCES documents(id)
-            """
-        )
+    await _ensure_fk(
+        conn,
+        "workspace_tasks",
+        "document_id",
+        "documents",
+        "fk_workspace_tasks_document_id",
     )
 
 
 async def _ensure_workspace_task_document_ids_column(conn) -> None:
     """Multiple document attachments on compliance tasks."""
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS document_ids JSONB DEFAULT '[]'::jsonb
-            """
+    created = not await _column_exists(conn, "workspace_tasks", "document_ids")
+    if created:
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE workspace_tasks
+                ADD COLUMN document_ids JSONB DEFAULT '[]'::jsonb
+                """
+            )
         )
-    )
-    await conn.execute(
-        text(
-            """
-            UPDATE workspace_tasks
-            SET document_ids = jsonb_build_array(document_id::text)
-            WHERE document_id IS NOT NULL
-              AND (
-                document_ids IS NULL
-                OR document_ids = '[]'::jsonb
-                OR document_ids = 'null'::jsonb
-              )
-            """
+    if created:
+        await conn.execute(
+            text(
+                """
+                UPDATE workspace_tasks
+                SET document_ids = jsonb_build_array(document_id::text)
+                WHERE document_id IS NOT NULL
+                  AND (
+                    document_ids IS NULL
+                    OR document_ids = '[]'::jsonb
+                    OR document_ids = 'null'::jsonb
+                  )
+                """
+            )
         )
-    )
 
 
 async def _ensure_workspace_workflows_table(conn) -> None:
@@ -532,71 +646,66 @@ async def _ensure_workflow_activities_table(conn) -> None:
 
 
 async def _ensure_workspace_task_workflow_column(conn) -> None:
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
-            """
-        )
+    await _ensure_fk(
+        conn,
+        "workspace_tasks",
+        "workflow_id",
+        "workspace_workflows",
+        "fk_workspace_tasks_workflow_id",
     )
 
 
 async def _ensure_document_workflow_column(conn) -> None:
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE documents
-            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
-            """
-        )
+    await _ensure_fk(
+        conn,
+        "documents",
+        "workflow_id",
+        "workspace_workflows",
+        "fk_documents_workflow_id",
     )
 
 
 async def _ensure_task_approval_ai_reviews_column(conn) -> None:
+    if await _column_exists(conn, "workspace_tasks", "approval_ai_reviews"):
+        return
     await conn.execute(
         text(
             """
             ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS approval_ai_reviews JSONB DEFAULT '[]'
+            ADD COLUMN approval_ai_reviews JSONB DEFAULT '[]'
             """
         )
     )
 
 
 async def _ensure_task_resolution_columns(conn) -> None:
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS resolution_result JSONB
-            """
+    if not await _column_exists(conn, "workspace_tasks", "resolution_result"):
+        await conn.execute(
+            text("ALTER TABLE workspace_tasks ADD COLUMN resolution_result JSONB")
         )
+    await _ensure_fk(
+        conn,
+        "workspace_tasks",
+        "resolution_document_id",
+        "documents",
+        "fk_workspace_tasks_resolution_document_id",
     )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS resolution_document_id UUID REFERENCES documents(id)
-            """
+    await _ensure_fk(
+        conn,
+        "workspace_tasks",
+        "execution_conversation_id",
+        "conversations",
+        "fk_workspace_tasks_execution_conversation_id",
+    )
+    if not await _column_exists(conn, "workspace_tasks", "resolution_history"):
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE workspace_tasks
+                ADD COLUMN resolution_history JSONB DEFAULT '[]'
+                """
+            )
         )
-    )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS execution_conversation_id UUID REFERENCES conversations(id)
-            """
-        )
-    )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE workspace_tasks
-            ADD COLUMN IF NOT EXISTS resolution_history JSONB DEFAULT '[]'
-            """
-        )
-    )
 
 
 async def _ensure_workflow_findings_table(conn) -> None:
@@ -631,21 +740,19 @@ async def _ensure_workflow_findings_table(conn) -> None:
 
 
 async def _ensure_conversation_workflow_columns(conn) -> None:
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE conversations
-            ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workspace_workflows(id)
-            """
-        )
+    await _ensure_fk(
+        conn,
+        "conversations",
+        "workflow_id",
+        "workspace_workflows",
+        "fk_conversations_workflow_id",
     )
-    await conn.execute(
-        text(
-            """
-            ALTER TABLE conversations
-            ADD COLUMN IF NOT EXISTS task_id UUID REFERENCES workspace_tasks(id)
-            """
-        )
+    await _ensure_fk(
+        conn,
+        "conversations",
+        "task_id",
+        "workspace_tasks",
+        "fk_conversations_task_id",
     )
 
 

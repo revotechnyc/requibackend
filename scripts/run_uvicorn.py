@@ -13,6 +13,7 @@ Docker / systemd can use the same script instead of bare uvicorn CLI.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -30,13 +31,18 @@ from app.core.ssl import uvicorn_ssl_kwargs  # noqa: E402
 def main() -> None:
     ssl_kwargs = uvicorn_ssl_kwargs()
     workers = 1 if settings.is_development or ssl_kwargs else 4
+    reload_enabled = (
+        settings.is_development
+        and not ssl_kwargs
+        and os.getenv("UVICORN_RELOAD", "1").lower() not in ("0", "false", "no")
+    )
 
     uvicorn.run(
         "app.main:app",
         host=settings.host,
         port=settings.port,
         workers=workers,
-        reload=settings.is_development and not ssl_kwargs,
+        reload=reload_enabled,
         **ssl_kwargs,
     )
 
