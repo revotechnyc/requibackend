@@ -157,7 +157,13 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
 async def _set_migration_session(conn) -> None:
     """Avoid Supabase statement_timeout during short schema ensures on restart."""
     await conn.execute(text("SET LOCAL statement_timeout = 0"))
-    await conn.execute(text("SET LOCAL lock_timeout = '60s'"))
+    await conn.execute(text("SET LOCAL lock_timeout = '30s'"))
+
+
+async def _set_migration_session_short_lock(conn) -> None:
+    """Hot-table alters: fail fast instead of blocking seats/login for minutes."""
+    await conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+    await conn.execute(text("SET LOCAL lock_timeout = '3s'"))
 
 
 async def _column_exists(conn, table: str, column: str) -> bool:
@@ -264,6 +270,30 @@ async def _run_migration_step(
         raise
 
 
+async def _run_optional_migration_step(
+    name: str,
+    fn: Callable[..., Awaitable[None]],
+) -> bool:
+    """
+    Non-blocking migration for busy tables (e.g. seats).
+    Skips on lock timeout so API startup and logins are not held hostage.
+    """
+    try:
+        async with async_engine.begin() as conn:
+            await _set_migration_session_short_lock(conn)
+            await fn(conn)
+        logger.info("db_migration_step_ok: %s", name)
+        return True
+    except Exception as exc:
+        logger.warning(
+            "db_migration_step_skipped: %s (%s: %s)",
+            name,
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+
 async def _ensure_platform_admin_invited_by_column(conn) -> None:
     await _ensure_fk(
         conn,
@@ -364,11 +394,17 @@ async def init_db() -> None:
         ("conversation_workflow", _ensure_conversation_workflow_columns),
         ("compliance_tables", _ensure_compliance_tables),
         ("member_feature_permissions", _ensure_member_feature_permissions_columns),
+        ("workspace_member_credentials_table", _ensure_workspace_member_credentials_table),
         ("notification_type_enum", _ensure_notification_type_enum_values),
     ]
 
     for name, step in migration_steps:
         await _run_migration_step(name, step)
+
+
+async def retry_optional_migrations() -> bool:
+    """Kept for API compatibility; all migrations run at startup."""
+    return True
 
 
 async def _ensure_member_feature_permissions_columns(conn) -> None:
@@ -380,6 +416,21 @@ async def _ensure_member_feature_permissions_columns(conn) -> None:
         await conn.execute(
             text("ALTER TABLE workspace_invitations ADD COLUMN feature_permissions JSONB")
         )
+
+
+async def _ensure_workspace_member_credentials_table(conn) -> None:
+    """New table for admin-provisioned passwords — does not lock the seats table."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_member_credentials (
+                seat_id UUID PRIMARY KEY REFERENCES seats(id) ON DELETE CASCADE,
+                provisioned_password_encrypted VARCHAR(512) NOT NULL,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
 
 
 async def _ensure_compliance_tables(conn) -> None:

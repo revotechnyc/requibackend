@@ -3,7 +3,6 @@ Workspace member invites — Pro/Enterprise viewers; Enterprise paid seats.
 """
 
 import uuid as uuid_lib
-from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -12,7 +11,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.endpoints.auth import get_current_active_user
+from app.api.endpoints.auth import get_current_active_user, get_password_hash
+from app.core.provisioned_password import generate_temp_password
 from app.db.database import get_db
 from app.db.models import (
     Organization,
@@ -28,7 +28,6 @@ from app.services.workspace_permissions import (
     role_default_permissions_snapshot,
     sanitize_permissions_payload,
 )
-from app.services.email_service import send_workspace_member_invite_email
 from app.services.enterprise_roles import (
     INVITEABLE_ENTERPRISE_ROLES,
     role_catalog_for_api,
@@ -41,17 +40,15 @@ from app.services.seat_allocation import (
     reserve_paid_seat,
 )
 from app.services.workspace_invite_service import (
-    INVITE_TTL_DAYS,
     _org_plan_type,
     assert_workspace_invite_allowed,
-    generate_invite_token,
     get_admin_seat,
-    invite_accept_url,
+    get_seat_provisioned_password,
     invite_role_value,
     invite_status_value,
     list_viewers_for_org,
     list_workspace_members_for_org,
-    role_label,
+    store_seat_provisioned_password,
 )
 
 router = APIRouter()
@@ -132,6 +129,7 @@ def _member_detail_payload(
     seat: Seat | None,
     user: User | None,
     plan: PlanType,
+    login_password: str | None = None,
 ) -> dict:
     if member_type == "invitation" and invitation:
         role = UserRole(invite_role_value(invitation.role))
@@ -173,6 +171,8 @@ def _member_detail_payload(
                 plan, seat.role, seat.feature_permissions
             ),
             "editable_fields": ["first_name", "last_name", "role", "feature_permissions"],
+            "login_password": login_password,
+            "has_provisioned_password": login_password is not None,
         }
 
     raise HTTPException(status_code=404, detail="Member not found")
@@ -189,7 +189,7 @@ async def invite_workspace_member(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Invite a workspace member. Pro: viewers only. Enterprise: viewers + paid roles."""
+    """Create an active workspace member account (no invitation email)."""
     org, seat = await get_admin_seat(current_user, db)
     try:
         target_role = UserRole(data.role)
@@ -201,9 +201,12 @@ async def invite_workspace_member(
     )
 
     email = data.email.strip().lower()
+    first_name = (data.first_name or "").strip() or email.split("@")[0]
+    last_name = (data.last_name or "").strip()
 
-    existing_user = await db.execute(select(User).where(User.email == email))
-    user = existing_user.scalar_one_or_none()
+    existing_user_result = await db.execute(select(User).where(User.email == email))
+    user = existing_user_result.scalar_one_or_none()
+
     if user:
         seat_check = await db.execute(
             select(Seat).where(
@@ -215,57 +218,77 @@ async def invite_workspace_member(
         if seat_check.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="User is already a team member")
 
-    pending = await db.execute(
+    pending_result = await db.execute(
         select(WorkspaceInvitation).where(
             WorkspaceInvitation.organization_id == org.id,
             WorkspaceInvitation.email == email,
             WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING.value,
         )
     )
-    if pending.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A pending invitation already exists for this email")
+    pending_invitation = pending_result.scalar_one_or_none()
+    if pending_invitation:
+        pending_invitation.status = WorkspaceInvitationStatus.REVOKED.value
+        if is_paid_role(invite_role_value(pending_invitation.role)):
+            await release_paid_seat_if_unused(org, db)
 
     seat_billing = None
     if is_paid_role(target_role):
         seat_billing = await reserve_paid_seat(org, db)
 
-    token = generate_invite_token()
-    expires_at = datetime.utcnow() + timedelta(days=INVITE_TTL_DAYS)
+    feature_permissions = _default_invite_permissions(org, target_role)
+    temporary_password: str | None = None
+    created_new_user = False
 
-    invitation = WorkspaceInvitation(
-        organization_id=org.id,
-        invited_by_id=current_user.id,
-        email=email,
-        role=invite_role_value(target_role),
-        token=token,
-        status=WorkspaceInvitationStatus.PENDING.value,
-        first_name=(data.first_name or "").strip() or None,
-        last_name=(data.last_name or "").strip() or None,
-        message=(data.message or "").strip() or None,
-        expires_at=expires_at,
-        feature_permissions=_default_invite_permissions(org, target_role),
-    )
-    db.add(invitation)
+    if user:
+        inactive_seat_result = await db.execute(
+            select(Seat).where(
+                Seat.organization_id == org.id,
+                Seat.user_id == user.id,
+            )
+        )
+        member_seat = inactive_seat_result.scalar_one_or_none()
+        if member_seat:
+            member_seat.is_active = True
+            member_seat.role = target_role
+            member_seat.feature_permissions = feature_permissions
+        else:
+            member_seat = Seat(
+                organization_id=org.id,
+                user_id=user.id,
+                role=target_role,
+                is_active=True,
+                feature_permissions=feature_permissions,
+            )
+            db.add(member_seat)
+        if data.first_name:
+            user.first_name = first_name
+        if data.last_name:
+            user.last_name = last_name
+    else:
+        temporary_password = generate_temp_password()
+        created_new_user = True
+        user = User(
+            email=email,
+            hashed_password=get_password_hash(temporary_password),
+            first_name=first_name,
+            last_name=last_name,
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        member_seat = Seat(
+            organization_id=org.id,
+            user_id=user.id,
+            role=target_role,
+            is_active=True,
+            feature_permissions=feature_permissions,
+        )
+        db.add(member_seat)
+
     await db.flush()
 
-    inviter_name = (
-        f"{current_user.first_name} {current_user.last_name}".strip()
-        or current_user.email
-    )
-    accept_link = invite_accept_url(token)
-    is_viewer = target_role == UserRole.VIEWER
-    email_sent = await send_workspace_member_invite_email(
-        to_email=email,
-        invited_name=data.first_name or email.split("@")[0],
-        inviter_name=inviter_name,
-        organization_name=org.name,
-        accept_url=accept_link,
-        role_label=role_label(target_role),
-        is_viewer=is_viewer,
-        custom_message=data.message,
-    )
-
-    await db.commit()
+    if temporary_password and member_seat:
+        await store_seat_provisioned_password(member_seat.id, temporary_password, db)
 
     billing = await billing_snapshot_for_org(org, db)
     seat_message = ""
@@ -275,32 +298,46 @@ async def invite_workspace_member(
             f"({seat_billing['previous_seat_quantity']} → {seat_billing['new_seat_quantity']})."
         )
 
+    plan = _org_plan_type(org)
+    stored_password = (
+        await get_seat_provisioned_password(member_seat.id, db)
+        if member_seat
+        else None
+    )
+    member_payload = _member_detail_payload(
+        "seat",
+        None,
+        member_seat,
+        user,
+        plan,
+        login_password=temporary_password or stored_password,
+    )
+    if temporary_password:
+        member_payload["temporary_password"] = temporary_password
+
+    await db.commit()
+    await db.refresh(member_seat)
+    if user:
+        await db.refresh(user)
+
+    if created_new_user:
+        message = (
+            "Team member account created. Copy the login password from the member profile "
+            "and share it manually."
+            + seat_message
+        )
+    else:
+        message = (
+            "Existing user added to your workspace. They should sign in with their current password."
+            + seat_message
+        )
+
     return {
-        "member": {
-            "id": str(invitation.id),
-            "email": email,
-            "first_name": invitation.first_name,
-            "last_name": invitation.last_name,
-            "status": "pending",
-            "role": target_role.value,
-            "invited_at": invitation.created_at.isoformat(),
-            "expires_at": expires_at.isoformat(),
-            "feature_permissions": invitation.feature_permissions,
-            "effective_permissions": effective_feature_permissions(
-                _org_plan_type(org), target_role, invitation.feature_permissions
-            ),
-            "seat_allocated": is_paid_role(target_role),
-        },
+        "member": member_payload,
+        "temporary_password": temporary_password,
         "seat_billing": seat_billing,
         "billing": billing,
-        "delivery": {
-            "email_sent": email_sent,
-            "accept_url": accept_link if not email_sent else None,
-        },
-        "message": (
-            ("Invitation email sent." if email_sent else "Invitation created. Email was not sent (check SMTP settings).")
-            + seat_message
-        ),
+        "message": message,
     }
 
 
@@ -331,6 +368,9 @@ async def get_workspace_member(
     org, _seat = await get_admin_seat(current_user, db)
     member_type, record, user = await _resolve_member_in_org(member_id, org.id, db)
     plan = _org_plan_type(org)
+    login_password = None
+    if member_type == "seat":
+        login_password = await get_seat_provisioned_password(record.id, db)
     if member_type == "invitation":
         return {
             "member": _member_detail_payload("invitation", record, None, None, plan),
@@ -338,7 +378,9 @@ async def get_workspace_member(
             "plan": plan.value,
         }
     return {
-        "member": _member_detail_payload("seat", None, record, user, plan),
+        "member": _member_detail_payload(
+            "seat", None, record, user, plan, login_password=login_password
+        ),
         "workspace_id": str(org.id),
         "plan": plan.value,
     }
@@ -455,8 +497,11 @@ async def update_workspace_member(
     if user:
         await db.refresh(user)
     await db.refresh(seat)
+    login_password = await get_seat_provisioned_password(seat.id, db)
     return {
-        "member": _member_detail_payload("seat", None, seat, user, plan),
+        "member": _member_detail_payload(
+            "seat", None, seat, user, plan, login_password=login_password
+        ),
         "message": "Member updated.",
     }
 

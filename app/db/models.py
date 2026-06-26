@@ -377,9 +377,30 @@ class Seat(Base):
     # Relationships
     organization: Mapped["Organization"] = relationship("Organization", back_populates="seats")
     user: Mapped["User"] = relationship("User", back_populates="seats")
+    provisioned_credential: Mapped[Optional["WorkspaceMemberCredential"]] = relationship(
+        "WorkspaceMemberCredential",
+        back_populates="seat",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
     
     def __repr__(self) -> str:
         return f"<Seat {self.organization_id}:{self.user_id}>"
+
+
+class WorkspaceMemberCredential(Base):
+    """Admin-provisioned login password for a workspace seat (separate table — no ALTER on seats)."""
+    __tablename__ = "workspace_member_credentials"
+
+    seat_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("seats.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    provisioned_password_encrypted: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    seat: Mapped["Seat"] = relationship("Seat", back_populates="provisioned_credential")
 
 
 class WorkspaceInvitationStatus(str, PyEnum):

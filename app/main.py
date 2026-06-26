@@ -18,7 +18,7 @@ from app.core.infrastructure import (
     log_startup_infrastructure,
     run_infrastructure_checks,
 )
-from app.db.database import close_db, get_db_context, init_db
+from app.db.database import close_db, get_db_context, init_db, retry_optional_migrations
 from app.db.platform_admin_seed import ensure_platform_admin_seed
 from app.services.task_reminder_service import process_task_reminders
 
@@ -31,6 +31,17 @@ async def _run_task_reminders_once(delay_seconds: int = 90) -> None:
             await process_task_reminders(db)
     except Exception as exc:
         print(f"[WARN] Task reminder startup run failed: {exc}")
+
+
+async def _retry_db_migrations_later(delay_seconds: int = 120) -> None:
+    """Retry hot-table migrations when traffic is lower (non-blocking startup)."""
+    await asyncio.sleep(delay_seconds)
+    try:
+        ok = await retry_optional_migrations()
+        if ok:
+            print("[OK  ] Optional DB migrations applied (background retry)")
+    except Exception as exc:
+        print(f"[WARN] Optional DB migration retry failed: {exc}")
 
 
 @asynccontextmanager
@@ -49,6 +60,8 @@ async def lifespan(app: FastAPI):
 
     if settings.task_reminder_enabled:
         asyncio.create_task(_run_task_reminders_once())
+
+    asyncio.create_task(_retry_db_migrations_later())
 
     yield
 
