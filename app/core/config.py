@@ -90,8 +90,8 @@ class Settings(BaseSettings):
     # Authentication
     jwt_secret_key: str = Field(..., description="Secret key for JWT tokens")
     jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 30
-    refresh_token_expire_days: int = 7
+    access_token_expire_minutes: int = 1440  # 24 hours
+    refresh_token_expire_days: int = 30
 
     # SaaS admin portal (separate JWT + seed user)
     platform_admin_jwt_secret_key: Optional[str] = Field(

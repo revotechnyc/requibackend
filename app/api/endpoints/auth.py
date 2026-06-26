@@ -86,6 +86,10 @@ class UserLogin(BaseModel):
     password: str
 
 
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
 class Token(BaseModel):
     access_token: str
     refresh_token: str
@@ -582,11 +586,12 @@ async def login(
 
 
 @router.post("/refresh", response_model=Token)
-async def refresh_token(
-    refresh_token: str,
+async def refresh_access_token(
+    body: RefreshTokenRequest,
     db: AsyncSession = Depends(get_db),
 ):
     """Refresh access token"""
+    refresh_token = body.refresh_token
     try:
         payload = jwt.decode(
             refresh_token,
