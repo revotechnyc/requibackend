@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.database import get_db
 from app.services.billing import BillingService
+from app.services.user_password_flags import user_must_change_password
 from app.db.models import (
     Organization,
     PlanType,
@@ -568,6 +569,7 @@ async def login(
         primary_org_id = str(seat.organization_id)
 
     organizations = await _organizations_for_user(user.id, db)
+    must_change = await user_must_change_password(user.id, db)
 
     return {
         "access_token": access_token,
@@ -581,6 +583,7 @@ async def login(
             "organization": org_data,
             "primary_organization_id": primary_org_id,
             "organizations": organizations,
+            "must_change_password": must_change,
         },
     }
 
@@ -671,6 +674,8 @@ async def get_me(
             plan_enum, seat.role, seat.feature_permissions
         )
 
+    must_change = await user_must_change_password(current_user.id, db)
+
     return {
         "id": str(current_user.id),
         "email": current_user.email,
@@ -692,6 +697,7 @@ async def get_me(
         "organizations": organizations,
         "feature_permissions": feature_permissions,
         "effective_permissions": effective_permissions,
+        "must_change_password": must_change,
     }
 
 

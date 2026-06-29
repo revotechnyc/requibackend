@@ -395,6 +395,7 @@ async def init_db() -> None:
         ("compliance_tables", _ensure_compliance_tables),
         ("member_feature_permissions", _ensure_member_feature_permissions_columns),
         ("workspace_member_credentials_table", _ensure_workspace_member_credentials_table),
+        ("user_password_flags_table", _ensure_user_password_flags_table),
         ("notification_type_enum", _ensure_notification_type_enum_values),
     ]
 
@@ -419,13 +420,28 @@ async def _ensure_member_feature_permissions_columns(conn) -> None:
 
 
 async def _ensure_workspace_member_credentials_table(conn) -> None:
-    """New table for admin-provisioned passwords — does not lock the seats table."""
+    """Legacy table — no longer used for admin password retrieval."""
     await conn.execute(
         text(
             """
             CREATE TABLE IF NOT EXISTS workspace_member_credentials (
                 seat_id UUID PRIMARY KEY REFERENCES seats(id) ON DELETE CASCADE,
                 provisioned_password_encrypted VARCHAR(512) NOT NULL,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
+            )
+            """
+        )
+    )
+
+
+async def _ensure_user_password_flags_table(conn) -> None:
+    """Track forced password changes without ALTER TABLE users (avoids lock on hot table)."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS user_password_flags (
+                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                must_change_password BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
             )
             """

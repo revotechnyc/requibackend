@@ -13,10 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
-from app.core.provisioned_password import (
-    decrypt_provisioned_password,
-    encrypt_provisioned_password,
-)
 from app.db.models import (
     Organization,
     PlanType,
@@ -32,6 +28,7 @@ from app.services.enterprise_roles import (
     is_workspace_admin,
     role_display_payload,
 )
+from app.services.user_password_flags import users_requiring_password_change
 from app.services.seat_allocation import PAID_ROLES, billing_snapshot_for_org, is_paid_role
 from app.services.workspace_permissions import effective_feature_permissions
 
@@ -39,54 +36,25 @@ INVITE_TTL_DAYS = 7
 TEAM_PLANS = {PlanType.PRO, PlanType.ENTERPRISE}
 
 
-async def get_seat_provisioned_password(seat_id: UUID, db: AsyncSession) -> str | None:
-    result = await db.execute(
-        select(WorkspaceMemberCredential).where(WorkspaceMemberCredential.seat_id == seat_id)
-    )
-    row = result.scalar_one_or_none()
-    if not row:
-        return None
-    return decrypt_provisioned_password(row.provisioned_password_encrypted)
-
-
-async def store_seat_provisioned_password(
-    seat_id: UUID,
-    plain_password: str,
-    db: AsyncSession,
-) -> None:
-    encrypted = encrypt_provisioned_password(plain_password)
-    result = await db.execute(
-        select(WorkspaceMemberCredential).where(WorkspaceMemberCredential.seat_id == seat_id)
-    )
-    existing = result.scalar_one_or_none()
-    if existing:
-        existing.provisioned_password_encrypted = encrypted
+async def clear_provisioned_passwords_for_user(user_id: UUID, db: AsyncSession) -> None:
+    """Remove any legacy stored credentials after the user sets their own password."""
+    seat_ids = await db.scalars(select(Seat.id).where(Seat.user_id == user_id))
+    ids = list(seat_ids.all())
+    if not ids:
         return
-    db.add(
-        WorkspaceMemberCredential(
-            seat_id=seat_id,
-            provisioned_password_encrypted=encrypted,
+    await db.execute(
+        WorkspaceMemberCredential.__table__.delete().where(
+            WorkspaceMemberCredential.seat_id.in_(ids)
         )
     )
 
 
-async def provisioned_passwords_for_seats(
-    seat_ids: list[UUID],
-    db: AsyncSession,
-) -> dict[UUID, str]:
-    if not seat_ids:
-        return {}
-    result = await db.execute(
-        select(WorkspaceMemberCredential).where(
-            WorkspaceMemberCredential.seat_id.in_(seat_ids)
+async def clear_seat_provisioned_password(seat_id: UUID, db: AsyncSession) -> None:
+    await db.execute(
+        WorkspaceMemberCredential.__table__.delete().where(
+            WorkspaceMemberCredential.seat_id == seat_id
         )
     )
-    out: dict[UUID, str] = {}
-    for row in result.scalars().all():
-        plain = decrypt_provisioned_password(row.provisioned_password_encrypted)
-        if plain:
-            out[row.seat_id] = plain
-    return out
 
 
 def generate_invite_token() -> str:
@@ -246,15 +214,12 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
     seat_result = await db.execute(
         select(Seat)
         .where(Seat.organization_id == org_id, Seat.is_active == True)
-        .options(
-            selectinload(Seat.user),
-            selectinload(Seat.provisioned_credential),
-        )
+        .options(selectinload(Seat.user))
         .order_by(Seat.created_at.desc())
     )
     seats = seat_result.scalars().all()
-    password_by_seat = await provisioned_passwords_for_seats(
-        [seat.id for seat in seats],
+    password_change_user_ids = await users_requiring_password_change(
+        [seat.user_id for seat in seats if seat.user_id],
         db,
     )
 
@@ -303,7 +268,6 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
             continue
         seen_emails.add(email)
         name = f"{seat.user.first_name} {seat.user.last_name}".strip() or email
-        login_password = password_by_seat.get(seat.id)
         members.append(
             {
                 "id": str(seat.id),
@@ -321,8 +285,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "revocable": seat.role == UserRole.VIEWER,
                 "member_type": "seat",
                 "user_id": str(seat.user_id),
-                "login_password": login_password,
-                "has_provisioned_password": login_password is not None,
+                "requires_password_change": seat.user_id in password_change_user_ids,
                 "feature_permissions": seat.feature_permissions,
                 "effective_permissions": effective_feature_permissions(
                     plan, seat.role, seat.feature_permissions

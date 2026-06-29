@@ -5,13 +5,18 @@ User management endpoints
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.endpoints.auth import get_current_active_user, get_password_hash
 from app.db.database import get_db
 from app.db.models import User
+from app.services.workspace_invite_service import clear_provisioned_passwords_for_user
+from app.services.user_password_flags import (
+    clear_user_must_change_password,
+    user_must_change_password,
+)
 
 router = APIRouter()
 
@@ -23,8 +28,20 @@ class UserUpdate(BaseModel):
 
 
 class PasswordChange(BaseModel):
-    current_password: str
+    current_password: Optional[str] = None
     new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
+
+    @model_validator(mode="after")
+    def require_current_when_not_forced(self):
+        # current_password is validated in the endpoint when must_change_password is False
+        return self
 
 
 @router.get("/me", response_model=dict)
@@ -41,6 +58,7 @@ async def get_current_user_info(
         "is_active": current_user.is_active,
         "last_login": current_user.last_login.isoformat() if current_user.last_login else None,
         "created_at": current_user.created_at.isoformat(),
+        "must_change_password": await user_must_change_password(current_user.id, db),
     }
 
 
@@ -85,18 +103,23 @@ async def change_password(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Change user password"""
+    """Change user password. Skips current password when must_change_password is set."""
     from app.api.endpoints.auth import verify_password
-    
-    # Verify current password
-    if not verify_password(data.current_password, current_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Current password is incorrect")
-    
-    # Update password
+
+    forced_change = await user_must_change_password(current_user.id, db)
+
+    if not forced_change:
+        if not data.current_password:
+            raise HTTPException(status_code=400, detail="Current password is required")
+        if not verify_password(data.current_password, current_user.hashed_password):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+
     current_user.hashed_password = get_password_hash(data.new_password)
+    await clear_user_must_change_password(current_user.id, db)
+    await clear_provisioned_passwords_for_user(current_user.id, db)
     await db.commit()
-    
-    return {"message": "Password changed successfully"}
+
+    return {"message": "Password changed successfully", "must_change_password": False}
 
 
 @router.delete("/me")

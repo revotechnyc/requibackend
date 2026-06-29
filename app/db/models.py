@@ -403,6 +403,19 @@ class WorkspaceMemberCredential(Base):
     seat: Mapped["Seat"] = relationship("Seat", back_populates="provisioned_credential")
 
 
+class UserPasswordFlag(Base):
+    """Users who must change password on next login (separate table — no ALTER on users)."""
+    __tablename__ = "user_password_flags"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class WorkspaceInvitationStatus(str, PyEnum):
     """Workspace member invitation lifecycle."""
     PENDING = "pending"

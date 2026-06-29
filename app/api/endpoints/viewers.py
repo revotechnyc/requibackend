@@ -42,13 +42,16 @@ from app.services.seat_allocation import (
 from app.services.workspace_invite_service import (
     _org_plan_type,
     assert_workspace_invite_allowed,
+    clear_seat_provisioned_password,
     get_admin_seat,
-    get_seat_provisioned_password,
     invite_role_value,
     invite_status_value,
     list_viewers_for_org,
     list_workspace_members_for_org,
-    store_seat_provisioned_password,
+)
+from app.services.user_password_flags import (
+    set_user_must_change_password,
+    user_must_change_password,
 )
 
 router = APIRouter()
@@ -62,6 +65,7 @@ class WorkspaceMemberInvite(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     message: Optional[str] = None
+    password: Optional[str] = None
 
     @field_validator("role")
     @classmethod
@@ -72,6 +76,13 @@ class WorkspaceMemberInvite(BaseModel):
                 "role must be one of: admin, reviewer, approver, contributor, analyst, viewer"
             )
         return r
+
+    @field_validator("password")
+    @classmethod
+    def password_min_length(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        return v
 
 
 class ViewerInvite(WorkspaceMemberInvite):
@@ -129,7 +140,7 @@ def _member_detail_payload(
     seat: Seat | None,
     user: User | None,
     plan: PlanType,
-    login_password: str | None = None,
+    requires_password_change: bool = False,
 ) -> dict:
     if member_type == "invitation" and invitation:
         role = UserRole(invite_role_value(invitation.role))
@@ -171,8 +182,7 @@ def _member_detail_payload(
                 plan, seat.role, seat.feature_permissions
             ),
             "editable_fields": ["first_name", "last_name", "role", "feature_permissions"],
-            "login_password": login_password,
-            "has_provisioned_password": login_password is not None,
+            "requires_password_change": requires_password_change,
         }
 
     raise HTTPException(status_code=404, detail="Member not found")
@@ -265,17 +275,19 @@ async def invite_workspace_member(
         if data.last_name:
             user.last_name = last_name
     else:
-        temporary_password = generate_temp_password()
+        initial_password = (data.password or "").strip() or generate_temp_password()
+        temporary_password = initial_password
         created_new_user = True
         user = User(
             email=email,
-            hashed_password=get_password_hash(temporary_password),
+            hashed_password=get_password_hash(initial_password),
             first_name=first_name,
             last_name=last_name,
             is_active=True,
         )
         db.add(user)
         await db.flush()
+        await set_user_must_change_password(user.id, True, db)
         member_seat = Seat(
             organization_id=org.id,
             user_id=user.id,
@@ -287,9 +299,6 @@ async def invite_workspace_member(
 
     await db.flush()
 
-    if temporary_password and member_seat:
-        await store_seat_provisioned_password(member_seat.id, temporary_password, db)
-
     billing = await billing_snapshot_for_org(org, db)
     seat_message = ""
     if seat_billing and seat_billing.get("seat_added"):
@@ -299,18 +308,13 @@ async def invite_workspace_member(
         )
 
     plan = _org_plan_type(org)
-    stored_password = (
-        await get_seat_provisioned_password(member_seat.id, db)
-        if member_seat
-        else None
-    )
     member_payload = _member_detail_payload(
         "seat",
         None,
         member_seat,
         user,
         plan,
-        login_password=temporary_password or stored_password,
+        requires_password_change=created_new_user,
     )
     if temporary_password:
         member_payload["temporary_password"] = temporary_password
@@ -322,8 +326,8 @@ async def invite_workspace_member(
 
     if created_new_user:
         message = (
-            "Team member account created. Copy the login password from the member profile "
-            "and share it manually."
+            "Team member account created. Copy the temporary password now — "
+            "it will not be shown again."
             + seat_message
         )
     else:
@@ -368,18 +372,18 @@ async def get_workspace_member(
     org, _seat = await get_admin_seat(current_user, db)
     member_type, record, user = await _resolve_member_in_org(member_id, org.id, db)
     plan = _org_plan_type(org)
-    login_password = None
-    if member_type == "seat":
-        login_password = await get_seat_provisioned_password(record.id, db)
     if member_type == "invitation":
         return {
             "member": _member_detail_payload("invitation", record, None, None, plan),
             "workspace_id": str(org.id),
             "plan": plan.value,
         }
+    requires_change = False
+    if user:
+        requires_change = await user_must_change_password(user.id, db)
     return {
         "member": _member_detail_payload(
-            "seat", None, record, user, plan, login_password=login_password
+            "seat", None, record, user, plan, requires_password_change=requires_change
         ),
         "workspace_id": str(org.id),
         "plan": plan.value,
@@ -497,12 +501,57 @@ async def update_workspace_member(
     if user:
         await db.refresh(user)
     await db.refresh(seat)
-    login_password = await get_seat_provisioned_password(seat.id, db)
+    requires_change = await user_must_change_password(seat.user_id, db) if seat.user_id else False
     return {
         "member": _member_detail_payload(
-            "seat", None, seat, user, plan, login_password=login_password
+            "seat", None, seat, user, plan, requires_password_change=requires_change
         ),
         "message": "Member updated.",
+    }
+
+
+@router.post("/members/{member_id}/reset-password", response_model=dict)
+async def reset_workspace_member_password(
+    member_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a new temporary password for an active member (shown once)."""
+    org, _seat = await get_admin_seat(current_user, db)
+    member_type, record, user = await _resolve_member_in_org(member_id, org.id, db)
+    if member_type != "seat" or not user:
+        raise HTTPException(
+            status_code=400,
+            detail="Only active team members can have their password reset",
+        )
+
+    seat: Seat = record
+    if user.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="Use account settings to change your own password",
+        )
+
+    temporary_password = generate_temp_password()
+    user.hashed_password = get_password_hash(temporary_password)
+    await set_user_must_change_password(user.id, True, db)
+    await clear_seat_provisioned_password(seat.id, db)
+
+    await db.commit()
+    await db.refresh(user)
+
+    plan = _org_plan_type(org)
+    member_payload = _member_detail_payload(
+        "seat", None, seat, user, plan, requires_password_change=True
+    )
+    member_payload["temporary_password"] = temporary_password
+
+    return {
+        "member": member_payload,
+        "temporary_password": temporary_password,
+        "message": (
+            "Password reset. Copy the temporary password now — it will not be shown again."
+        ),
     }
 
 
