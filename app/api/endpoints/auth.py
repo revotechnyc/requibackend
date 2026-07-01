@@ -76,6 +76,12 @@ class RegisterCheckoutCreate(UserCreate):
     """Register account then redirect to Stripe Checkout (no free trial)."""
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
+    promotion_code: Optional[str] = None
+
+
+class ValidatePromoCodeRequest(BaseModel):
+    code: str
+    plan_type: str
 
 
 class CheckoutCompleteRequest(BaseModel):
@@ -403,6 +409,27 @@ async def register(
     }
 
 
+@router.post("/validate-promo-code", response_model=dict)
+async def validate_promo_code(body: ValidatePromoCodeRequest):
+    """Public check for signup promo codes (pricing → paid signup flow)."""
+    try:
+        plan_type = PlanType(body.plan_type.strip().lower())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid plan type") from exc
+
+    from app.services.stripe_promotions_service import StripePromotionsService
+
+    promotion = StripePromotionsService.lookup_for_checkout(body.code, plan_type)
+    return {
+        "valid": True,
+        "promotion": {
+            "code": promotion.get("code"),
+            "discount_label": promotion.get("discount_label"),
+            "plan_types": promotion.get("plan_types"),
+        },
+    }
+
+
 @router.post("/register-checkout", response_model=dict)
 async def register_checkout(
     user_data: RegisterCheckoutCreate,
@@ -412,6 +439,13 @@ async def register_checkout(
     Register user/org and return Stripe Checkout URL (paid plan, no trial).
     Used when signing up from the pricing page.
     """
+    plan_type = PlanType(user_data.plan_type)
+    promotion_code = (user_data.promotion_code or "").strip() or None
+    if promotion_code:
+        from app.services.stripe_promotions_service import StripePromotionsService
+
+        StripePromotionsService.lookup_for_checkout(promotion_code, plan_type)
+
     result = await db.execute(select(User).where(User.email == user_data.email))
     if result.scalar_one_or_none():
         raise HTTPException(
@@ -419,7 +453,6 @@ async def register_checkout(
             detail="Email already registered",
         )
 
-    plan_type = PlanType(user_data.plan_type)
     limits = settings.get_plan_limits(plan_type.value)
     org_display_name = (
         user_data.organization_name.strip()
@@ -488,6 +521,7 @@ async def register_checkout(
         limits["min"],
         success_url,
         cancel_url,
+        promotion_code=promotion_code,
     )
 
     return {

@@ -154,6 +154,7 @@ class User(Base):
 class PlatformAdminRole(str, PyEnum):
     """Roles for the standalone SaaS admin portal (separate from org UserRole)."""
     SUPER_ADMIN = "super_admin"
+    SALES = "sales"
     BLOG_WRITER = "blog_writer"
     BLOG_EDITOR = "blog_editor"
     BLOG_ADMIN = "blog_admin"

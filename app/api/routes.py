@@ -17,6 +17,7 @@ from app.api.endpoints import (
     platform_admin_overview,
     platform_admin_billing,
     platform_admin_analytics,
+    platform_admin_promotions,
     platform_blog_public,
     chat_share,
     billing,
@@ -93,6 +94,13 @@ api_router.include_router(
     platform_admin_analytics.router,
     prefix="/platform-admin/analytics",
     tags=["platform-admin-analytics"],
+    dependencies=platform_admin_dep,
+)
+
+api_router.include_router(
+    platform_admin_promotions.router,
+    prefix="/platform-admin/promotions",
+    tags=["platform-admin-promotions"],
     dependencies=platform_admin_dep,
 )
 

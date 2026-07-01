@@ -579,6 +579,7 @@ class BillingService:
         seat_quantity: int,
         success_url: str,
         cancel_url: str,
+        promotion_code: Optional[str] = None,
     ) -> dict:
         """Stripe Checkout for new sign-up (paid subscription, no trial)."""
         price_id = BillingService.PLAN_PRICE_MAP.get(plan_type)
@@ -598,18 +599,32 @@ class BillingService:
             "user_id": str(user.id),
             "plan_type": plan_type.value,
         }
+        promo_stripe_id: Optional[str] = None
+        if promotion_code and promotion_code.strip():
+            from app.services.stripe_promotions_service import StripePromotionsService
+
+            promo = StripePromotionsService.lookup_for_checkout(
+                promotion_code.strip(),
+                plan_type,
+            )
+            promo_stripe_id = promo["id"]
+            metadata["promotion_code"] = promo.get("code") or promotion_code.strip().upper()
 
         try:
-            session = stripe.checkout.Session.create(
-                customer=user.stripe_customer_id,
-                payment_method_types=["card"],
-                line_items=[{"price": price_id, "quantity": seat_quantity}],
-                mode="subscription",
-                success_url=success_url,
-                cancel_url=cancel_url,
-                metadata=metadata,
-                subscription_data={"metadata": metadata},
-            )
+            session_params: dict = {
+                "customer": user.stripe_customer_id,
+                "payment_method_types": ["card"],
+                "line_items": [{"price": price_id, "quantity": seat_quantity}],
+                "mode": "subscription",
+                "success_url": success_url,
+                "cancel_url": cancel_url,
+                "metadata": metadata,
+                "subscription_data": {"metadata": metadata},
+            }
+            if promo_stripe_id:
+                session_params["discounts"] = [{"promotion_code": promo_stripe_id}]
+
+            session = stripe.checkout.Session.create(**session_params)
             return {"session_id": session.id, "url": session.url}
         except stripe.error.StripeError as e:
             raise HTTPException(
