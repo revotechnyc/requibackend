@@ -47,7 +47,9 @@ services:
     volumes:
       - ./app:/app/app
       - ./credentials:/app/credentials:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Do NOT mount /etc/letsencrypt here — uvicorn would serve HTTPS on :8001
+      # and plain `curl http://127.0.0.1:8001/health` / Apache http:// proxy would fail.
+      # Public TLS is terminated by Apache on api.dev.requi.io.
     command: python scripts/run_uvicorn.py
 
   worker:
