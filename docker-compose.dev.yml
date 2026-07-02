@@ -1,0 +1,108 @@
+# Development stack — isolated from production on the same server.
+#
+#   ./scripts/start-api-dev.sh
+#   ./scripts/start-api-dev.sh --build
+#
+# Host ports (production uses 8000 / 6380 / 5555):
+#   API    → 8001
+#   Redis  → 6381
+#   Flower → 5556
+#
+# Uses compose project name "requi-dev" (set in start-api-dev.sh) so containers
+# and volumes never clash with production.
+
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      PORT: "8001"
+      APP_ENV: development
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: api
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./credentials:/app/credentials:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    command: python scripts/run_uvicorn.py
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      APP_ENV: development
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: worker
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+      - ./credentials:/app/credentials:ro
+    command: celery -A app.tasks.celery_app worker --loglevel=info
+
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      APP_ENV: development
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      DATABASE_POOL_ROLE: beat
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    ports:
+      - "5556:5555"
+    depends_on:
+      - redis
+    command: celery -A app.tasks.celery_app flower --port=5555
+
+volumes:
+  redis_dev_data:
