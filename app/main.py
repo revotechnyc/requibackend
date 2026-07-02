@@ -97,6 +97,8 @@ _requi_frontend_origins = [
     "https://www.requi.io",
     "http://requi.io",
     "http://www.requi.io",
+    "https://dev.requi.io",
+    "http://dev.requi.io",
 ]
 
 
