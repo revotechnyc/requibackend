@@ -57,6 +57,13 @@ PLAN_LABELS = {
     "enterprise": "Enterprise",
 }
 
+# Only revenue-generating subscriptions count toward MRR/ARR.
+# Trials, incomplete/abandoned checkouts, paused, canceled and unpaid subscriptions are $0.
+REVENUE_SUBSCRIPTION_STATUSES = {
+    SubscriptionStatus.ACTIVE,
+    SubscriptionStatus.PAST_DUE,
+}
+
 
 def _plan_label(plan_type: Optional[PlanType]) -> tuple[Optional[str], Optional[str]]:
     if not plan_type:
@@ -89,6 +96,9 @@ def _format_datetime(dt: Optional[datetime]) -> Optional[str]:
 async def _estimate_org_mrr_cents(org: Organization, db: AsyncSession) -> int:
     sub = org.subscription
     if not sub:
+        return 0
+    # Trials (and other non-paying states) do not contribute to recurring revenue.
+    if sub.status not in REVENUE_SUBSCRIPTION_STATUSES:
         return 0
     if sub.plan_type == PlanType.ENTERPRISE:
         return await _estimated_monthly_cents_for_org(org, db)

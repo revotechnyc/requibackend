@@ -46,6 +46,13 @@ PLAN_LABELS = {
     "enterprise": "Enterprise",
 }
 
+# Only revenue-generating subscriptions count toward MRR (matches Overview/Billing).
+# Trials, incomplete/abandoned checkouts, paused, canceled and unpaid subscriptions are $0.
+REVENUE_SUBSCRIPTION_STATUSES = {
+    SubscriptionStatus.ACTIVE,
+    SubscriptionStatus.PAST_DUE,
+}
+
 
 def _require_super_admin(admin: PlatformAdmin) -> None:
     from app.core.platform_admin_roles import PlatformAdminRole
@@ -95,6 +102,9 @@ def _format_date(dt) -> Optional[str]:
 async def _estimate_org_mrr_cents(org: Organization, db: AsyncSession) -> int:
     sub = org.subscription
     if not sub:
+        return 0
+    # Trials (and other non-paying states) do not contribute to recurring revenue.
+    if sub.status not in REVENUE_SUBSCRIPTION_STATUSES:
         return 0
     if sub.plan_type == PlanType.ENTERPRISE:
         return await _estimated_monthly_cents_for_org(org, db)
