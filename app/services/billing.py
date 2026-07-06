@@ -1029,6 +1029,34 @@ class BillingService:
         return summary, amount_due, credit_total, charge_total
 
     @staticmethod
+    def _preview_subscription_change_invoice(
+        customer_id: str,
+        subscription_id: str,
+        modify_items: list[dict],
+        proration_date: int,
+    ) -> dict:
+        """Preview prorated invoice for a subscription plan change (SDK-compatible)."""
+        if hasattr(stripe.Invoice, "create_preview"):
+            return stripe.Invoice.create_preview(
+                customer=customer_id,
+                subscription=subscription_id,
+                subscription_details={
+                    "items": modify_items,
+                    "proration_behavior": "always_invoice",
+                    "proration_date": proration_date,
+                },
+            )
+
+        # stripe==8.x (pinned in requirements): use upcoming invoice preview API.
+        return stripe.Invoice.upcoming(
+            customer=customer_id,
+            subscription=subscription_id,
+            subscription_items=modify_items,
+            subscription_proration_behavior="always_invoice",
+            subscription_proration_date=proration_date,
+        )
+
+    @staticmethod
     async def preview_upgrade_plan(
         db: AsyncSession,
         subscription: Subscription,
@@ -1055,14 +1083,11 @@ class BillingService:
         proration_date = int(datetime.now(tz=timezone.utc).timestamp())
 
         try:
-            invoice = stripe.Invoice.create_preview(
-                customer=subscription.stripe_customer_id,
-                subscription=stripe_sub_id,
-                subscription_details={
-                    "items": modify_items,
-                    "proration_behavior": "always_invoice",
-                    "proration_date": proration_date,
-                },
+            invoice = BillingService._preview_subscription_change_invoice(
+                subscription.stripe_customer_id,
+                stripe_sub_id,
+                modify_items,
+                proration_date,
             )
         except stripe.error.StripeError as exc:
             raise HTTPException(
