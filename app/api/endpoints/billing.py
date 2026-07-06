@@ -42,6 +42,44 @@ class CheckoutSessionCreate(BaseModel):
     cancel_url: str
 
 
+class UpgradePlanRequest(BaseModel):
+    plan_type: str
+    seat_quantity: int = 1
+    proration_date: Optional[int] = None
+
+
+async def _require_billing_org(
+    organization_id: str,
+    current_user: User,
+    db: AsyncSession,
+) -> tuple[Organization, Seat]:
+    result = await db.execute(
+        select(Organization)
+        .options(selectinload(Organization.owner))
+        .where(Organization.id == organization_id)
+    )
+    org = result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    seat_result = await db.execute(
+        select(Seat).where(
+            Seat.organization_id == organization_id,
+            Seat.user_id == current_user.id,
+            Seat.is_active == True,
+        )
+    )
+    seat = seat_result.scalar_one_or_none()
+    if not seat or not PermissionChecker.is_billing_owner(
+        current_user.id, org, seat.role
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only Enterprise Admins can manage billing",
+        )
+    return org, seat
+
+
 @router.post("/subscriptions")
 async def create_subscription(
     data: SubscriptionCreate,
@@ -230,39 +268,14 @@ async def create_checkout_session(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create Stripe checkout session"""
-    result = await db.execute(
-        select(Organization)
-        .options(selectinload(Organization.owner))
-        .where(Organization.id == organization_id)
-    )
-    org = result.scalar_one_or_none()
-    
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
+    """Create Stripe checkout session for first paid subscription."""
+    org, _seat = await _require_billing_org(organization_id, current_user, db)
 
-    seat_result = await db.execute(
-        select(Seat).where(
-            Seat.organization_id == organization_id,
-            Seat.user_id == current_user.id,
-            Seat.is_active == True,
-        )
-    )
-    seat = seat_result.scalar_one_or_none()
-    if not seat or not PermissionChecker.is_billing_owner(
-        current_user.id, org, seat.role
-    ):
-        raise HTTPException(
-            status_code=403,
-            detail="Only Enterprise Admins can manage billing",
-        )
-    
-    # Ensure customer exists
     if not org.owner.stripe_customer_id:
         customer_id = await BillingService.create_customer(org.owner, org)
         org.owner.stripe_customer_id = customer_id
         await db.commit()
-    
+
     try:
         plan_type = PlanType(data.plan_type.lower())
     except ValueError:
@@ -284,6 +297,81 @@ async def create_checkout_session(
     )
 
     return session
+
+
+@router.post("/upgrade-preview")
+async def preview_upgrade_plan(
+    data: UpgradePlanRequest,
+    organization_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview prorated charge before upgrading an active subscription."""
+    await _require_billing_org(organization_id, current_user, db)
+
+    try:
+        plan_type = PlanType(data.plan_type.lower())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid plan type")
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.organization_id == organization_id)
+    )
+    subscription = sub_result.scalar_one_or_none()
+    if not subscription:
+        return {"upgrade_type": "checkout"}
+
+    return await BillingService.preview_upgrade_plan(
+        db,
+        subscription,
+        plan_type,
+        data.seat_quantity,
+    )
+
+
+@router.post("/upgrade-plan")
+async def upgrade_plan(
+    data: UpgradePlanRequest,
+    organization_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upgrade an active subscription in place and charge prorated amount immediately."""
+    await _require_billing_org(organization_id, current_user, db)
+
+    try:
+        plan_type = PlanType(data.plan_type.lower())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid plan type")
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.organization_id == organization_id)
+    )
+    subscription = sub_result.scalar_one_or_none()
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    updated, amount_charged_cents = await BillingService.upgrade_subscription_plan(
+        db,
+        subscription,
+        plan_type,
+        data.seat_quantity,
+        proration_date=data.proration_date,
+    )
+    plan_label = BillingService._plan_display_label(updated.plan_type)
+    amount_formatted = BillingService._format_usd_cents(amount_charged_cents)
+
+    return {
+        "upgraded": True,
+        "plan_type": updated.plan_type.value,
+        "plan_label": plan_label,
+        "amount_charged_cents": amount_charged_cents,
+        "amount_charged_formatted": amount_formatted,
+        "message": (
+            f"Congratulations! Your plan has been upgraded to {plan_label}. "
+            f"We charged {amount_formatted} to your card on file."
+        ),
+    }
 
 
 @router.post("/portal-session")

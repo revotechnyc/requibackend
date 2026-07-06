@@ -962,6 +962,160 @@ class BillingService:
         return modify_items
 
     @staticmethod
+    def _format_usd_cents(cents: int) -> str:
+        return f"${abs(cents) / 100:,.2f}"
+
+    @staticmethod
+    def _plan_display_label(plan_type: PlanType) -> str:
+        labels = {
+            PlanType.STANDARD: "Standard",
+            PlanType.PRO: "Pro",
+            PlanType.ENTERPRISE: "Enterprise",
+        }
+        return labels.get(plan_type, plan_type.value.title())
+
+    @staticmethod
+    def _get_default_card_last4(customer_id: Optional[str]) -> Optional[str]:
+        if not customer_id or customer_id.startswith("local"):
+            return None
+        try:
+            customer = stripe.Customer.retrieve(
+                customer_id,
+                expand=["invoice_settings.default_payment_method"],
+            )
+            pm = customer.get("invoice_settings", {}).get("default_payment_method")
+            if isinstance(pm, dict):
+                card = pm.get("card") or {}
+                return card.get("last4")
+        except stripe.error.StripeError:
+            return None
+        return None
+
+    @staticmethod
+    def _parse_invoice_preview_lines(invoice: dict) -> tuple[list[dict], int, int, int]:
+        """Return summary lines, amount_due, total credits, total charges (cents)."""
+        summary: list[dict] = []
+        credit_total = 0
+        charge_total = 0
+        lines = invoice.get("lines", {}).get("data", []) if hasattr(invoice, "get") else []
+
+        for line in lines:
+            amount = int(line.get("amount") or 0)
+            if amount == 0:
+                continue
+            description = (line.get("description") or "Plan adjustment").strip()
+            parent = line.get("parent") or {}
+            sub_details = parent.get("subscription_item_details") or {}
+            is_proration = bool(sub_details.get("proration"))
+
+            if amount < 0:
+                credit_total += abs(amount)
+                summary.append({
+                    "label": description,
+                    "amount_cents": amount,
+                    "formatted": f"-{BillingService._format_usd_cents(amount)}",
+                    "is_proration": is_proration,
+                })
+            else:
+                charge_total += amount
+                summary.append({
+                    "label": description,
+                    "amount_cents": amount,
+                    "formatted": BillingService._format_usd_cents(amount),
+                    "is_proration": is_proration,
+                })
+
+        amount_due = int(invoice.get("amount_due") or 0)
+        return summary, amount_due, credit_total, charge_total
+
+    @staticmethod
+    async def preview_upgrade_plan(
+        db: AsyncSession,
+        subscription: Subscription,
+        new_plan_type: PlanType,
+        seat_quantity: int,
+    ) -> dict:
+        """Preview prorated charge for an in-place plan upgrade (Stripe invoice preview)."""
+        stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
+            db, subscription
+        )
+        if not stripe_sub_id:
+            return {"upgrade_type": "checkout"}
+
+        if new_plan_type == subscription.plan_type:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"You are already on the {new_plan_type.value} plan",
+            )
+
+        stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
+        modify_items = BillingService._build_plan_change_modify_items(
+            stripe_sub, new_plan_type, seat_quantity
+        )
+        proration_date = int(datetime.now(tz=timezone.utc).timestamp())
+
+        try:
+            invoice = stripe.Invoice.create_preview(
+                customer=subscription.stripe_customer_id,
+                subscription=stripe_sub_id,
+                subscription_details={
+                    "items": modify_items,
+                    "proration_behavior": "always_invoice",
+                    "proration_date": proration_date,
+                },
+            )
+        except stripe.error.StripeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Could not preview upgrade: {str(exc)}",
+            ) from exc
+
+        summary_lines, amount_due, credit_total, charge_total = (
+            BillingService._parse_invoice_preview_lines(invoice)
+        )
+        period_end = subscription.current_period_end
+        card_last4 = BillingService._get_default_card_last4(subscription.stripe_customer_id)
+
+        current_label = BillingService._plan_display_label(subscription.plan_type)
+        new_label = BillingService._plan_display_label(new_plan_type)
+
+        friendly_lines: list[dict] = []
+        if credit_total > 0:
+            friendly_lines.append({
+                "label": f"Credit for unused {current_label} time",
+                "formatted": f"-{BillingService._format_usd_cents(credit_total)}",
+            })
+        if charge_total > 0:
+            friendly_lines.append({
+                "label": f"{new_label} plan (remaining billing period)",
+                "formatted": BillingService._format_usd_cents(charge_total),
+            })
+        friendly_lines.append({
+            "label": "Due today",
+            "formatted": BillingService._format_usd_cents(amount_due),
+            "emphasis": True,
+        })
+
+        return {
+            "upgrade_type": "in_place",
+            "current_plan": subscription.plan_type.value,
+            "new_plan": new_plan_type.value,
+            "current_plan_label": current_label,
+            "new_plan_label": new_label,
+            "amount_due_cents": amount_due,
+            "amount_due_formatted": BillingService._format_usd_cents(amount_due),
+            "credit_cents": credit_total,
+            "credit_formatted": BillingService._format_usd_cents(credit_total),
+            "charge_cents": charge_total,
+            "charge_formatted": BillingService._format_usd_cents(charge_total),
+            "period_end": period_end.strftime("%Y-%m-%d") if period_end else None,
+            "proration_date": proration_date,
+            "card_last4": card_last4,
+            "summary_lines": friendly_lines,
+            "detail_lines": summary_lines,
+        }
+
+    @staticmethod
     async def _cancel_duplicate_stripe_subscriptions(
         customer_id: Optional[str],
         keep_subscription_id: str,
@@ -1024,10 +1178,11 @@ class BillingService:
         subscription: Subscription,
         new_plan_type: PlanType,
         seat_quantity: int,
-    ) -> Subscription:
+        proration_date: Optional[int] = None,
+    ) -> tuple[Subscription, int]:
         """
-        Change plan on the existing Stripe subscription (prorated).
-        Avoids creating a second parallel subscription.
+        Change plan on the existing Stripe subscription (prorated, charged immediately).
+        Returns (subscription, amount_charged_cents).
         """
         stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
             db, subscription
@@ -1039,7 +1194,9 @@ class BillingService:
             )
 
         if new_plan_type == subscription.plan_type:
-            return subscription
+            return subscription, 0
+
+        proration_ts = proration_date or int(datetime.now(tz=timezone.utc).timestamp())
 
         try:
             stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
@@ -1048,33 +1205,52 @@ class BillingService:
                 new_plan_type,
                 seat_quantity,
             )
-            stripe.Subscription.modify(
+            updated_sub = stripe.Subscription.modify(
                 stripe_sub_id,
                 items=modify_items,
-                proration_behavior="create_prorations",
+                proration_behavior="always_invoice",
+                payment_behavior="error_if_incomplete",
+                proration_date=proration_ts,
                 metadata={
                     "organization_id": str(subscription.organization_id),
                     "plan_type": new_plan_type.value,
                 },
+                expand=["latest_invoice"],
             )
         except stripe.error.StripeError as exc:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to upgrade subscription: {str(exc)}",
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Payment failed: {str(exc)}",
             ) from exc
+
+        amount_charged_cents = 0
+        latest_invoice = updated_sub.get("latest_invoice")
+        if isinstance(latest_invoice, dict):
+            amount_charged_cents = int(
+                latest_invoice.get("amount_paid")
+                or latest_invoice.get("amount_due")
+                or 0
+            )
+        elif latest_invoice:
+            try:
+                inv = stripe.Invoice.retrieve(str(latest_invoice))
+                amount_charged_cents = int(inv.get("amount_paid") or inv.get("amount_due") or 0)
+            except stripe.error.StripeError:
+                amount_charged_cents = 0
 
         await BillingService._cancel_duplicate_stripe_subscriptions(
             subscription.stripe_customer_id,
             stripe_sub_id,
         )
 
-        return await BillingService.sync_subscription_from_stripe(
+        synced = await BillingService.sync_subscription_from_stripe(
             db,
             subscription.organization_id,
             stripe_sub_id,
             stripe_customer_id=subscription.stripe_customer_id,
             plan_type_hint=new_plan_type,
         )
+        return synced, amount_charged_cents
 
     @staticmethod
     async def get_checkout_session(
@@ -1086,36 +1262,16 @@ class BillingService:
         success_url: str,
         cancel_url: str,
     ) -> dict:
-        """
-        Start checkout for first paid subscription, or upgrade an existing one in place.
-        """
+        """Start Stripe Checkout for first paid subscription (trial / no active sub)."""
         stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
             db, subscription
         )
 
         if stripe_sub_id and subscription:
-            if subscription.plan_type == plan_type:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"You are already on the {plan_type.value} plan",
-                )
-            updated = await BillingService.upgrade_subscription_plan(
-                db,
-                subscription,
-                plan_type,
-                seat_quantity,
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Use upgrade preview to change an active subscription",
             )
-            plan_label = plan_type.value.title()
-            return {
-                "upgraded": True,
-                "session_id": None,
-                "url": None,
-                "plan_type": updated.plan_type.value,
-                "message": (
-                    f"Your plan has been updated to {plan_label}. "
-                    "Any prorated charges will appear on your next invoice."
-                ),
-            }
 
         price_id = BillingService.PLAN_PRICE_MAP.get(plan_type)
         if not price_id:
