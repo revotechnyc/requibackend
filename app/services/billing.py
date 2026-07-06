@@ -568,6 +568,14 @@ class BillingService:
 
         await db.commit()
         await db.refresh(subscription)
+
+        customer_id_str = str(customer_id) if customer_id else subscription.stripe_customer_id
+        if customer_id_str and BillingService._is_stripe_billed_subscription(stripe_subscription_id):
+            await BillingService._cancel_duplicate_stripe_subscriptions(
+                customer_id_str,
+                stripe_subscription_id,
+            )
+
         return subscription
 
     @staticmethod
@@ -893,22 +901,229 @@ class BillingService:
                 subscription.status = SubscriptionStatus.PAST_DUE
                 await db.commit()
     
+    UPGRADE_IN_PLACE_STATUSES = frozenset({
+        SubscriptionStatus.ACTIVE,
+        SubscriptionStatus.PAST_DUE,
+    })
+
+    @staticmethod
+    def _build_plan_change_modify_items(
+        stripe_sub: dict,
+        new_plan_type: PlanType,
+        seat_quantity: int,
+    ) -> list[dict]:
+        """Build Stripe Subscription.modify items for a plan change (with proration)."""
+        limits = settings.get_plan_limits(new_plan_type.value)
+        qty = max(seat_quantity, limits["min"])
+        if qty > limits["max"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Seat quantity must be between {limits['min']} and {limits['max']}",
+            )
+
+        existing = BillingService._subscription_items(stripe_sub)
+
+        if new_plan_type == PlanType.ENTERPRISE:
+            base_price = BillingService._enterprise_base_price_id()
+            add_price = BillingService._enterprise_additional_price_id()
+            additional_qty = max(0, qty - BillingService.ENTERPRISE_BASE_SEAT_COUNT)
+            modify_items: list[dict] = []
+            for item in existing:
+                modify_items.append({"id": item["id"], "deleted": True})
+            modify_items.append({
+                "price": base_price,
+                "quantity": BillingService.ENTERPRISE_BASE_SEAT_COUNT,
+            })
+            if additional_qty > 0:
+                modify_items.append({"price": add_price, "quantity": additional_qty})
+            return modify_items
+
+        new_price_id = BillingService.PLAN_PRICE_MAP.get(new_plan_type)
+        if not new_price_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid plan type",
+            )
+
+        if not existing:
+            return [{"price": new_price_id, "quantity": qty}]
+
+        # Standard / Pro: single line item — replace first, remove extras (e.g. legacy Enterprise lines).
+        modify_items = []
+        for index, item in enumerate(existing):
+            if index == 0:
+                modify_items.append({
+                    "id": item["id"],
+                    "price": new_price_id,
+                    "quantity": qty,
+                })
+            else:
+                modify_items.append({"id": item["id"], "deleted": True})
+        return modify_items
+
+    @staticmethod
+    async def _cancel_duplicate_stripe_subscriptions(
+        customer_id: Optional[str],
+        keep_subscription_id: str,
+    ) -> None:
+        """Cancel extra active Stripe subscriptions on the same customer (one plan per org)."""
+        if not customer_id or customer_id.startswith("local"):
+            return
+        for stripe_status in ("active", "past_due", "trialing"):
+            try:
+                listed = stripe.Subscription.list(
+                    customer=customer_id,
+                    status=stripe_status,
+                    limit=100,
+                )
+            except stripe.error.StripeError as exc:
+                logger.warning(
+                    "Could not list %s subscriptions for %s: %s",
+                    stripe_status,
+                    customer_id,
+                    exc,
+                )
+                continue
+            for sub in listed.data:
+                if sub.id == keep_subscription_id:
+                    continue
+                try:
+                    stripe.Subscription.cancel(sub.id)
+                    logger.info(
+                        "Cancelled duplicate Stripe subscription %s (kept %s)",
+                        sub.id,
+                        keep_subscription_id,
+                    )
+                except stripe.error.StripeError as exc:
+                    logger.warning(
+                        "Failed to cancel duplicate subscription %s: %s",
+                        sub.id,
+                        exc,
+                    )
+
+    @staticmethod
+    async def _resolve_billable_stripe_subscription_id(
+        db: AsyncSession,
+        subscription: Optional[Subscription],
+    ) -> Optional[str]:
+        """Return sub_... id when the org already has a paid Stripe subscription to upgrade in place."""
+        if not subscription:
+            return None
+        if subscription.status not in BillingService.UPGRADE_IN_PLACE_STATUSES:
+            return None
+
+        sid = subscription.stripe_subscription_id or ""
+        if BillingService._is_stripe_billed_subscription(sid):
+            return sid
+
+        return await BillingService.resolve_stripe_subscription_id(db, subscription)
+
+    @staticmethod
+    async def upgrade_subscription_plan(
+        db: AsyncSession,
+        subscription: Subscription,
+        new_plan_type: PlanType,
+        seat_quantity: int,
+    ) -> Subscription:
+        """
+        Change plan on the existing Stripe subscription (prorated).
+        Avoids creating a second parallel subscription.
+        """
+        stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
+            db, subscription
+        )
+        if not stripe_sub_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No active Stripe subscription to upgrade",
+            )
+
+        if new_plan_type == subscription.plan_type:
+            return subscription
+
+        try:
+            stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
+            modify_items = BillingService._build_plan_change_modify_items(
+                stripe_sub,
+                new_plan_type,
+                seat_quantity,
+            )
+            stripe.Subscription.modify(
+                stripe_sub_id,
+                items=modify_items,
+                proration_behavior="create_prorations",
+                metadata={
+                    "organization_id": str(subscription.organization_id),
+                    "plan_type": new_plan_type.value,
+                },
+            )
+        except stripe.error.StripeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to upgrade subscription: {str(exc)}",
+            ) from exc
+
+        await BillingService._cancel_duplicate_stripe_subscriptions(
+            subscription.stripe_customer_id,
+            stripe_sub_id,
+        )
+
+        return await BillingService.sync_subscription_from_stripe(
+            db,
+            subscription.organization_id,
+            stripe_sub_id,
+            stripe_customer_id=subscription.stripe_customer_id,
+            plan_type_hint=new_plan_type,
+        )
+
     @staticmethod
     async def get_checkout_session(
+        db: AsyncSession,
         organization: Organization,
+        subscription: Optional[Subscription],
         plan_type: PlanType,
         seat_quantity: int,
         success_url: str,
         cancel_url: str,
     ) -> dict:
-        """Create Stripe checkout session"""
+        """
+        Start checkout for first paid subscription, or upgrade an existing one in place.
+        """
+        stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
+            db, subscription
+        )
+
+        if stripe_sub_id and subscription:
+            if subscription.plan_type == plan_type:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"You are already on the {plan_type.value} plan",
+                )
+            updated = await BillingService.upgrade_subscription_plan(
+                db,
+                subscription,
+                plan_type,
+                seat_quantity,
+            )
+            plan_label = plan_type.value.title()
+            return {
+                "upgraded": True,
+                "session_id": None,
+                "url": None,
+                "plan_type": updated.plan_type.value,
+                "message": (
+                    f"Your plan has been updated to {plan_label}. "
+                    "Any prorated charges will appear on your next invoice."
+                ),
+            }
+
         price_id = BillingService.PLAN_PRICE_MAP.get(plan_type)
         if not price_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid plan type"
+                detail="Invalid plan type",
             )
-        
+
         try:
             metadata = {
                 "organization_id": str(organization.id),
@@ -927,11 +1142,11 @@ class BillingService:
                 metadata=metadata,
                 subscription_data={"metadata": metadata},
             )
-            return {"session_id": session.id, "url": session.url}
+            return {"session_id": session.id, "url": session.url, "upgraded": False}
         except stripe.error.StripeError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to create checkout session: {str(e)}"
+                detail=f"Failed to create checkout session: {str(e)}",
             )
     
     @staticmethod

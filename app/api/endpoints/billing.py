@@ -267,11 +267,22 @@ async def create_checkout_session(
         plan_type = PlanType(data.plan_type.lower())
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid plan type")
-    
-    session = await BillingService.get_checkout_session(
-        org, plan_type, data.seat_quantity, data.success_url, data.cancel_url
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.organization_id == organization_id)
     )
-    
+    subscription = sub_result.scalar_one_or_none()
+
+    session = await BillingService.get_checkout_session(
+        db,
+        org,
+        subscription,
+        plan_type,
+        data.seat_quantity,
+        data.success_url,
+        data.cancel_url,
+    )
+
     return session
 
 
