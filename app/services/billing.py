@@ -59,7 +59,7 @@ class BillingService:
     @staticmethod
     def _parse_enterprise_total_seats_from_stripe(stripe_sub: dict) -> int:
         """
-        Enterprise billing: 1 base seat ($3,500) + N additional seats ($500).
+        Enterprise billing: 1 base seat ($3,500) + N additional seats (per-seat price).
         Legacy subs with a single line item use that item's quantity as total.
         """
         base_price = BillingService._enterprise_base_price_id()
@@ -232,9 +232,10 @@ class BillingService:
         # Handle seat quantity change only
         elif new_seat_quantity and new_seat_quantity != subscription.seat_quantity:
             if subscription.plan_type == PlanType.ENTERPRISE:
-                return await BillingService.update_enterprise_total_seats(
+                updated, _charge = await BillingService.update_enterprise_total_seats(
                     db, subscription, new_seat_quantity
                 )
+                return updated
             # Validate limits
             limits = settings.get_plan_limits(subscription.plan_type.value)
             if new_seat_quantity < limits["min"] or new_seat_quantity > limits["max"]:
@@ -275,10 +276,11 @@ class BillingService:
         db: AsyncSession,
         subscription: Subscription,
         total_seat_quantity: int,
-    ) -> Subscription:
+    ) -> tuple[Subscription, int]:
         """
-        Enterprise: keep 1 base seat at $3,500 and bill extras at $500/seat.
+        Enterprise: keep 1 base seat at $3,500 and bill extras at additional seat price.
         total_seat_quantity = 1 (owner) + additional paid users.
+        Charges immediately when adding seats (prorated); credits on removal.
         """
         limits = settings.get_plan_limits(PlanType.ENTERPRISE.value)
         if total_seat_quantity < limits["min"] or total_seat_quantity > limits["max"]:
@@ -286,6 +288,9 @@ class BillingService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Seat quantity must be between {limits['min']} and {limits['max']}",
             )
+
+        previous_qty = subscription.seat_quantity or BillingService.ENTERPRISE_BASE_SEAT_COUNT
+        is_adding_seats = total_seat_quantity > previous_qty
 
         additional_qty = max(0, total_seat_quantity - BillingService.ENTERPRISE_BASE_SEAT_COUNT)
         base_price_id = BillingService._enterprise_base_price_id()
@@ -328,23 +333,45 @@ class BillingService:
         elif add_item:
             modify_items.append({"id": add_item["id"], "deleted": True})
 
+        modify_kwargs: dict = {
+            "items": modify_items,
+            "proration_behavior": "always_invoice" if is_adding_seats else "create_prorations",
+        }
+        if is_adding_seats:
+            modify_kwargs["payment_behavior"] = "error_if_incomplete"
+
         try:
-            stripe.Subscription.modify(
+            updated_sub = stripe.Subscription.modify(
                 subscription.stripe_subscription_id,
-                items=modify_items,
-                proration_behavior="create_prorations",
+                expand=["latest_invoice"],
+                **modify_kwargs,
             )
         except stripe.error.StripeError as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Failed to update enterprise seats: {str(e)}",
+            status_code = (
+                status.HTTP_402_PAYMENT_REQUIRED
+                if is_adding_seats
+                else status.HTTP_400_BAD_REQUEST
             )
+            raise HTTPException(
+                status_code=status_code,
+                detail=f"Failed to update enterprise seats: {str(e)}",
+            ) from e
+
+        amount_charged_cents = 0
+        if is_adding_seats:
+            latest_invoice = updated_sub.get("latest_invoice")
+            if isinstance(latest_invoice, dict):
+                amount_charged_cents = int(
+                    latest_invoice.get("amount_paid")
+                    or latest_invoice.get("amount_due")
+                    or 0
+                )
 
         subscription.seat_quantity = total_seat_quantity
         subscription.stripe_price_id = base_price_id
         await db.commit()
         await db.refresh(subscription)
-        return subscription
+        return subscription, amount_charged_cents
     
     @staticmethod
     def _is_stripe_billed_subscription(stripe_subscription_id: str) -> bool:
@@ -1057,6 +1084,96 @@ class BillingService:
         )
 
     @staticmethod
+    def _build_checkout_line_items(
+        plan_type: PlanType,
+        total_seat_quantity: int,
+    ) -> list[dict]:
+        """Stripe Checkout line items for first paid subscription."""
+        if plan_type == PlanType.ENTERPRISE:
+            base_price = BillingService._enterprise_base_price_id()
+            add_price = BillingService._enterprise_additional_price_id()
+            additional_qty = max(
+                0, total_seat_quantity - BillingService.ENTERPRISE_BASE_SEAT_COUNT
+            )
+            items = [{
+                "price": base_price,
+                "quantity": BillingService.ENTERPRISE_BASE_SEAT_COUNT,
+            }]
+            if additional_qty > 0:
+                items.append({"price": add_price, "quantity": additional_qty})
+            return items
+
+        price_id = BillingService.PLAN_PRICE_MAP.get(plan_type)
+        if not price_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid plan type",
+            )
+        return [{"price": price_id, "quantity": total_seat_quantity}]
+
+    @staticmethod
+    async def _preview_trial_checkout(
+        db: AsyncSession,
+        subscription: Subscription,
+        new_plan_type: PlanType,
+        seat_quantity: int,
+    ) -> dict:
+        """Preview first paid checkout (trial → paid), including trial team seats."""
+        from app.services.seat_allocation import (
+            count_paid_seats_allocated,
+            resolve_checkout_seat_quantity,
+        )
+
+        total_seats = await resolve_checkout_seat_quantity(
+            subscription.organization_id,
+            subscription,
+            new_plan_type,
+            seat_quantity,
+            db,
+        )
+        allocated = await count_paid_seats_allocated(subscription.organization_id, db)
+        new_label = BillingService._plan_display_label(new_plan_type)
+
+        summary_lines: list[dict] = []
+        if new_plan_type == PlanType.ENTERPRISE:
+            additional = max(0, total_seats - BillingService.ENTERPRISE_BASE_SEAT_COUNT)
+            base_cents = settings.enterprise_plan_price
+            add_cents = settings.enterprise_additional_seat_price * additional
+            amount_due = base_cents + add_cents
+            summary_lines.append({
+                "label": "Enterprise owner seat",
+                "formatted": BillingService._format_usd_cents(base_cents),
+            })
+            if additional > 0:
+                summary_lines.append({
+                    "label": f"Additional team seats × {additional}",
+                    "formatted": BillingService._format_usd_cents(add_cents),
+                })
+            summary_lines.append({
+                "label": "Due today (first month)",
+                "formatted": BillingService._format_usd_cents(amount_due),
+                "emphasis": True,
+            })
+        else:
+            amount_due = settings.get_plan_price(new_plan_type.value)
+            summary_lines.append({
+                "label": f"{new_label} plan",
+                "formatted": BillingService._format_usd_cents(amount_due),
+                "emphasis": True,
+            })
+
+        return {
+            "upgrade_type": "checkout",
+            "seat_quantity": total_seats,
+            "allocated_paid_seats": allocated,
+            "new_plan": new_plan_type.value,
+            "new_plan_label": new_label,
+            "amount_due_cents": amount_due,
+            "amount_due_formatted": BillingService._format_usd_cents(amount_due),
+            "summary_lines": summary_lines,
+        }
+
+    @staticmethod
     async def preview_upgrade_plan(
         db: AsyncSession,
         subscription: Subscription,
@@ -1068,7 +1185,9 @@ class BillingService:
             db, subscription
         )
         if not stripe_sub_id:
-            return {"upgrade_type": "checkout"}
+            return await BillingService._preview_trial_checkout(
+                db, subscription, new_plan_type, seat_quantity
+            )
 
         if new_plan_type == subscription.plan_type:
             raise HTTPException(
@@ -1299,31 +1418,44 @@ class BillingService:
             )
 
         price_id = BillingService.PLAN_PRICE_MAP.get(plan_type)
-        if not price_id:
+        if not price_id and plan_type != PlanType.ENTERPRISE:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid plan type",
             )
 
+        limits = settings.get_plan_limits(plan_type.value)
+        if plan_type == PlanType.ENTERPRISE:
+            seat_quantity = max(
+                seat_quantity, limits["min"]
+            )
+        else:
+            seat_quantity = max(seat_quantity, limits["min"])
+
+        line_items = BillingService._build_checkout_line_items(plan_type, seat_quantity)
+
         try:
             metadata = {
                 "organization_id": str(organization.id),
                 "plan_type": plan_type.value,
+                "seat_quantity": str(seat_quantity),
             }
             session = stripe.checkout.Session.create(
                 customer=organization.owner.stripe_customer_id,
                 payment_method_types=["card"],
-                line_items=[{
-                    "price": price_id,
-                    "quantity": seat_quantity,
-                }],
+                line_items=line_items,
                 mode="subscription",
                 success_url=success_url,
                 cancel_url=cancel_url,
                 metadata=metadata,
                 subscription_data={"metadata": metadata},
             )
-            return {"session_id": session.id, "url": session.url, "upgraded": False}
+            return {
+                "session_id": session.id,
+                "url": session.url,
+                "upgraded": False,
+                "seat_quantity": seat_quantity,
+            }
         except stripe.error.StripeError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,

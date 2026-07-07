@@ -302,9 +302,16 @@ async def invite_workspace_member(
     billing = await billing_snapshot_for_org(org, db)
     seat_message = ""
     if seat_billing and seat_billing.get("seat_added"):
+        charge_note = ""
+        if seat_billing.get("amount_charged_formatted"):
+            charge_note = (
+                f" A prorated charge of {seat_billing['amount_charged_formatted']} "
+                "was applied to your card."
+            )
         seat_message = (
             f" 1 paid seat added to your subscription "
             f"({seat_billing['previous_seat_quantity']} → {seat_billing['new_seat_quantity']})."
+            f"{charge_note}"
         )
 
     plan = _org_plan_type(org)

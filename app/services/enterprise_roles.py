@@ -5,11 +5,18 @@ from __future__ import annotations
 from typing import Optional
 from uuid import UUID
 
+from app.core.config import settings
 from app.db.models import PlanType, UserRole
 
 # Seat prices in cents (client framework)
 ENTERPRISE_OWNER_SEAT_CENTS = 350_000  # $3,500 — Enterprise Admin seat
-STANDARD_ENTERPRISE_SEAT_CENTS = 50_000  # $500 — other paid roles
+
+
+def additional_enterprise_seat_cents() -> int:
+    return settings.enterprise_additional_seat_price
+
+
+STANDARD_ENTERPRISE_SEAT_CENTS = 150_000  # $1,500 — additional paid team seats (see settings)
 
 ROLE_SEAT_PRICE_CENTS: dict[str, int] = {
     UserRole.ENTERPRISE_ADMIN.value: ENTERPRISE_OWNER_SEAT_CENTS,
@@ -144,10 +151,10 @@ def seat_price_cents_for_member(
     value = role.value if isinstance(role, UserRole) else str(role).lower()
     if value == UserRole.VIEWER.value:
         return 0
-    # Only the account owner is billed at $3,500; all other paid users are $500.
+    # Only the account owner is billed at $3,500; all other paid users are additional seat price.
     if user_id is not None and owner_id is not None and user_id == owner_id:
         return ENTERPRISE_OWNER_SEAT_CENTS
-    return STANDARD_ENTERPRISE_SEAT_CENTS
+    return additional_enterprise_seat_cents()
 
 
 def display_role_key(

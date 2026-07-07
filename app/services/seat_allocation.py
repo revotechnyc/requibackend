@@ -15,6 +15,7 @@ from app.db.models import (
     PlanType,
     Seat,
     Subscription,
+    SubscriptionStatus,
     UserRole,
     WorkspaceInvitation,
     WorkspaceInvitationStatus,
@@ -24,6 +25,7 @@ from app.services.enterprise_roles import (
     PAID_INVITE_ROLES,
     ROLE_SEAT_PRICE_CENTS,
     STANDARD_ENTERPRISE_SEAT_CENTS,
+    additional_enterprise_seat_cents,
     seat_price_cents_for_member,
 )
 
@@ -74,7 +76,7 @@ async def _set_subscription_seat_quantity(
     db: AsyncSession,
     subscription: Subscription,
     new_quantity: int,
-) -> Subscription:
+) -> tuple[Subscription, int]:
     limits = settings.get_plan_limits(subscription.plan_type.value)
     if new_quantity < limits["min"] or new_quantity > limits["max"]:
         raise HTTPException(
@@ -85,16 +87,37 @@ async def _set_subscription_seat_quantity(
     stripe_id = subscription.stripe_subscription_id or ""
     if BillingService._is_stripe_billed_subscription(stripe_id):
         if subscription.plan_type == PlanType.ENTERPRISE:
-            return await BillingService.update_enterprise_total_seats(
+            updated, charge_cents = await BillingService.update_enterprise_total_seats(
                 db, subscription, new_quantity
             )
-        return await BillingService.update_subscription(
+            return updated, charge_cents
+        updated = await BillingService.update_subscription(
             db, subscription, new_seat_quantity=new_quantity
         )
+        return updated, 0
 
     subscription.seat_quantity = new_quantity
     await db.flush()
-    return subscription
+    return subscription, 0
+
+
+async def resolve_checkout_seat_quantity(
+    organization_id: UUID,
+    subscription: Optional[Subscription],
+    plan_type: PlanType,
+    requested: int,
+    db: AsyncSession,
+) -> int:
+    """Seat count for first paid checkout (trial → paid), including trial invites."""
+    limits = settings.get_plan_limits(plan_type.value)
+    minimum = limits["min"]
+    if not subscription or subscription.status != SubscriptionStatus.TRIALING:
+        return max(requested, minimum)
+
+    allocated = await count_paid_seats_allocated(organization_id, db)
+    if plan_type == PlanType.ENTERPRISE:
+        return max(requested, allocated, minimum)
+    return max(requested, minimum)
 
 
 async def reserve_paid_seat(
@@ -117,13 +140,15 @@ async def reserve_paid_seat(
     previous = sub.seat_quantity
 
     if needed > previous:
-        await _set_subscription_seat_quantity(db, sub, needed)
+        sub, charge_cents = await _set_subscription_seat_quantity(db, sub, needed)
         await db.refresh(sub)
         return {
             "seat_added": True,
             "previous_seat_quantity": previous,
             "new_seat_quantity": sub.seat_quantity,
             "allocated_paid_seats": needed,
+            "amount_charged_cents": charge_cents,
+            "amount_charged_formatted": BillingService._format_usd_cents(charge_cents),
         }
 
     return {
@@ -173,7 +198,7 @@ async def _estimated_monthly_cents_for_org(
     org: Organization,
     db: AsyncSession,
 ) -> int:
-    """Sum per-member seat prices (owner admin = $3,500, other paid = $500)."""
+    """Sum per-member seat prices (owner admin = $3,500, other paid = additional seat price)."""
     owner_id = org.owner_id
     total = 0
 
@@ -201,7 +226,7 @@ async def _estimated_monthly_cents_for_org(
             UserRole(str(inv.role).lower())
         except ValueError:
             continue
-        total += STANDARD_ENTERPRISE_SEAT_CENTS
+        total += additional_enterprise_seat_cents()
 
     return total
 
@@ -221,8 +246,8 @@ def seat_billing_summary(
         "available_paid_seats": max(0, billed - allocated_paid_seats),
         "price_per_seat_cents": default_cents,
         "price_per_seat_display": default_cents / 100,
-        "standard_seat_price_cents": STANDARD_ENTERPRISE_SEAT_CENTS,
-        "standard_seat_price_display": STANDARD_ENTERPRISE_SEAT_CENTS / 100,
+        "standard_seat_price_cents": additional_enterprise_seat_cents(),
+        "standard_seat_price_display": additional_enterprise_seat_cents() / 100,
         "enterprise_owner_seat_price_cents": ROLE_SEAT_PRICE_CENTS["enterprise_admin"],
         "enterprise_owner_seat_price_display": ROLE_SEAT_PRICE_CENTS["enterprise_admin"] / 100,
         "estimated_monthly_cents": estimated_monthly_cents,

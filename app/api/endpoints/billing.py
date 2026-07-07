@@ -17,6 +17,7 @@ from app.core.permissions import PermissionChecker, check_feature_access, requir
 from app.db.database import get_db
 from app.db.models import Organization, PlanType, Seat, Subscription, SubscriptionStatus, User
 from app.services.billing import BillingService
+from app.services.seat_allocation import resolve_checkout_seat_quantity
 
 router = APIRouter()
 public_router = APIRouter()
@@ -286,12 +287,20 @@ async def create_checkout_session(
     )
     subscription = sub_result.scalar_one_or_none()
 
+    resolved_seats = await resolve_checkout_seat_quantity(
+        org.id,
+        subscription,
+        plan_type,
+        data.seat_quantity,
+        db,
+    )
+
     session = await BillingService.get_checkout_session(
         db,
         org,
         subscription,
         plan_type,
-        data.seat_quantity,
+        resolved_seats,
         data.success_url,
         data.cancel_url,
     )
@@ -476,8 +485,8 @@ async def get_plans():
             "name": "Enterprise",
             "price_per_seat": settings.enterprise_plan_price,
             "price_display": "$3,500/month",
-            "additional_seat_price": settings.standard_plan_price,
-            "additional_seat_price_display": "$500/month per additional user",
+            "additional_seat_price": settings.enterprise_additional_seat_price,
+            "additional_seat_price_display": "$1,500/month per additional user",
             "min_seats": settings.enterprise_plan_min_seats,
             "max_seats": settings.enterprise_plan_max_seats,
             "free_trial_days": 14,
