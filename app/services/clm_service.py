@@ -36,6 +36,7 @@ from app.db.models import (
 )
 from app.services.clm_extraction import extract_clm_metadata
 from app.services.compliance_ai_integration import process_intelligence_compliance_update
+from app.services.compliance_gap_helpers import GapSourceContext, apply_gap_source_context
 from app.services.document_storage import content_type_for_extension, save_document_file
 
 logger = logging.getLogger(__name__)
@@ -265,6 +266,8 @@ async def process_contract_after_upload(
                 source_type="document_analysis",
                 has_documents=True,
                 use_mock=settings.mock_chat_stream,
+                contract_id=contract.id,
+                contract_name=contract.title,
             )
         except Exception as exc:
             logger.warning("clm_compliance_sync_skip: %s", exc)
@@ -288,6 +291,16 @@ async def _create_obligations_and_gaps(
             severity=item.get("severity") or "medium",
             status="open",
             category="Contracts",
+        )
+        apply_gap_source_context(
+            gap,
+            GapSourceContext(
+                source_type="clm",
+                source_label=contract.title[:500],
+                contract_id=contract.id,
+                contract_name=contract.title[:500],
+                project_name="Contracts",
+            ),
         )
         db.add(gap)
         await db.flush()
@@ -322,6 +335,8 @@ async def _create_obligations_and_gaps(
             db.add(task)
             await db.flush()
             obligation.task_id = task.id
+            gap.task_id = task.id
+            gap.task_name = task.title[:500]
 
 
 async def _schedule_renewal_task(

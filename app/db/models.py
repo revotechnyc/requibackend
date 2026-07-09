@@ -720,6 +720,20 @@ class ComplianceGap(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
     resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    source_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    source_label: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    conversation_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True
+    )
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workspace_tasks.id"), nullable=True
+    )
+    task_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    contract_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_contracts.id"), nullable=True
+    )
+    contract_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    project_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     organization: Mapped["Organization"] = relationship("Organization")
 

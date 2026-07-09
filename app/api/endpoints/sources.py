@@ -407,6 +407,7 @@ async def upload_document_file(
                 source_type="document_analysis",
                 has_documents=True,
                 use_mock=settings.mock_chat_stream,
+                document_filename=filename,
             )
         except Exception as exc:
             logger.warning("document_upload_compliance_skip: %s", exc)

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import uuid
+from datetime import datetime
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +24,7 @@ from app.db.models import (
     User,
     UserRole,
 )
+from app.services.compliance_gap_helpers import gap_to_dict
 from app.services.compliance_service import (
     FRAMEWORK_CATALOG,
     build_compliance_overview,
@@ -50,6 +53,10 @@ class GapUpdate(BaseModel):
     severity: Optional[str] = Field(default=None, pattern="^(critical|high|medium|low)$")
 
 
+class BulkGapResolve(BaseModel):
+    gap_ids: list[str] = Field(..., min_length=1, max_length=200)
+
+
 async def _get_workspace(user: User, db: AsyncSession) -> tuple[Organization, Seat]:
     result = await db.execute(
         select(Seat)
@@ -72,6 +79,64 @@ def _require_compliance_plan(org: Organization) -> PlanType:
             detail="Compliance dashboard requires Pro or Enterprise plan.",
         )
     return plan
+
+
+def _can_manage_gaps(seat: Seat) -> bool:
+    return seat.role in (UserRole.ADMIN, UserRole.REVIEWER) or PermissionChecker.can_administrate(
+        seat.role
+    )
+
+
+async def _gap_status_counts(db: AsyncSession, org_id: uuid.UUID) -> dict[str, int]:
+    result = await db.execute(
+        select(ComplianceGap.status, func.count())
+        .where(ComplianceGap.organization_id == org_id)
+        .group_by(ComplianceGap.status)
+    )
+    by_status = {row[0]: int(row[1]) for row in result.all()}
+    open_count = by_status.get("open", 0)
+    resolved_count = by_status.get("resolved", 0)
+    return {
+        "open": open_count,
+        "resolved": resolved_count,
+        "all": open_count + resolved_count,
+    }
+
+
+async def _resolve_gaps_for_org(
+    db: AsyncSession,
+    org: Organization,
+    gap_ids: list[str],
+) -> list[ComplianceGap]:
+    parsed_ids: list[uuid.UUID] = []
+    for gap_id in gap_ids:
+        try:
+            parsed_ids.append(uuid.UUID(gap_id))
+        except ValueError:
+            continue
+
+    if not parsed_ids:
+        raise HTTPException(status_code=400, detail="No valid gap IDs provided")
+
+    result = await db.execute(
+        select(ComplianceGap).where(
+            ComplianceGap.organization_id == org.id,
+            ComplianceGap.id.in_(parsed_ids),
+            ComplianceGap.status == "open",
+        )
+    )
+    gaps = result.scalars().all()
+    if not gaps:
+        raise HTTPException(status_code=404, detail="No open gaps found for the given IDs")
+
+    now = datetime.utcnow()
+    for gap in gaps:
+        gap.status = "resolved"
+        gap.resolved_at = now
+
+    await db.commit()
+    await build_compliance_overview(db, org, persist_snapshot=True)
+    return gaps
 
 
 @router.get("/overview")
@@ -200,7 +265,16 @@ async def remove_framework(
 
 @router.get("/gaps")
 async def list_gaps(
-    status: Optional[str] = "open",
+    status: Optional[str] = Query(default="open", pattern="^(open|resolved|all)$"),
+    search: Optional[str] = Query(default=None, max_length=200),
+    sort_by: Literal[
+        "created_at", "resolved_at", "title", "task_name", "source_label", "severity", "status"
+    ] = Query(default="created_at"),
+    sort_order: Literal["asc", "desc"] = Query(default="desc"),
+    framework_slug: Optional[str] = Query(default=None, max_length=64),
+    source_type: Optional[str] = Query(default=None, max_length=40),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -208,23 +282,78 @@ async def list_gaps(
     _require_compliance_plan(org)
 
     q = select(ComplianceGap).where(ComplianceGap.organization_id == org.id)
-    if status:
+    if status and status != "all":
         q = q.where(ComplianceGap.status == status)
-    result = await db.execute(q.order_by(ComplianceGap.created_at.desc()))
+    if framework_slug:
+        q = q.where(ComplianceGap.framework_slug == framework_slug.strip().lower())
+    if source_type:
+        q = q.where(ComplianceGap.source_type == source_type.strip().lower())
+    if search:
+        term = f"%{search.strip()}%"
+        q = q.where(
+            or_(
+                ComplianceGap.title.ilike(term),
+                ComplianceGap.source_label.ilike(term),
+                ComplianceGap.task_name.ilike(term),
+                ComplianceGap.contract_name.ilike(term),
+                ComplianceGap.project_name.ilike(term),
+                ComplianceGap.category.ilike(term),
+            )
+        )
+
+    sort_columns = {
+        "created_at": ComplianceGap.created_at,
+        "resolved_at": ComplianceGap.resolved_at,
+        "title": ComplianceGap.title,
+        "task_name": ComplianceGap.task_name,
+        "source_label": ComplianceGap.source_label,
+        "severity": ComplianceGap.severity,
+        "status": ComplianceGap.status,
+    }
+    sort_col = sort_columns.get(sort_by, ComplianceGap.created_at)
+    q = q.order_by(sort_col.asc() if sort_order == "asc" else sort_col.desc())
+
+    result = await db.execute(q.offset(offset).limit(limit))
     gaps = result.scalars().all()
+
+    count_q = select(func.count()).select_from(ComplianceGap).where(
+        ComplianceGap.organization_id == org.id
+    )
+    if status and status != "all":
+        count_q = count_q.where(ComplianceGap.status == status)
+    if framework_slug:
+        count_q = count_q.where(ComplianceGap.framework_slug == framework_slug.strip().lower())
+    if source_type:
+        count_q = count_q.where(ComplianceGap.source_type == source_type.strip().lower())
+    if search:
+        term = f"%{search.strip()}%"
+        count_q = count_q.where(
+            or_(
+                ComplianceGap.title.ilike(term),
+                ComplianceGap.source_label.ilike(term),
+                ComplianceGap.task_name.ilike(term),
+                ComplianceGap.contract_name.ilike(term),
+                ComplianceGap.project_name.ilike(term),
+                ComplianceGap.category.ilike(term),
+            )
+        )
+    total = int((await db.execute(count_q)).scalar_one() or 0)
+    counts = await _gap_status_counts(db, org.id)
+
     return {
         "gaps": [
-            {
-                "id": str(g.id),
-                "title": g.title,
-                "framework_slug": g.framework_slug,
-                "severity": g.severity,
-                "status": g.status,
-                "category": g.category,
-                "days_open": max(0, (g.updated_at - g.created_at).days),
-            }
+            gap_to_dict(
+                g,
+                framework_name=FRAMEWORK_CATALOG.get(
+                    g.framework_slug, g.framework_slug.replace("_", " ").title()
+                ),
+            )
             for g in gaps
-        ]
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "counts": counts,
     }
 
 
@@ -236,9 +365,7 @@ async def create_gap(
 ):
     org, seat = await _get_workspace(current_user, db)
     _require_compliance_plan(org)
-    if seat.role not in (UserRole.ADMIN, UserRole.REVIEWER) and not PermissionChecker.can_administrate(
-        seat.role
-    ):
+    if not _can_manage_gaps(seat):
         raise HTTPException(status_code=403, detail="Insufficient permissions to create gaps")
 
     slug = data.framework_slug.strip().lower()
@@ -250,12 +377,32 @@ async def create_gap(
         severity=data.severity,
         category=data.category,
         status="open",
+        source_type="manual",
+        source_label="Manual entry",
     )
     db.add(gap)
     await db.commit()
     await db.refresh(gap)
     await build_compliance_overview(db, org, persist_snapshot=True)
     return {"gap": {"id": str(gap.id), "title": gap.title}}
+
+
+@router.post("/gaps/bulk-resolve")
+async def bulk_resolve_gaps(
+    data: BulkGapResolve,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    org, seat = await _get_workspace(current_user, db)
+    _require_compliance_plan(org)
+    if not _can_manage_gaps(seat):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    gaps = await _resolve_gaps_for_org(db, org, data.gap_ids)
+    return {
+        "resolved_count": len(gaps),
+        "gap_ids": [str(g.id) for g in gaps],
+    }
 
 
 @router.patch("/gaps/{gap_id}")
@@ -267,9 +414,7 @@ async def update_gap(
 ):
     org, seat = await _get_workspace(current_user, db)
     _require_compliance_plan(org)
-    if seat.role not in (UserRole.ADMIN, UserRole.REVIEWER) and not PermissionChecker.can_administrate(
-        seat.role
-    ):
+    if not _can_manage_gaps(seat):
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     result = await db.execute(
@@ -287,8 +432,6 @@ async def update_gap(
     if data.status:
         gap.status = data.status
         if data.status == "resolved":
-            from datetime import datetime
-
             gap.resolved_at = datetime.utcnow()
     await db.commit()
     await build_compliance_overview(db, org, persist_snapshot=True)

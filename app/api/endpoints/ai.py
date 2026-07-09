@@ -866,6 +866,9 @@ async def chat_stream(
                                 source_type="chat",
                                 has_documents=has_doc_context,
                                 use_mock=settings.mock_chat_stream,
+                                conversation_id=conversation_id,
+                                task_id=task_uuid,
+                                workflow_id=workflow_uuid,
                             )
                             if compliance_summary and compliance_summary.get("gaps_created", 0) > 0:
                                 yield (
@@ -1269,6 +1272,9 @@ async def chat(
                 source_type="chat",
                 has_documents=False,
                 use_mock=settings.mock_chat_stream,
+                conversation_id=conversation.id,
+                task_id=conversation.task_id,
+                workflow_id=conversation.workflow_id,
             )
         except Exception as comp_exc:
             logger.warning("chat_compliance_skip: %s", comp_exc)

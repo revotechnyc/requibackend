@@ -25,6 +25,11 @@ from app.db.models import (
     Organization,
     PlanType,
 )
+from app.services.compliance_gap_helpers import (
+    GapSourceContext,
+    apply_gap_source_context,
+    build_gap_source_context,
+)
 from app.services.compliance_service import (
     FRAMEWORK_CATALOG,
     calculate_ai_score,
@@ -261,6 +266,7 @@ async def persist_ai_compliance_analysis(
     analysis: dict,
     *,
     source_type: str = "chat",
+    source_context: Optional[GapSourceContext] = None,
 ) -> dict[str, Any]:
     """Write gaps + snapshot; update framework scores. Returns summary for logging/SSE."""
     await ensure_default_frameworks(db, org.id)
@@ -304,17 +310,17 @@ async def persist_ai_compliance_analysis(
         if severity not in ("critical", "high", "medium", "low"):
             severity = "medium"
 
-        db.add(
-            ComplianceGap(
-                organization_id=org.id,
-                framework_slug=slug,
-                title=title[:500],
-                description=(item.get("description") or "")[:2000] or None,
-                severity=severity,
-                category=(item.get("category") or FRAMEWORK_CATALOG.get(slug, slug))[:100],
-                status="open",
-            )
+        gap = ComplianceGap(
+            organization_id=org.id,
+            framework_slug=slug,
+            title=title[:500],
+            description=(item.get("description") or "")[:2000] or None,
+            severity=severity,
+            category=(item.get("category") or FRAMEWORK_CATALOG.get(slug, slug))[:100],
+            status="open",
         )
+        apply_gap_source_context(gap, source_context)
+        db.add(gap)
         created_gaps += 1
 
     for slug, score in framework_scores.items():
@@ -370,6 +376,13 @@ async def process_intelligence_compliance_update(
     source_type: str = "chat",
     has_documents: bool = False,
     use_mock: bool = False,
+    source_context: Optional[GapSourceContext] = None,
+    conversation_id: Optional[uuid.UUID] = None,
+    task_id: Optional[uuid.UUID] = None,
+    workflow_id: Optional[uuid.UUID] = None,
+    contract_id: Optional[uuid.UUID] = None,
+    contract_name: Optional[str] = None,
+    document_filename: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """
     Run compliance extraction after an Intelligence turn.
@@ -388,6 +401,19 @@ async def process_intelligence_compliance_update(
     if not (assistant_message or "").strip():
         return None
 
+    if source_context is None:
+        source_context = await build_gap_source_context(
+            db,
+            user_message=user_message,
+            source_type=source_type,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            workflow_id=workflow_id,
+            contract_id=contract_id,
+            contract_name=contract_name,
+            document_filename=document_filename,
+        )
+
     if use_mock or settings.mock_chat_stream:
         analysis = _mock_analysis(user_message, assistant_message)
     else:
@@ -396,7 +422,13 @@ async def process_intelligence_compliance_update(
             analysis = _mock_analysis(user_message, assistant_message)
 
     try:
-        return await persist_ai_compliance_analysis(db, org, analysis, source_type=source_type)
+        return await persist_ai_compliance_analysis(
+            db,
+            org,
+            analysis,
+            source_type=source_type,
+            source_context=source_context,
+        )
     except Exception as exc:
         logger.exception("persist_ai_compliance_failed: %s", exc)
         await db.rollback()

@@ -393,6 +393,7 @@ async def init_db() -> None:
         ("workflow_findings_table", _ensure_workflow_findings_table),
         ("conversation_workflow", _ensure_conversation_workflow_columns),
         ("compliance_tables", _ensure_compliance_tables),
+        ("compliance_gap_metadata", _ensure_compliance_gap_metadata_columns),
         ("member_feature_permissions", _ensure_member_feature_permissions_columns),
         ("workspace_member_credentials_table", _ensure_workspace_member_credentials_table),
         ("user_password_flags_table", _ensure_user_password_flags_table),
@@ -429,6 +430,69 @@ async def _ensure_workspace_member_credentials_table(conn) -> None:
                 provisioned_password_encrypted VARCHAR(512) NOT NULL,
                 created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc')
             )
+            """
+        )
+    )
+
+
+async def _ensure_compliance_gap_metadata_columns(conn) -> None:
+    """Source / contract / task metadata for gap filtering and history."""
+    varchar_cols = [
+        ("source_type", "VARCHAR(40)"),
+        ("source_label", "VARCHAR(500)"),
+        ("task_name", "VARCHAR(500)"),
+        ("contract_name", "VARCHAR(500)"),
+        ("project_name", "VARCHAR(500)"),
+    ]
+    for column, col_type in varchar_cols:
+        if not await _column_exists(conn, "compliance_gaps", column):
+            await conn.execute(
+                text(f"ALTER TABLE compliance_gaps ADD COLUMN {column} {col_type}")
+            )
+
+    await _ensure_uuid_column(conn, "compliance_gaps", "conversation_id")
+    await _ensure_uuid_column(conn, "compliance_gaps", "task_id")
+    await _ensure_uuid_column(conn, "compliance_gaps", "contract_id")
+
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_compliance_gaps_org_created "
+            "ON compliance_gaps (organization_id, created_at DESC)"
+        )
+    )
+
+    # Backfill CLM-linked gaps from obligations (idempotent, skip if CLM tables absent).
+    clm_check = await conn.execute(
+        text(
+            """
+            SELECT 1 FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = 'clm_obligations'
+            """
+        )
+    )
+    if clm_check.scalar() is not None:
+        await conn.execute(
+            text(
+                """
+                UPDATE compliance_gaps AS g
+                SET contract_id = o.contract_id,
+                    contract_name = c.title,
+                    source_type = COALESCE(g.source_type, 'clm')
+                FROM clm_obligations AS o
+                JOIN clm_contracts AS c ON c.id = o.contract_id
+                WHERE o.compliance_gap_id = g.id
+                  AND g.contract_id IS NULL
+                """
+            )
+        )
+
+    await conn.execute(
+        text(
+            """
+            UPDATE compliance_gaps
+            SET project_name = 'Documents'
+            WHERE source_type = 'document'
+              AND project_name IS NULL
             """
         )
     )

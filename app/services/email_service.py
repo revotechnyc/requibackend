@@ -63,7 +63,7 @@ EMAIL_BASE_TEMPLATE = """
     <div class="container">
         <div class="header">
             <h1>REQUI</h1>
-            <p>AI-Powered Compliance Intelligence</p>
+            <p>Healthcare Compliance + Legal Simplified</p>
         </div>
         <div class="content">
             {% if badge %}<span class="badge">{{ badge }}</span>{% endif %}
@@ -262,7 +262,7 @@ async def send_welcome_email(
     message = (
         f"Hi {greeting},\n\n"
         f"Thanks for signing up. Your workspace is ready and your {days}-day free trial "
-        f"has started. Sign in to explore AI-powered compliance intelligence, upload documents, "
+        f"has started. Sign in to explore compliance and legal intelligence, upload documents, "
         f"and manage your compliance workflow.\n\n"
         f"If you have questions, reply to this email or visit our site."
     )
