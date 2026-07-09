@@ -191,6 +191,10 @@ class Settings(BaseSettings):
     # Knowledge Pipeline
     chunk_size: int = 1000
     chunk_overlap: int = 200
+    # Max characters injected per explicitly selected Intelligence document (library or attachment).
+    intelligence_document_context_max_chars: int = 200_000
+    # Max characters sent to compliance gap extraction (document upload + Intelligence analysis).
+    compliance_analysis_max_chars: int = 200_000
     max_sources_per_query: int = 5
     min_confidence_threshold: float = 0.7
     gap_detection_threshold: float = 0.5

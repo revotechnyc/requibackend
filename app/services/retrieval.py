@@ -4,6 +4,7 @@ Hybrid semantic + keyword search with reranking
 """
 
 import hashlib
+from collections import defaultdict
 from typing import List, Optional, Tuple
 from uuid import UUID
 
@@ -144,6 +145,76 @@ class RetrievalService:
             await db.refresh(chunk)
 
         return chunk_records
+
+    async def get_ordered_chunks_for_document(
+        self,
+        db: AsyncSession,
+        document_id: UUID,
+    ) -> List[DocumentChunk]:
+        """Return all chunks for a document in sequential chunk_index order."""
+        result = await db.execute(
+            select(DocumentChunk)
+            .where(DocumentChunk.document_id == document_id)
+            .order_by(DocumentChunk.chunk_index.asc())
+        )
+        return list(result.scalars().all())
+
+    async def build_document_context_text(
+        self,
+        db: AsyncSession,
+        document: Document,
+        source_label: str,
+        max_chars: Optional[int] = None,
+    ) -> Tuple[str, List[str]]:
+        """
+        Build full document context in sequential section order for Intelligence chat.
+        Returns (context_text, section_labels_for_ui).
+        """
+        cap = max_chars if max_chars is not None else settings.intelligence_document_context_max_chars
+        chunks = await self.get_ordered_chunks_for_document(db, document.id)
+        section_labels: List[str] = []
+
+        if chunks:
+            total = len(chunks)
+            header_lines = [
+                f"--- {source_label}: {document.title} ---",
+                (
+                    f"This document has {total} section(s). "
+                    f"Review and reference them in strict numerical order "
+                    f"(Section 1 through Section {total})."
+                ),
+                "",
+            ]
+            parts: List[str] = list(header_lines)
+            used = sum(len(line) + 1 for line in header_lines)
+
+            for chunk in chunks:
+                section_num = chunk.chunk_index + 1
+                section_labels.append(f"{document.title} — Section {section_num}/{total}")
+                section_body = f"[Section {section_num} of {total}]\n{chunk.content}"
+                extra = len(section_body) + 2
+                if used + extra > cap:
+                    parts.append(
+                        f"… [Remaining sections {section_num}–{total} omitted due to length limit]"
+                    )
+                    break
+                parts.append(section_body)
+                used += extra
+
+            return "\n\n".join(parts), section_labels
+
+        raw = (document.content or "").strip()
+        if not raw:
+            return "", []
+
+        section_labels = [document.title]
+        body = raw if len(raw) <= cap else raw[:cap] + "\n…(document truncated for length)"
+        text = (
+            f"--- {source_label}: {document.title} ---\n\n"
+            "Review this document in the order presented below.\n\n"
+            f"{body}"
+        )
+        return text, section_labels
     
     async def semantic_search(
         self,
@@ -312,29 +383,49 @@ class RetrievalService:
         
         if not results:
             return "", []
-        
+
+        # Preserve sequential section order within each document; rank documents by best chunk score.
+        groups: dict = defaultdict(list)
+        for chunk, score in results:
+            groups[chunk.document_id].append((chunk, score))
+
+        ordered_doc_ids = sorted(
+            groups.keys(),
+            key=lambda doc_id: max(item[1] for item in groups[doc_id]),
+            reverse=True,
+        )
+        results = []
+        for doc_id in ordered_doc_ids:
+            results.extend(
+                sorted(groups[doc_id], key=lambda item: item[0].chunk_index)
+            )
+
         # Build context string
         context_parts = []
         citations = []
-        
+        doc_titles: dict = {}
+
         for i, (chunk, score) in enumerate(results):
-            # Get document info
-            doc_result = await db.execute(
-                select(Document).where(Document.id == chunk.document_id)
-            )
-            document = doc_result.scalar_one()
-            
-            # Add to context
+            doc_id = chunk.document_id
+            if doc_id not in doc_titles:
+                doc_result = await db.execute(
+                    select(Document).where(Document.id == doc_id)
+                )
+                doc_titles[doc_id] = doc_result.scalar_one().title
+
+            title = doc_titles[doc_id]
+            section_num = chunk.chunk_index + 1
+
             context_parts.append(
-                f"[Source {i+1}] {document.title}:\n{chunk.content}"
+                f"[{title} — Section {section_num}] (relevance: {score:.2f}):\n{chunk.content}"
             )
-            
-            # Build citation
+
             citations.append({
                 "index": i + 1,
-                "document_id": str(document.id),
-                "document_title": document.title,
+                "document_id": str(doc_id),
+                "document_title": title,
                 "chunk_id": str(chunk.id),
+                "chunk_index": chunk.chunk_index,
                 "relevance_score": round(score, 3),
                 "excerpt": chunk.content[:200] + "..." if len(chunk.content) > 200 else chunk.content,
             })

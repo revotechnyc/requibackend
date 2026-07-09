@@ -124,6 +124,8 @@ class ResponsesService:
         self,
         system_instruction: Optional[str] = None,
         request_id: Optional[str] = None,
+        skip_vector_search: bool = False,
+        document_source_labels: Optional[List[str]] = None,
     ):
         self.api_key = settings.openai_api_key
         self.base_url = "https://api.openai.com/v1/responses"
@@ -137,6 +139,8 @@ class ResponsesService:
         self.prompt_version = settings.openai_prompt_version
         self.system_instruction = system_instruction
         self.request_id = request_id or str(uuid.uuid4())[:8]
+        self.skip_vector_search = skip_vector_search
+        self.document_source_labels = document_source_labels or []
 
     async def _search_vector_store(self, query: str, max_results: int = 5) -> List[Dict]:
         if not self.vs_search_url:
@@ -198,6 +202,12 @@ class ResponsesService:
                 break
 
         if not last_user_msg:
+            msgs = list(messages)
+            if self.system_instruction:
+                msgs.insert(0, {"role": "developer", "content": self.system_instruction})
+            return msgs, []
+
+        if self.skip_vector_search:
             msgs = list(messages)
             if self.system_instruction:
                 msgs.insert(0, {"role": "developer", "content": self.system_instruction})
@@ -350,12 +360,16 @@ class ResponsesService:
             )
         )
 
-        filenames = [r.get("filename", "unknown") for r in search_results]
+        filenames = (
+            self.document_source_labels
+            if self.skip_vector_search and self.document_source_labels
+            else [r.get("filename", "unknown") for r in search_results]
+        )
         yield await _sse_event(
             {
                 "type": "phase",
                 "phase": "search_complete",
-                "sources": len(search_results),
+                "sources": len(filenames),
                 "filenames": filenames,
             }
         )

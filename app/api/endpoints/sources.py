@@ -396,14 +396,27 @@ async def upload_document_file(
                 .options(selectinload(Organization.subscription))
             )
             org = org_full.scalar_one()
+            doc_for_analysis = await db.get(Document, saved_doc_id)
+            if not doc_for_analysis:
+                doc_result = await db.execute(select(Document).where(Document.id == saved_doc_id))
+                doc_for_analysis = doc_result.scalar_one()
+
+            retrieval = RetrievalService()
+            analysis_text, _section_labels = await retrieval.build_document_context_text(
+                db,
+                doc_for_analysis,
+                "Uploaded compliance document",
+            )
+            compliance_body = analysis_text or extracted
+
             await process_intelligence_compliance_update(
                 db,
                 org,
                 user_message=(
                     f"Review this uploaded compliance document ({filename}) for HIPAA, "
-                    f"FWA, and security gaps."
+                    f"FWA, and security gaps. Consider every numbered section in order."
                 ),
-                assistant_message=extracted[:8000],
+                assistant_message=compliance_body,
                 source_type="document_analysis",
                 has_documents=True,
                 use_mock=settings.mock_chat_stream,

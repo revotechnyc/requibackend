@@ -75,7 +75,10 @@ Rules:
 - Only include gaps that are clearly implied or stated in the conversation (max 5).
 - If no gaps, return "gaps_found": [].
 - framework_scores should include every framework you mention in gaps.
-- Be conservative: do not invent violations without basis in the text."""
+- Be conservative: do not invent violations without basis in the text.
+- Assign framework_slug by topic: workforce training, breach/incident response, BAA, PHI access, risk analysis → hipaa; billing, coding, kickbacks, claims audits, FWA → fwa.
+- If the document already defines a control (policy, timeline, review cadence), do not report it as a missing policy — only flag weak, undocumented, or unverifiable controls.
+- When reviewing uploaded policy documents, consider all numbered sections in order."""
 
 
 def _should_analyze(user_message: str, assistant_message: str, *, has_documents: bool) -> bool:
@@ -181,9 +184,12 @@ async def _call_extraction_model(user_message: str, assistant_message: str) -> O
     if not settings.openai_api_key:
         return None
     client = AsyncOpenAI(api_key=settings.openai_api_key)
+    max_chars = settings.compliance_analysis_max_chars
+    user_text = (user_message or "")[:max_chars]
+    assistant_text = (assistant_message or "")[:max_chars]
     user_block = (
-        f"USER QUESTION:\n{user_message[:4000]}\n\n"
-        f"ASSISTANT ANSWER:\n{assistant_message[:6000]}"
+        f"USER QUESTION:\n{user_text}\n\n"
+        f"DOCUMENT OR ASSISTANT CONTENT TO ANALYZE:\n{assistant_text}"
     )
     try:
         resp = await client.chat.completions.create(

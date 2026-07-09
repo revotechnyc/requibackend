@@ -654,6 +654,8 @@ async def chat_stream(
                         messages = []
 
                     file_refs: List[dict] = []
+                    explicit_section_labels: List[str] = []
+                    retrieval = RetrievalService()
 
                     if attachment_uuids or internal_pick_uuids:
                         all_load_ids = list(dict.fromkeys([*attachment_uuids, *internal_pick_uuids]))
@@ -668,27 +670,36 @@ async def chat_stream(
 
                             for uid in attachment_uuids:
                                 d = by_id.get(uid)
-                                if d and d.content:
+                                if not d:
+                                    continue
+                                context_text, labels = await retrieval.build_document_context_text(
+                                    stream_db,
+                                    d,
+                                    "Attached to this chat",
+                                )
+                                if context_text:
                                     file_refs.append(
-                                        {
-                                            "type": "input_text",
-                                            "text": f"--- Attached to this chat: {d.title} ---\n{d.content[:5000]}",
-                                        }
+                                        {"type": "input_text", "text": context_text}
                                     )
+                                    explicit_section_labels.extend(labels)
 
                             for uid in internal_pick_uuids:
                                 d = by_id.get(uid)
-                                if d and d.content:
+                                if not d:
+                                    continue
+                                context_text, labels = await retrieval.build_document_context_text(
+                                    stream_db,
+                                    d,
+                                    "Internal library document",
+                                )
+                                if context_text:
                                     file_refs.append(
-                                        {
-                                            "type": "input_text",
-                                            "text": f"--- Internal library document: {d.title} ---\n{d.content[:5000]}",
-                                        }
+                                        {"type": "input_text", "text": context_text}
                                     )
+                                    explicit_section_labels.extend(labels)
 
                     if request.search_internal_documents and request.message.strip():
                         try:
-                            retrieval = RetrievalService()
                             context_str, _citations = await retrieval.get_context_for_query(
                                 stream_db,
                                 organization_id,
@@ -751,6 +762,8 @@ async def chat_stream(
                     responses_service = ResponsesService(
                         system_instruction=SONIA_SYSTEM_INSTRUCTION,
                         request_id=req_id,
+                        skip_vector_search=bool(explicit_section_labels),
+                        document_source_labels=explicit_section_labels,
                     )
 
                     t1 = time_module.time()
