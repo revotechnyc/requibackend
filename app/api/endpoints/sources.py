@@ -3,7 +3,6 @@ Knowledge source management endpoints
 """
 
 import hashlib
-import io
 import logging
 import uuid
 from typing import List, Optional
@@ -19,7 +18,7 @@ from app.api.endpoints.auth import get_current_active_user
 from app.core.config import settings
 from app.core.permissions import Feature, require_feature_dependency
 from app.db.database import get_db
-from app.db.models import Document, DocumentChunk, Organization, Source, SourceType, User, WorkspaceWorkflow
+from app.db.models import Document, DocumentChunk, Organization, PlanType, Source, SourceType, User, WorkspaceWorkflow
 from app.services.workflow_service import log_workflow_activity
 from app.services.document_storage import (
     build_document_file_url,
@@ -28,7 +27,8 @@ from app.services.document_storage import (
     remove_document_file,
     save_document_file,
 )
-from app.services.compliance_ai_integration import process_intelligence_compliance_update
+from app.services.document_text_extraction import extract_text_from_upload
+from app.services.document_upload_pipeline import run_document_compliance_analysis
 from app.services.retrieval import RetrievalService
 from app.tasks.ingestion import ingest_document_task, ingest_source_task
 
@@ -44,8 +44,15 @@ DOCUMENT_CATEGORIES = frozenset({
     "Audit",
 })
 
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".txt", ".md", ".csv", ".doc", ".docx", ".html", ".htm"}
+
+
+def _max_upload_bytes() -> int:
+    return int(settings.document_upload_max_bytes)
+
+
+def _max_upload_mb_label() -> int:
+    return max(1, _max_upload_bytes() // (1024 * 1024))
 
 
 def _format_file_size(num_bytes: int) -> str:
@@ -73,46 +80,49 @@ def _file_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower()
 
 
-def _extract_text_from_upload(filename: str, raw: bytes) -> str:
-    ext = _file_extension(filename)
-
-    if ext == "pdf":
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(raw))
-        parts = []
-        for page in reader.pages:
-            parts.append(page.extract_text() or "")
-        return "\n".join(parts).strip()
-
-    if ext in ("txt", "md", "csv", "html", "htm"):
-        return raw.decode("utf-8", errors="ignore").strip()
-
-    if ext in ("doc", "docx"):
+async def _enforce_document_page_limit(
+    db: AsyncSession,
+    organization_id: uuid.UUID,
+    page_count: Optional[int],
+) -> None:
+    """Pro plan: enforce marketing page cap for AI document analysis."""
+    if page_count is None:
+        return
+    org_result = await db.execute(
+        select(Organization)
+        .where(Organization.id == organization_id)
+        .options(selectinload(Organization.subscription))
+    )
+    org = org_result.scalar_one_or_none()
+    plan = org.subscription.plan_type if org and org.subscription else PlanType.STANDARD
+    if plan != PlanType.PRO:
+        return
+    limit = settings.pro_plan_document_max_pages
+    if page_count > limit:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Word documents are not supported yet. Please upload PDF or TXT.",
+            detail=(
+                f"This document has {page_count} pages. Requi Pro supports AI analysis "
+                f"for up to {limit} pages. Upgrade to Enterprise for unlimited pages, "
+                f"or upload a shorter document."
+            ),
         )
-
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"Unsupported file type: .{ext or 'unknown'}",
-    )
 
 
 def _document_processing_status(document: Document, chunk_count: int) -> str:
     meta_status = (document.document_metadata or {}).get("ingestion_status")
-    if meta_status in ("processed", "processing", "failed"):
-        if meta_status == "processing" and chunk_count > 0:
-            return "processed"
+    if meta_status in ("processed", "failed", "indexing", "gap_analysis", "processing"):
+        # Legacy "processing": distinguish indexing vs gap analysis when possible.
+        if meta_status == "processing":
+            return "gap_analysis" if chunk_count > 0 else "indexing"
         return meta_status
     if chunk_count > 0:
         return "processed"
     if (document.document_metadata or {}).get("ingestion_error"):
         return "failed"
     if document.content:
-        return "processing"
-    return "processing"
+        return "indexing"
+    return "indexing"
 
 
 def _serialize_document(document: Document, chunk_count: int = 0) -> dict:
@@ -136,6 +146,8 @@ def _serialize_document(document: Document, chunk_count: int = 0) -> dict:
         "has_original_file": bool(document.storage_path),
         "storage_path": document.storage_path,
         "file_url": build_document_file_url(document.storage_path),
+        "ingestion_error": meta.get("ingestion_error"),
+        "page_count": meta.get("page_count"),
     }
 
 
@@ -175,7 +187,29 @@ async def _run_document_ingestion_inline(db: AsyncSession, document: Document) -
     try:
         retrieval = RetrievalService()
         chunks = await retrieval.ingest_document(db, document)
-        return "processed" if chunks else "failed"
+        status_value = "processed" if chunks else "failed"
+        if chunks:
+            result = await db.execute(select(Document).where(Document.id == document.id))
+            doc = result.scalar_one_or_none()
+            if doc:
+                meta = dict(doc.document_metadata or {})
+                meta["ingestion_status"] = "gap_analysis"
+                meta.pop("ingestion_error", None)
+                doc.document_metadata = meta
+                await db.commit()
+            try:
+                await run_document_compliance_analysis(db, document.id, filename=document.title)
+            except Exception as comp_exc:
+                logger.warning("inline_compliance_skip doc=%s: %s", document.id, comp_exc)
+            result = await db.execute(select(Document).where(Document.id == document.id))
+            doc = result.scalar_one_or_none()
+            if doc:
+                meta = dict(doc.document_metadata or {})
+                meta["ingestion_status"] = "processed"
+                meta.pop("ingestion_error", None)
+                doc.document_metadata = meta
+                await db.commit()
+        return status_value
     except Exception as exc:
         await db.rollback()
         result = await db.execute(select(Document).where(Document.id == document.id))
@@ -191,11 +225,11 @@ async def _run_document_ingestion_inline(db: AsyncSession, document: Document) -
 
 
 async def _queue_or_run_ingestion(db: AsyncSession, document: Document) -> str:
-    """Run ingestion inline by default; optionally queue Celery when DOCUMENT_INGEST_USE_ASYNC_WORKER=true."""
+    """Queue Celery ingestion when enabled; otherwise run inline (dev fallback)."""
     if settings.document_ingest_use_async_worker:
         try:
             ingest_document_task.delay(str(document.id))
-            return "processing"
+            return "indexing"
         except Exception:
             logger.warning(
                 "document_ingest_use_async_worker=true but Celery publish failed; ingesting inline",
@@ -316,16 +350,17 @@ async def upload_document_file(
         )
 
     raw = await file.read()
-    if len(raw) > MAX_UPLOAD_BYTES:
+    if len(raw) > _max_upload_bytes():
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="File exceeds 25 MB limit",
+            detail=f"File exceeds {_max_upload_mb_label()} MB limit",
         )
     if not raw:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
 
     try:
-        extracted = _extract_text_from_upload(filename, raw)
+        extraction = extract_text_from_upload(filename, raw)
+        extracted = extraction.text
     except HTTPException:
         raise
     except Exception as exc:
@@ -333,6 +368,8 @@ async def upload_document_file(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Could not read file: {exc}",
         ) from exc
+
+    await _enforce_document_page_limit(db, organization.id, extraction.page_count)
 
     content_hash = hashlib.sha256(raw).hexdigest()
     uploader = f"{current_user.first_name} {current_user.last_name}".strip() or current_user.email
@@ -371,7 +408,9 @@ async def upload_document_file(
             "size_display": _format_file_size(len(raw)),
             "uploaded_by": uploader,
             "uploaded_by_id": str(current_user.id),
-            "ingestion_status": "processing",
+            "ingestion_status": "indexing",
+            "page_count": extraction.page_count,
+            "extraction_method": extraction.method,
         },
     )
     db.add(document)
@@ -387,47 +426,6 @@ async def upload_document_file(
     )
     chunk_total = int(chunk_count_result.scalar_one() or 0)
     saved_doc_id = document.id
-
-    if extracted:
-        try:
-            org_full = await db.execute(
-                select(Organization)
-                .where(Organization.id == organization.id)
-                .options(selectinload(Organization.subscription))
-            )
-            org = org_full.scalar_one()
-            doc_for_analysis = await db.get(Document, saved_doc_id)
-            if not doc_for_analysis:
-                doc_result = await db.execute(select(Document).where(Document.id == saved_doc_id))
-                doc_for_analysis = doc_result.scalar_one()
-
-            retrieval = RetrievalService()
-            analysis_text, _section_labels = await retrieval.build_document_context_text(
-                db,
-                doc_for_analysis,
-                "Uploaded compliance document",
-            )
-            compliance_body = analysis_text or extracted
-
-            await process_intelligence_compliance_update(
-                db,
-                org,
-                user_message=(
-                    f"Review this uploaded compliance document ({filename}) for HIPAA, "
-                    f"FWA, and security gaps. Consider every numbered section in order."
-                ),
-                assistant_message=compliance_body,
-                source_type="document_analysis",
-                has_documents=True,
-                use_mock=settings.mock_chat_stream,
-                document_filename=filename,
-            )
-        except Exception as exc:
-            logger.warning("document_upload_compliance_skip: %s", exc)
-            try:
-                await db.rollback()
-            except Exception:
-                pass
 
     doc_fresh = await db.get(Document, saved_doc_id)
     if not doc_fresh:
@@ -448,7 +446,11 @@ async def upload_document_file(
     return {
         **_serialize_document(doc_fresh, chunk_total),
         "status": ingestion_status,
-        "message": "Document uploaded successfully",
+        "message": (
+            "Document uploaded; indexing and gap analysis running in background."
+            if ingestion_status in ("indexing", "processing", "gap_analysis")
+            else "Document uploaded successfully"
+        ),
     }
 
 
@@ -476,7 +478,7 @@ async def create_document(
             "category": doc_category,
             "uploaded_by": uploader,
             "uploaded_by_id": str(current_user.id),
-            "ingestion_status": "processing",
+            "ingestion_status": "indexing",
         },
     )
     db.add(document)
@@ -616,6 +618,40 @@ async def get_document(
     )
     chunk_count = count_result.scalar() or 0
     return _serialize_document(document, chunk_count)
+
+
+@router.post("/documents/{document_id}/reprocess", response_model=dict)
+async def reprocess_document(
+    document_id: str,
+    organization: Organization = Depends(require_feature_dependency(Feature.KNOWLEDGE_STORAGE)),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Re-queue chunking and embedding for a failed or stale document."""
+    document = await _get_org_document(document_id, organization, db)
+    meta = dict(document.document_metadata or {})
+    meta["ingestion_status"] = "indexing"
+    meta.pop("ingestion_error", None)
+    document.document_metadata = meta
+    await db.commit()
+    await db.refresh(document)
+
+    ingestion_status = await _queue_or_run_ingestion(db, document)
+    await db.refresh(document)
+
+    count_result = await db.execute(
+        select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == document.id)
+    )
+    chunk_count = int(count_result.scalar_one() or 0)
+    return {
+        **_serialize_document(document, chunk_count),
+        "status": ingestion_status,
+        "message": (
+            "Document re-queued for background indexing and gap analysis."
+            if ingestion_status in ("indexing", "processing", "gap_analysis")
+            else "Document reprocessed"
+        ),
+    }
 
 
 @router.delete("/documents/{document_id}")

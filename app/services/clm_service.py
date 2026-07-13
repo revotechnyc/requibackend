@@ -15,12 +15,13 @@ from sqlalchemy.orm import selectinload
 
 from app.api.endpoints.sources import (
     ALLOWED_UPLOAD_EXTENSIONS,
-    MAX_UPLOAD_BYTES,
-    _extract_text_from_upload,
     _file_extension,
+    _max_upload_bytes,
+    _max_upload_mb_label,
     _queue_or_run_ingestion,
 )
 from app.core.config import settings
+from app.services.document_text_extraction import extract_text_from_upload
 from app.db.models import (
     ClmContract,
     ClmContractStatus,
@@ -121,8 +122,11 @@ async def upload_contract_document(
         )
 
     raw = await file.read()
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File exceeds 25 MB limit")
+    if len(raw) > _max_upload_bytes():
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File exceeds {_max_upload_mb_label()} MB limit",
+        )
     if not raw:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
 
@@ -137,7 +141,8 @@ async def upload_contract_document(
             raise HTTPException(status_code=400, detail="Vendor not found")
 
     try:
-        extracted = _extract_text_from_upload(filename, raw)
+        extraction = extract_text_from_upload(filename, raw)
+        extracted = extraction.text
     except HTTPException:
         raise
     except Exception as exc:

@@ -7,10 +7,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DEFAULT_TIMEOUT=300 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System deps for psycopg2 / asyncpg
+# System deps for psycopg2 / asyncpg / PDF OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    tesseract-ocr \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies (lean set — avoids multi-GB torch downloads)

@@ -250,9 +250,16 @@ async def _fetch_document_metrics(db: AsyncSession, org_id: uuid.UUID) -> dict[s
     docs = doc_result.scalars().all()
     total = len(docs)
     if total == 0:
-        return {"total": 0, "analyzed": 0, "readiness_score": 0.0}
+        return {
+            "total": 0,
+            "analyzed": 0,
+            "readiness_score": 0.0,
+            "analyzing_count": 0,
+            "analyzing": [],
+        }
 
     analyzed = 0
+    analyzing: list[dict[str, Any]] = []
     for doc in docs:
         chunk_count = await db.scalar(
             select(func.count()).select_from(DocumentChunk).where(
@@ -261,9 +268,29 @@ async def _fetch_document_metrics(db: AsyncSession, org_id: uuid.UUID) -> dict[s
         )
         if chunk_count and chunk_count > 0:
             analyzed += 1
+        meta = doc.document_metadata or {}
+        status = meta.get("ingestion_status") or ""
+        if status in ("indexing", "gap_analysis", "processing"):
+            # Legacy processing: with chunks = analyzing gaps
+            phase = status
+            if status == "processing":
+                phase = "gap_analysis" if chunk_count else "indexing"
+            analyzing.append(
+                {
+                    "id": str(doc.id),
+                    "name": doc.title,
+                    "status": phase,
+                }
+            )
 
     readiness = round((analyzed / total) * 100, 1)
-    return {"total": total, "analyzed": analyzed, "readiness_score": readiness}
+    return {
+        "total": total,
+        "analyzed": analyzed,
+        "readiness_score": readiness,
+        "analyzing_count": len(analyzing),
+        "analyzing": analyzing[:10],
+    }
 
 
 def _gap_severity_penalty(gap: ComplianceGap) -> int:

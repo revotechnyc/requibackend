@@ -36,12 +36,22 @@ class EmbeddingService:
     
     @staticmethod
     async def get_embeddings_batch(texts: List[str]) -> List[List[float]]:
-        """Get embeddings for multiple texts"""
-        response = await openai_client.embeddings.create(
-            model=settings.embedding_model,
-            input=texts,
-        )
-        return [item.embedding for item in response.data]
+        """Get embeddings for multiple texts in API-safe batches."""
+        if not texts:
+            return []
+
+        batch_size = max(1, settings.embedding_batch_size)
+        all_embeddings: List[List[float]] = []
+
+        for start in range(0, len(texts), batch_size):
+            batch = [t[:8000] for t in texts[start : start + batch_size]]
+            response = await openai_client.embeddings.create(
+                model=settings.embedding_model,
+                input=batch,
+            )
+            all_embeddings.extend(item.embedding for item in response.data)
+
+        return all_embeddings
 
 
 class ChunkingService:
@@ -136,7 +146,8 @@ class RetrievalService:
         document.version += 1
 
         meta = dict(document.document_metadata or {})
-        meta["ingestion_status"] = "processed"
+        # Chunks ready — gap analysis still pending (ingestion task sets processed).
+        meta["ingestion_status"] = "gap_analysis"
         meta.pop("ingestion_error", None)
         document.document_metadata = meta
 

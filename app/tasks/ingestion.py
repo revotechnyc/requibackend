@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from app.db.database import get_db_context
 from app.db.models import Document, Source
+from app.services.document_upload_pipeline import run_document_compliance_analysis
 from app.services.retrieval import RetrievalService
 
 logger = logging.getLogger(__name__)
@@ -31,9 +32,24 @@ async def _mark_ingestion_failed(document_id: UUID, error_message: str) -> None:
         await db.commit()
 
 
+async def _ingest_document_core(db, document: Document) -> list:
+    """Chunk + embed a document; returns chunk records (may be empty)."""
+    if not (document.content or "").strip():
+        document.document_metadata = {
+            **(document.document_metadata or {}),
+            "ingestion_status": "failed",
+            "ingestion_error": "No extractable text in file",
+        }
+        await db.commit()
+        return []
+
+    retrieval = RetrievalService()
+    return await retrieval.ingest_document(db, document)
+
+
 @shared_task(bind=True, max_retries=3)
 def ingest_document_task(self, document_id: str):
-    """Ingest a single document: chunk, embed, update status."""
+    """Ingest a single document: chunk, embed, compliance analysis."""
 
     async def _ingest():
         doc_uuid = UUID(document_id)
@@ -43,6 +59,8 @@ def ingest_document_task(self, document_id: str):
 
             if not document:
                 return {"error": f"Document {document_id} not found"}
+
+            filename = document.title
 
             # Download content if URL provided
             if document.url and not document.content:
@@ -82,14 +100,12 @@ def ingest_document_task(self, document_id: str):
                     raise self.retry(exc=e, countdown=60) from e
 
             try:
-                retrieval_service = RetrievalService()
-                chunks = await retrieval_service.ingest_document(db, document)
+                chunks = await _ingest_document_core(db, document)
             except Exception as e:
                 logger.exception("ingest_document_task failed for %s", document_id)
                 await _mark_ingestion_failed(doc_uuid, str(e))
                 raise
 
-            # ingest_document commits metadata to processed (or failed with no chunks)
             if document.source_id:
                 source_result = await db.execute(
                     select(Source).where(Source.id == document.source_id)
@@ -102,10 +118,43 @@ def ingest_document_task(self, document_id: str):
 
             await db.commit()
 
+            if chunks and (document.content or "").strip():
+                # Ensure UI sees gap_analysis phase before long LLM work.
+                result = await db.execute(select(Document).where(Document.id == doc_uuid))
+                doc = result.scalar_one_or_none()
+                if doc:
+                    meta = dict(doc.document_metadata or {})
+                    meta["ingestion_status"] = "gap_analysis"
+                    meta.pop("ingestion_error", None)
+                    doc.document_metadata = meta
+                    await db.commit()
+                try:
+                    await run_document_compliance_analysis(
+                        db,
+                        doc_uuid,
+                        filename=filename,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "ingest_document_task compliance failed for %s: %s",
+                        document_id,
+                        exc,
+                    )
+
+            if chunks:
+                result = await db.execute(select(Document).where(Document.id == doc_uuid))
+                doc = result.scalar_one_or_none()
+                if doc:
+                    meta = dict(doc.document_metadata or {})
+                    meta["ingestion_status"] = "processed"
+                    meta.pop("ingestion_error", None)
+                    doc.document_metadata = meta
+                    await db.commit()
+
             return {
                 "document_id": document_id,
                 "chunks_created": len(chunks) if chunks else 0,
-                "status": "success",
+                "status": "success" if chunks else "failed",
             }
 
     return asyncio.run(_ingest())

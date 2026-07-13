@@ -83,9 +83,18 @@ class Settings(BaseSettings):
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
     celery_worker_concurrency: int = 4
-    # When True, document uploads queue `ingest_document_task` (requires a Celery worker).
-    # Default False = ingest in the API request (avoids stuck "Indexing…" if no worker consumes the queue).
-    document_ingest_use_async_worker: bool = False
+    # When True (default), document uploads queue `ingest_document_task` (requires Celery worker + Redis).
+    # Set False for dev without a worker — ingestion runs inline in the API process.
+    document_ingest_use_async_worker: bool = True
+    # Max upload size in bytes (default 50 MB).
+    document_upload_max_bytes: int = 50 * 1024 * 1024
+    # OpenAI embeddings API batch size (chunks per request).
+    embedding_batch_size: int = 100
+    # Pro plan AI document analysis page cap (Enterprise = unlimited).
+    pro_plan_document_max_pages: int = 50
+    # OCR fallback for scanned PDFs (requires tesseract in the container/host).
+    document_ocr_enabled: bool = True
+    document_ocr_max_pages: int = 100
     
     # Authentication
     jwt_secret_key: str = Field(..., description="Secret key for JWT tokens")
@@ -193,7 +202,7 @@ class Settings(BaseSettings):
     chunk_overlap: int = 200
     # Max characters injected per explicitly selected Intelligence document (library or attachment).
     intelligence_document_context_max_chars: int = 200_000
-    # Max characters sent to compliance gap extraction (document upload + Intelligence analysis).
+    # Max characters sent to compliance gap extraction (Intelligence chat replies).
     compliance_analysis_max_chars: int = 200_000
     max_sources_per_query: int = 5
     min_confidence_threshold: float = 0.7
