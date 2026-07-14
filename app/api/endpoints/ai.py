@@ -25,6 +25,7 @@ from app.services.ml import MLService
 from app.core.config import settings
 from app.services.compliance_ai_integration import process_intelligence_compliance_update
 from app.services.responses_service import (
+    DOCUMENT_TURN_DEVELOPER_INSTRUCTION,
     SONIA_SYSTEM_INSTRUCTION,
     ResponsesService,
     mock_chat_stream_for_testing,
@@ -655,6 +656,10 @@ async def chat_stream(
 
                     file_refs: List[dict] = []
                     explicit_section_labels: List[str] = []
+                    loaded_doc_titles: List[str] = []
+                    loaded_doc_message_refs: List[dict] = []
+                    loaded_section_count = 0
+                    requested_missing_titles: List[str] = []
                     retrieval = RetrievalService()
 
                     if attachment_uuids or internal_pick_uuids:
@@ -671,6 +676,7 @@ async def chat_stream(
                             for uid in attachment_uuids:
                                 d = by_id.get(uid)
                                 if not d:
+                                    requested_missing_titles.append(str(uid))
                                     continue
                                 context_text, labels = await retrieval.build_document_context_text(
                                     stream_db,
@@ -682,10 +688,23 @@ async def chat_stream(
                                         {"type": "input_text", "text": context_text}
                                     )
                                     explicit_section_labels.extend(labels)
+                                    loaded_doc_titles.append(d.title or str(d.id))
+                                    loaded_doc_message_refs.append(
+                                        {
+                                            "type": "document_attachment",
+                                            "document_id": str(d.id),
+                                            "name": d.title or str(d.id),
+                                            "source": "attachment",
+                                        }
+                                    )
+                                    loaded_section_count += len(labels)
+                                else:
+                                    requested_missing_titles.append(d.title or str(d.id))
 
                             for uid in internal_pick_uuids:
                                 d = by_id.get(uid)
                                 if not d:
+                                    requested_missing_titles.append(str(uid))
                                     continue
                                 context_text, labels = await retrieval.build_document_context_text(
                                     stream_db,
@@ -697,6 +716,46 @@ async def chat_stream(
                                         {"type": "input_text", "text": context_text}
                                     )
                                     explicit_section_labels.extend(labels)
+                                    loaded_doc_titles.append(d.title or str(d.id))
+                                    loaded_doc_message_refs.append(
+                                        {
+                                            "type": "document_attachment",
+                                            "document_id": str(d.id),
+                                            "name": d.title or str(d.id),
+                                            "source": "library",
+                                        }
+                                    )
+                                    loaded_section_count += len(labels)
+                                else:
+                                    requested_missing_titles.append(d.title or str(d.id))
+
+                        if loaded_doc_titles:
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "phase",
+                                        "phase": "documents_loaded",
+                                        "sources": len(loaded_doc_titles),
+                                        "filenames": loaded_doc_titles,
+                                        "sections": loaded_section_count,
+                                    }
+                                )
+                                + "\n\n"
+                            )
+                        elif requested_missing_titles:
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "phase",
+                                        "phase": "documents_unavailable",
+                                        "sources": 0,
+                                        "filenames": requested_missing_titles[:8],
+                                    }
+                                )
+                                + "\n\n"
+                            )
 
                     if request.search_internal_documents and request.message.strip():
                         try:
@@ -731,6 +790,15 @@ async def chat_stream(
                     else:
                         user_content = request.message
 
+                    if file_refs:
+                        messages.insert(
+                            0,
+                            {
+                                "role": "developer",
+                                "content": DOCUMENT_TURN_DEVELOPER_INSTRUCTION,
+                            },
+                        )
+
                     if workflow_context_text:
                         messages.insert(
                             0,
@@ -754,6 +822,7 @@ async def chat_stream(
                         conversation_id=conversation_id,
                         role="user",
                         content=request.message,
+                        citations=loaded_doc_message_refs or None,
                     )
                     stream_db.add(user_msg)
                     conversation_row.updated_at = datetime.utcnow()

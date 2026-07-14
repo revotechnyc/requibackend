@@ -188,11 +188,18 @@ class RetrievalService:
         if chunks:
             total = len(chunks)
             header_lines = [
-                f"--- {source_label}: {document.title} ---",
+                f"=== DOCUMENT AVAILABLE IN THIS TURN ({source_label}) ===",
+                f"Title: {document.title}",
+                f"Document ID: {document.id}",
                 (
                     f"This document has {total} section(s). "
-                    f"Review and reference them in strict numerical order "
-                    f"(Section 1 through Section {total})."
+                    f"The full text below IS the source content for this turn — "
+                    f"do NOT claim the file is missing, not uploaded, or absent from any library."
+                ),
+                (
+                    f"Reference sections in numerical order "
+                    f"(Section 1 through Section {total}). "
+                    f"Sections are sequential extracts; they may not equal PDF page numbers."
                 ),
                 "",
             ]
@@ -206,7 +213,8 @@ class RetrievalService:
                 extra = len(section_body) + 2
                 if used + extra > cap:
                     parts.append(
-                        f"… [Remaining sections {section_num}–{total} omitted due to length limit]"
+                        f"… [Remaining sections {section_num}–{total} omitted due to length limit "
+                        f"— continue from Section {section_num} if the user asks]"
                     )
                     break
                 parts.append(section_body)
@@ -221,7 +229,11 @@ class RetrievalService:
         section_labels = [document.title]
         body = raw if len(raw) <= cap else raw[:cap] + "\n…(document truncated for length)"
         text = (
-            f"--- {source_label}: {document.title} ---\n\n"
+            f"=== DOCUMENT AVAILABLE IN THIS TURN ({source_label}) ===\n"
+            f"Title: {document.title}\n"
+            f"Document ID: {document.id}\n\n"
+            "The text below IS the source content for this turn — "
+            "do NOT claim the file is missing, not uploaded, or absent from any library.\n\n"
             "Review this document in the order presented below.\n\n"
             f"{body}"
         )
