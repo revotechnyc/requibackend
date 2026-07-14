@@ -311,7 +311,14 @@ async def list_gaps(
         "status": ComplianceGap.status,
     }
     sort_col = sort_columns.get(sort_by, ComplianceGap.created_at)
-    q = q.order_by(sort_col.asc() if sort_order == "asc" else sort_col.desc())
+    sort_expr = (
+        sort_col.asc().nullslast()
+        if sort_order == "asc"
+        else sort_col.desc().nullslast()
+    )
+    # Stable tie-breaker keeps pagination reliable when multiple gaps share a timestamp.
+    id_expr = ComplianceGap.id.asc() if sort_order == "asc" else ComplianceGap.id.desc()
+    q = q.order_by(sort_expr, id_expr)
 
     result = await db.execute(q.offset(offset).limit(limit))
     gaps = result.scalars().all()
