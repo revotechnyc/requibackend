@@ -1092,6 +1092,11 @@ async def persist_ai_compliance_analysis(
     }
 
 
+# Only these callers may auto-create compliance gaps via this entrypoint.
+# Freeform Intelligence chat (source_type="chat") must not create gaps.
+_GAP_AUTO_CREATE_SOURCES = frozenset({"document_analysis"})
+
+
 async def process_intelligence_compliance_update(
     db: AsyncSession,
     org: Organization,
@@ -1110,10 +1115,20 @@ async def process_intelligence_compliance_update(
     document_filename: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """
-    Run compliance extraction after an Intelligence turn.
+    Run compliance gap extraction for document/CLM analysis.
+
+    Skips freeform Intelligence chat (source_type=\"chat\") so normal messages
+    do not create gaps. Document upload / CLM use source_type=\"document_analysis\".
     Returns summary dict or None if skipped.
     """
     if not getattr(settings, "compliance_ai_extraction_enabled", True):
+        return None
+
+    if source_type not in _GAP_AUTO_CREATE_SOURCES:
+        logger.debug(
+            "compliance_gap_extraction_skip source_type=%s (chat does not auto-create gaps)",
+            source_type,
+        )
         return None
 
     plan = org.subscription.plan_type if org.subscription else PlanType.STANDARD
