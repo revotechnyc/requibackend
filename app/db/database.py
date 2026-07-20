@@ -395,6 +395,7 @@ async def init_db() -> None:
         ("compliance_tables", _ensure_compliance_tables),
         ("compliance_gap_metadata", _ensure_compliance_gap_metadata_columns),
         ("member_feature_permissions", _ensure_member_feature_permissions_columns),
+        ("clm_location_access_table", _ensure_clm_location_access_table),
         ("workspace_member_credentials_table", _ensure_workspace_member_credentials_table),
         ("user_password_flags_table", _ensure_user_password_flags_table),
         ("notification_type_enum", _ensure_notification_type_enum_values),
@@ -418,6 +419,43 @@ async def _ensure_member_feature_permissions_columns(conn) -> None:
         await conn.execute(
             text("ALTER TABLE workspace_invitations ADD COLUMN feature_permissions JSONB")
         )
+
+
+async def _ensure_clm_location_access_table(conn) -> None:
+    """Create location-scoped CLM member access for existing deployments."""
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS clm_user_location_access (
+                id UUID PRIMARY KEY,
+                organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                sub_location_id UUID NOT NULL REFERENCES clm_sub_locations(id) ON DELETE CASCADE,
+                access_level VARCHAR(20) NOT NULL DEFAULT 'viewer',
+                granted_by_id UUID REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                updated_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'utc'),
+                CONSTRAINT uq_clm_user_location_access
+                    UNIQUE (organization_id, user_id, sub_location_id),
+                CONSTRAINT ck_clm_location_access_level
+                    CHECK (
+                        access_level IN (
+                            'viewer',
+                            'compliance_officer',
+                            'facility_manager',
+                            'facility_owner'
+                        )
+                    )
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS idx_clm_location_access_org_user "
+            "ON clm_user_location_access (organization_id, user_id)"
+        )
+    )
 
 
 async def _ensure_workspace_member_credentials_table(conn) -> None:

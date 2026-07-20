@@ -15,6 +15,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.tasks.ingestion",
+        "app.tasks.clm",
         "app.tasks.gap_resolution",
         "app.tasks.daily_update",
         "app.tasks.trial_emails",

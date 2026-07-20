@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import uuid
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -36,9 +37,12 @@ from app.db.models import (
     WorkspaceTaskStatus,
 )
 from app.services.clm_extraction import extract_clm_metadata
-from app.services.compliance_ai_integration import process_intelligence_compliance_update
 from app.services.compliance_gap_helpers import GapSourceContext, apply_gap_source_context
-from app.services.document_storage import content_type_for_extension, save_document_file
+from app.services.document_storage import (
+    content_type_for_extension,
+    read_document_file,
+    save_document_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +116,7 @@ async def upload_contract_document(
     *,
     sub_location_id: Optional[uuid.UUID] = None,
     vendor_id: Optional[uuid.UUID] = None,
+    process_immediately: bool = True,
 ) -> ClmContract:
     filename = file.filename or "contract.pdf"
     ext = _file_extension(filename)
@@ -197,10 +202,11 @@ async def upload_contract_document(
     await _queue_or_run_ingestion(db, document)
     await db.commit()
 
-    try:
-        await process_contract_after_upload(db, contract.id, org, user)
-    except Exception as exc:
-        logger.warning("clm_process_after_upload_failed: %s", exc)
+    if process_immediately:
+        try:
+            await process_contract_after_upload(db, contract.id, org, user)
+        except Exception as exc:
+            logger.warning("clm_process_after_upload_failed: %s", exc)
 
     await db.refresh(contract)
     return contract
@@ -225,17 +231,31 @@ async def process_contract_after_upload(
         return
 
     doc = contract.document
-    text = doc.content or ""
-    if not text and doc.storage_path:
-        text = doc.content or ""
+    text = (doc.content or "").strip() if doc else ""
+    if not text and doc and doc.storage_path:
+        try:
+            raw = read_document_file(doc.storage_path)
+            extraction = extract_text_from_upload(doc.title or "contract.txt", raw)
+            text = (extraction.text or "").strip()
+            if text:
+                doc.content = text
+        except Exception as exc:
+            logger.warning("clm_read_storage_failed contract=%s error=%s", contract_id, exc)
 
-    meta = await extract_clm_metadata(text, doc.title)
+    if not text:
+        logger.warning("clm_process_no_text contract=%s", contract_id)
+        contract.status = ClmContractStatus.PROCESSING.value
+        await db.commit()
+        return
 
-    if not contract.vendor_id and meta.get("vendor_name"):
+    meta = await extract_clm_metadata(text, doc.title if doc else contract.title)
+    vendor_name = (meta.get("vendor_name") or "").strip()
+
+    if vendor_name:
         vendor = await find_or_create_vendor(
             db,
             contract.organization_id,
-            meta["vendor_name"],
+            vendor_name,
             sub_location_id=contract.sub_location_id,
             source="auto",
         )
@@ -246,38 +266,70 @@ async def process_contract_after_upload(
     contract.renewal_clause = meta.get("renewal_clause")
     contract.risk_score = meta.get("risk_score")
     contract.ai_extraction = {
-        "vendor_name": meta.get("vendor_name"),
+        "vendor_name": vendor_name or None,
         "extracted_at": datetime.utcnow().isoformat(),
         "obligations_count": len(meta.get("obligations") or []),
     }
     contract.status = _contract_status_for_dates(contract.expiration_date)
 
-    if contract.vendor_id and contract.title == (doc.title.rsplit(".", 1)[0] if doc.title else ""):
+    if contract.vendor_id:
         vendor_row = await db.get(ClmVendor, contract.vendor_id)
-        if vendor_row:
+        filename_stem = doc.title.rsplit(".", 1)[0] if doc and doc.title else ""
+        if vendor_row and (
+            not contract.title
+            or contract.title == filename_stem
+            or re.match(r"^\d+[\s_-]", contract.title or "")
+            or (
+                contract.title.endswith(" Agreement")
+                and re.match(r"^\d+[\s_-]", contract.title or "")
+            )
+        ):
             contract.title = f"{vendor_row.name} Agreement"[:500]
 
-    await _create_obligations_and_gaps(db, contract, meta.get("obligations") or [], org)
+    existing_obligations = int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(ClmObligation)
+                .where(ClmObligation.contract_id == contract.id)
+            )
+        ).scalar_one()
+        or 0
+    )
+    if existing_obligations == 0:
+        await _create_obligations_and_gaps(
+            db, contract, meta.get("obligations") or [], org
+        )
     await _schedule_renewal_task(db, contract, user)
     await db.flush()
 
-    if text:
-        try:
-            await process_intelligence_compliance_update(
-                db,
-                org,
-                user_message=f"CLM contract uploaded: {contract.title}",
-                assistant_message=text[:8000],
-                source_type="document_analysis",
-                has_documents=True,
-                use_mock=settings.mock_chat_stream,
-                contract_id=contract.id,
-                contract_name=contract.title,
-            )
-        except Exception as exc:
-            logger.warning("clm_compliance_sync_skip: %s", exc)
-
+    # Document ingestion already runs compliance gap analysis. Avoid a second
+    # async compliance pass from the Celery worker (greenlet/session conflicts).
     await db.commit()
+
+
+async def reprocess_contract_metadata(
+    db: AsyncSession,
+    contract_id: uuid.UUID,
+    org: Organization,
+    user: User,
+) -> ClmContract:
+    """Re-run CLM metadata extraction for an existing contract."""
+    contract = await db.get(ClmContract, contract_id)
+    if contract:
+        contract.status = ClmContractStatus.PROCESSING.value
+        await db.flush()
+    await process_contract_after_upload(db, contract_id, org, user)
+    result = await db.execute(
+        select(ClmContract)
+        .where(ClmContract.id == contract_id)
+        .options(
+            selectinload(ClmContract.vendor),
+            selectinload(ClmContract.sub_location),
+        )
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one()
 
 
 async def _create_obligations_and_gaps(
@@ -398,17 +450,50 @@ def serialize_contract(contract: ClmContract, *, vendor_name: Optional[str] = No
     }
 
 
-async def get_clm_overview(db: AsyncSession, org_id: uuid.UUID) -> dict[str, Any]:
+async def get_clm_overview(
+    db: AsyncSession,
+    org_id: uuid.UUID,
+    accessible_location_ids: Optional[set[uuid.UUID]] = None,
+) -> dict[str, Any]:
+    contract_scope = [ClmContract.organization_id == org_id]
+    vendor_scope = [
+        ClmVendor.organization_id == org_id,
+        ClmVendor.is_active.is_(True),
+    ]
+    obligation_scope = [
+        ClmObligation.organization_id == org_id,
+        ClmObligation.status == "open",
+    ]
+    location_scope = [
+        ClmSubLocation.organization_id == org_id,
+        ClmSubLocation.is_active.is_(True),
+    ]
+    if accessible_location_ids is not None:
+        contract_scope.append(ClmContract.sub_location_id.in_(accessible_location_ids))
+        vendor_scope.append(ClmVendor.sub_location_id.in_(accessible_location_ids))
+        obligation_scope.append(
+            ClmObligation.contract_id.in_(
+                select(ClmContract.id).where(
+                    ClmContract.organization_id == org_id,
+                    ClmContract.sub_location_id.in_(accessible_location_ids),
+                )
+            )
+        )
+        location_scope.append(ClmSubLocation.id.in_(accessible_location_ids))
+
     contracts_total = int(
-        (await db.execute(select(func.count()).select_from(ClmContract).where(ClmContract.organization_id == org_id))).scalar()
+        (
+            await db.execute(
+                select(func.count()).select_from(ClmContract).where(*contract_scope)
+            )
+        ).scalar()
         or 0
     )
     vendors_active = int(
         (
             await db.execute(
                 select(func.count()).select_from(ClmVendor).where(
-                    ClmVendor.organization_id == org_id,
-                    ClmVendor.is_active.is_(True),
+                    *vendor_scope,
                 )
             )
         ).scalar()
@@ -418,7 +503,7 @@ async def get_clm_overview(db: AsyncSession, org_id: uuid.UUID) -> dict[str, Any
         (
             await db.execute(
                 select(func.count()).select_from(ClmContract).where(
-                    ClmContract.organization_id == org_id,
+                    *contract_scope,
                     ClmContract.status == ClmContractStatus.EXPIRING.value,
                 )
             )
@@ -429,8 +514,7 @@ async def get_clm_overview(db: AsyncSession, org_id: uuid.UUID) -> dict[str, Any
         (
             await db.execute(
                 select(func.count()).select_from(ClmObligation).where(
-                    ClmObligation.organization_id == org_id,
-                    ClmObligation.status == "open",
+                    *obligation_scope,
                 )
             )
         ).scalar()
@@ -440,8 +524,7 @@ async def get_clm_overview(db: AsyncSession, org_id: uuid.UUID) -> dict[str, Any
         (
             await db.execute(
                 select(func.count()).select_from(ClmSubLocation).where(
-                    ClmSubLocation.organization_id == org_id,
-                    ClmSubLocation.is_active.is_(True),
+                    *location_scope,
                 )
             )
         ).scalar()

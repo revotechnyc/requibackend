@@ -1389,6 +1389,51 @@ class ClmSubLocation(Base):
     )
 
 
+class ClmUserLocationAccess(Base):
+    """Location-scoped CLM access for an organization member."""
+    __tablename__ = "clm_user_location_access"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "user_id",
+            "sub_location_id",
+            name="uq_clm_user_location_access",
+        ),
+        Index("idx_clm_location_access_org_user", "organization_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("organizations.id"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=False
+    )
+    sub_location_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("clm_sub_locations.id"), nullable=False
+    )
+    access_level: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="viewer"
+    )
+    granted_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    organization: Mapped["Organization"] = relationship("Organization")
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    sub_location: Mapped["ClmSubLocation"] = relationship("ClmSubLocation")
+    granted_by: Mapped[Optional["User"]] = relationship(
+        "User", foreign_keys=[granted_by_id]
+    )
+
+
 class ClmVendor(Base):
     """Vendor registry — manual or auto-created from contract upload."""
     __tablename__ = "clm_vendors"
