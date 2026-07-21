@@ -94,13 +94,16 @@ async def find_or_create_vendor(
         clean = "Unknown Vendor"
     email = (contact_email or "").strip()[:255] or None
     existing = await db.execute(
-        select(ClmVendor).where(
+        select(ClmVendor)
+        .where(
             ClmVendor.organization_id == org_id,
             ClmVendor.is_active.is_(True),
             func.lower(ClmVendor.name) == clean.lower(),
         )
+        .order_by(ClmVendor.created_at.asc())
     )
-    vendor = existing.scalar_one_or_none()
+    # Prefer oldest match — parallel Celery + BackgroundTasks can race-create duplicates.
+    vendor = existing.scalars().first()
     if vendor:
         if email and not vendor.contact_email:
             vendor.contact_email = email

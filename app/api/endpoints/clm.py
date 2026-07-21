@@ -128,14 +128,13 @@ async def _queue_or_process_contract(
     *,
     celery_ready: Optional[bool] = None,
 ) -> None:
-    """Queue CLM extraction. Prefer Celery when available, always keep a
-    FastAPI BackgroundTasks fallback so contracts do not stay stuck on
-    Processing if the worker is down or the broker drop the message.
+    """Queue CLM extraction via Celery when available; otherwise FastAPI
+    BackgroundTasks. Do not enqueue both — parallel runs race on vendor
+    create and can leave contracts stuck in Processing.
     """
     from app.tasks.clm import process_clm_contract_background
 
     ready = celery_is_ready() if celery_ready is None else celery_ready
-    queued_celery = False
     if ready:
         try:
             from app.tasks.clm import process_clm_contract_task
@@ -145,26 +144,16 @@ async def _queue_or_process_contract(
                 str(context.organization.id),
                 str(context.user.id),
             )
-            queued_celery = True
+            return
         except Exception:
-            queued_celery = False
+            pass
 
-    # Reliable in-process fallback (idempotent via extracted_at check).
-    if not queued_celery:
-        background_tasks.add_task(
-            process_clm_contract_background,
-            str(contract.id),
-            str(context.organization.id),
-            str(context.user.id),
-        )
-    else:
-        # Safety net: if Celery never picks the task up, API process still runs it.
-        background_tasks.add_task(
-            process_clm_contract_background,
-            str(contract.id),
-            str(context.organization.id),
-            str(context.user.id),
-        )
+    background_tasks.add_task(
+        process_clm_contract_background,
+        str(contract.id),
+        str(context.organization.id),
+        str(context.user.id),
+    )
 
 
 async def _parse_location_and_vendor(
