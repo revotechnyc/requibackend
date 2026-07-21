@@ -19,6 +19,7 @@ CLM_EXTRACTION_PROMPT = """You are a healthcare contract analyst. Extract struct
 OUTPUT JSON ONLY:
 {
   "vendor_name": "string — counterparty / vendor legal or trade name (NOT the filename)",
+  "contact_email": "vendor contact email if stated, else null",
   "effective_date": "YYYY-MM-DD or null",
   "expiration_date": "YYYY-MM-DD or null",
   "renewal_clause": "short summary of renewal/termination terms or null",
@@ -37,6 +38,7 @@ OUTPUT JSON ONLY:
 Rules:
 - vendor_name must be the counterparty legal/trade name, never a file stem like "01_MedSupply_BAA"
 - Prefer explicit labels such as "Vendor", "Business Associate", "Parties", "Vendor Name"
+- contact_email only when an explicit vendor/counterparty email appears
 - Use null when dates are not explicit
 - Max 10 obligations; only explicit contractual duties
 - No markdown outside JSON
@@ -115,6 +117,16 @@ def _heuristic_extract(text: str, filename: str) -> dict[str, Any]:
     if renewal_match:
         renewal = re.sub(r"\s+", " ", renewal_match.group(1)).strip()[:4000]
 
+    contact_email = None
+    for pattern in (
+        r"(?im)^\s*Contact\s*Email\s*[:\-]\s*([^\s<>]+@[^\s<>]+)",
+        r"(?im)^\s*(?:Vendor|Counterparty)?\s*Email\s*[:\-]\s*([^\s<>]+@[^\s<>]+)",
+    ):
+        match = re.search(pattern, body)
+        if match:
+            contact_email = match.group(1).strip().rstrip(".,;)")[:255]
+            break
+
     obligations: list[dict[str, Any]] = []
     for match in re.finditer(
         r"(?im)^\s*(?:\d+(?:\.\d+)*\.?|[A-Z]\.|[-*•])\s+(.+)$",
@@ -163,6 +175,7 @@ def _heuristic_extract(text: str, filename: str) -> dict[str, Any]:
 
     return {
         "vendor_name": vendor[:255],
+        "contact_email": contact_email,
         "effective_date": effective,
         "expiration_date": expiration,
         "renewal_clause": renewal,
@@ -235,8 +248,15 @@ async def extract_clm_metadata(document_text: str, filename: str) -> dict[str, A
     except (TypeError, ValueError):
         risk_score = fallback["risk_score"]
 
+    contact_email = str(data.get("contact_email") or "").strip() or None
+    if contact_email and "@" not in contact_email:
+        contact_email = None
+    if not contact_email:
+        contact_email = fallback.get("contact_email")
+
     return {
         "vendor_name": vendor_name[:255],
+        "contact_email": (contact_email[:255] if contact_email else None),
         "effective_date": _parse_date(data.get("effective_date"))
         or fallback["effective_date"],
         "expiration_date": _parse_date(data.get("expiration_date"))

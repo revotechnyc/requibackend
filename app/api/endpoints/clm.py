@@ -25,7 +25,6 @@ from sqlalchemy.orm import selectinload
 from starlette.datastructures import Headers
 
 from app.api.endpoints.sources import (
-    ALLOWED_UPLOAD_EXTENSIONS,
     _file_extension,
     _max_upload_bytes,
 )
@@ -47,6 +46,7 @@ from app.services.clm_access import (
     require_location_access,
 )
 from app.services.clm_service import (
+    CLM_ALLOWED_UPLOAD_EXTENSIONS,
     find_or_create_vendor,
     get_clm_overview,
     reprocess_contract_metadata,
@@ -128,7 +128,14 @@ async def _queue_or_process_contract(
     *,
     celery_ready: Optional[bool] = None,
 ) -> None:
+    """Queue CLM extraction. Prefer Celery when available, always keep a
+    FastAPI BackgroundTasks fallback so contracts do not stay stuck on
+    Processing if the worker is down or the broker drop the message.
+    """
+    from app.tasks.clm import process_clm_contract_background
+
     ready = celery_is_ready() if celery_ready is None else celery_ready
+    queued_celery = False
     if ready:
         try:
             from app.tasks.clm import process_clm_contract_task
@@ -138,17 +145,26 @@ async def _queue_or_process_contract(
                 str(context.organization.id),
                 str(context.user.id),
             )
-            return
+            queued_celery = True
         except Exception:
-            pass
-    from app.tasks.clm import process_clm_contract_background
+            queued_celery = False
 
-    background_tasks.add_task(
-        process_clm_contract_background,
-        str(contract.id),
-        str(context.organization.id),
-        str(context.user.id),
-    )
+    # Reliable in-process fallback (idempotent via extracted_at check).
+    if not queued_celery:
+        background_tasks.add_task(
+            process_clm_contract_background,
+            str(contract.id),
+            str(context.organization.id),
+            str(context.user.id),
+        )
+    else:
+        # Safety net: if Celery never picks the task up, API process still runs it.
+        background_tasks.add_task(
+            process_clm_contract_background,
+            str(contract.id),
+            str(context.organization.id),
+            str(context.user.id),
+        )
 
 
 async def _parse_location_and_vendor(
@@ -219,7 +235,7 @@ def _safe_archive_members(raw: bytes) -> list[tuple[str, bytes]]:
                     detail=f"Unsafe ZIP entry: {item.filename}",
                 )
             ext = _file_extension(parts[-1])
-            if f".{ext}" not in ALLOWED_UPLOAD_EXTENSIONS:
+            if f".{ext}" not in CLM_ALLOWED_UPLOAD_EXTENSIONS:
                 continue
             if item.file_size > _max_upload_bytes():
                 raise HTTPException(
@@ -251,7 +267,22 @@ async def clm_overview(
         if context.location_permissions is None
         else set(context.location_permissions)
     )
-    return await get_clm_overview(db, context.organization.id, accessible)
+    payload = await get_clm_overview(db, context.organization.id, accessible)
+    can_write_any = False
+    if context.can_create:
+        if context.has_org_wide_access:
+            can_write_any = True
+        else:
+            can_write_any = any(
+                context.can_write_location(loc_id)
+                for loc_id in (context.location_permissions or {})
+            )
+    payload["permissions"] = {
+        "can_write": can_write_any,
+        "can_manage_access": context.can_manage_access,
+        "has_org_wide_access": context.has_org_wide_access,
+    }
+    return payload
 
 
 @router.get("/sub-locations")

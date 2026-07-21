@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 
 RENEWAL_LEAD_DAYS = 90
 
+# CLM contracts are legal agreements — markdown notes are not accepted.
+CLM_ALLOWED_UPLOAD_EXTENSIONS = frozenset(
+    ext for ext in ALLOWED_UPLOAD_EXTENSIONS if ext != ".md"
+)
+
 
 def _contract_status_for_dates(expiration: Optional[date]) -> str:
     if not expiration:
@@ -82,10 +87,12 @@ async def find_or_create_vendor(
     *,
     sub_location_id: Optional[uuid.UUID] = None,
     source: str = "auto",
+    contact_email: Optional[str] = None,
 ) -> ClmVendor:
     clean = name.strip()
     if not clean:
         clean = "Unknown Vendor"
+    email = (contact_email or "").strip()[:255] or None
     existing = await db.execute(
         select(ClmVendor).where(
             ClmVendor.organization_id == org_id,
@@ -95,11 +102,14 @@ async def find_or_create_vendor(
     )
     vendor = existing.scalar_one_or_none()
     if vendor:
+        if email and not vendor.contact_email:
+            vendor.contact_email = email
         return vendor
     vendor = ClmVendor(
         organization_id=org_id,
         sub_location_id=sub_location_id,
         name=clean[:255],
+        contact_email=email,
         source=source,
         is_active=True,
     )
@@ -120,10 +130,13 @@ async def upload_contract_document(
 ) -> ClmContract:
     filename = file.filename or "contract.pdf"
     ext = _file_extension(filename)
-    if f".{ext}" not in ALLOWED_UPLOAD_EXTENSIONS and ext:
+    if f".{ext}" not in CLM_ALLOWED_UPLOAD_EXTENSIONS and ext:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File type not allowed. Supported: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}",
+            detail=(
+                f"File type not allowed for CLM. Supported: "
+                f"{', '.join(sorted(CLM_ALLOWED_UPLOAD_EXTENSIONS))}"
+            ),
         )
 
     raw = await file.read()
@@ -230,6 +243,14 @@ async def process_contract_after_upload(
     if not contract:
         return
 
+    # Idempotent: skip if another worker already finished extraction.
+    if (
+        isinstance(contract.ai_extraction, dict)
+        and contract.ai_extraction.get("extracted_at")
+        and contract.status != ClmContractStatus.PROCESSING.value
+    ):
+        return
+
     doc = contract.document
     text = (doc.content or "").strip() if doc else ""
     if not text and doc and doc.storage_path:
@@ -244,12 +265,18 @@ async def process_contract_after_upload(
 
     if not text:
         logger.warning("clm_process_no_text contract=%s", contract_id)
-        contract.status = ClmContractStatus.PROCESSING.value
+        # Keep processing only briefly; leave a marker so UI can show stuck state.
+        contract.ai_extraction = {
+            **(contract.ai_extraction or {}),
+            "error": "no_document_text",
+            "attempted_at": datetime.utcnow().isoformat(),
+        }
         await db.commit()
         return
 
     meta = await extract_clm_metadata(text, doc.title if doc else contract.title)
     vendor_name = (meta.get("vendor_name") or "").strip()
+    contact_email = (meta.get("contact_email") or None)
 
     if vendor_name:
         vendor = await find_or_create_vendor(
@@ -258,6 +285,7 @@ async def process_contract_after_upload(
             vendor_name,
             sub_location_id=contract.sub_location_id,
             source="auto",
+            contact_email=contact_email,
         )
         contract.vendor_id = vendor.id
 
@@ -267,6 +295,7 @@ async def process_contract_after_upload(
     contract.risk_score = meta.get("risk_score")
     contract.ai_extraction = {
         "vendor_name": vendor_name or None,
+        "contact_email": contact_email,
         "extracted_at": datetime.utcnow().isoformat(),
         "obligations_count": len(meta.get("obligations") or []),
     }
@@ -463,6 +492,12 @@ async def get_clm_overview(
     obligation_scope = [
         ClmObligation.organization_id == org_id,
         ClmObligation.status == "open",
+        ClmObligation.contract_id.in_(
+            select(ClmContract.id).where(
+                ClmContract.organization_id == org_id,
+                ClmContract.status != ClmContractStatus.ARCHIVED.value,
+            )
+        ),
     ]
     location_scope = [
         ClmSubLocation.organization_id == org_id,
@@ -471,14 +506,18 @@ async def get_clm_overview(
     if accessible_location_ids is not None:
         contract_scope.append(ClmContract.sub_location_id.in_(accessible_location_ids))
         vendor_scope.append(ClmVendor.sub_location_id.in_(accessible_location_ids))
-        obligation_scope.append(
+        # Replace the open-obligation contract filter with a scoped + non-archived set.
+        obligation_scope = [
+            ClmObligation.organization_id == org_id,
+            ClmObligation.status == "open",
             ClmObligation.contract_id.in_(
                 select(ClmContract.id).where(
                     ClmContract.organization_id == org_id,
                     ClmContract.sub_location_id.in_(accessible_location_ids),
+                    ClmContract.status != ClmContractStatus.ARCHIVED.value,
                 )
-            )
-        )
+            ),
+        ]
         location_scope.append(ClmSubLocation.id.in_(accessible_location_ids))
 
     contracts_total = int(

@@ -27,6 +27,12 @@ async def process_clm_contract_background(
             return {"status": "not_found", "contract_id": contract_id}
         if contract.organization_id != organization.id:
             return {"status": "invalid_scope", "contract_id": contract_id}
+        if (
+            isinstance(contract.ai_extraction, dict)
+            and contract.ai_extraction.get("extracted_at")
+            and contract.status != "processing"
+        ):
+            return {"status": "already_processed", "contract_id": contract_id}
         await process_contract_after_upload(db, contract.id, organization, user)
         return {"status": "processed", "contract_id": contract_id}
 
