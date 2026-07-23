@@ -521,3 +521,71 @@ async def send_trial_two_days_left_email(
     except Exception:
         logger.exception("Trial reminder email error for %s", to_email)
         return False
+
+
+CANCELLATION_REQUEST_INBOX = "team@requi.io"
+
+
+async def send_cancellation_request_email(
+    *,
+    requester_email: str,
+    requester_name: str,
+    organization_id: str,
+    organization_name: str,
+    plan_label: str,
+    subscription_status: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    stripe_subscription_id: Optional[str] = None,
+    period_end: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    """Notify billing team of a user cancellation request. Does not cancel Stripe."""
+    inbox = (
+        (settings.billing_cancellation_request_email or "").strip()
+        or CANCELLATION_REQUEST_INBOX
+    )
+    subject = f"Cancellation request — {organization_name}"
+    title = "Subscription cancellation request"
+    reason_block = (reason or "").strip() or "No reason provided."
+    message = (
+        f"<p>A user requested to cancel their subscription. "
+        f"<strong>Do not auto-cancel</strong> — review and process manually.</p>"
+        f"<ul>"
+        f"<li><strong>Organization:</strong> {organization_name} ({organization_id})</li>"
+        f"<li><strong>Requester:</strong> {requester_name} &lt;{requester_email}&gt;</li>"
+        f"<li><strong>Plan:</strong> {plan_label}</li>"
+        f"<li><strong>Status:</strong> {subscription_status or '—'}</li>"
+        f"<li><strong>Subscription ID:</strong> {subscription_id or '—'}</li>"
+        f"<li><strong>Stripe subscription:</strong> {stripe_subscription_id or '—'}</li>"
+        f"<li><strong>Current period end:</strong> {period_end or '—'}</li>"
+        f"<li><strong>Reason:</strong> {reason_block}</li>"
+        f"</ul>"
+    )
+    try:
+        service = get_email_service()
+        ok = await service.send(
+            to_email=inbox,
+            subject=subject,
+            title=title,
+            message=message,
+            badge="Cancellation request",
+        )
+        if ok:
+            logger.info(
+                "Cancellation request emailed to %s for org=%s by=%s",
+                inbox,
+                organization_id,
+                requester_email,
+            )
+        else:
+            logger.warning(
+                "Cancellation request email failed for org=%s",
+                organization_id,
+            )
+        return ok
+    except Exception:
+        logger.exception(
+            "Cancellation request email error for org=%s",
+            organization_id,
+        )
+        return False

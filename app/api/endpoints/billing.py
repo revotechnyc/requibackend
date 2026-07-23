@@ -390,17 +390,119 @@ async def create_portal_session(
     current_user: User = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create Stripe customer portal session"""
+    """Create Stripe customer portal session (update card / billing info)."""
+    org, _seat = await _require_billing_org(organization_id, current_user, db)
+    # Ensure owner is loaded for stripe_customer_id
     result = await db.execute(
-        select(Organization).where(Organization.id == organization_id)
+        select(Organization)
+        .options(selectinload(Organization.owner))
+        .where(Organization.id == org.id)
     )
-    org = result.scalar_one_or_none()
-    
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
-    
+    org = result.scalar_one()
     session = await BillingService.get_portal_session(org, return_url)
     return session
+
+
+@router.get("/summary")
+async def get_billing_summary(
+    organization_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Current subscription snapshot for the Billing settings module."""
+    org, _seat = await _require_billing_org(organization_id, current_user, db)
+    result = await db.execute(
+        select(Organization)
+        .options(
+            selectinload(Organization.owner),
+            selectinload(Organization.subscription),
+        )
+        .where(Organization.id == org.id)
+    )
+    org = result.scalar_one()
+    return await BillingService.get_billing_summary(org)
+
+
+@router.get("/invoices")
+async def list_billing_invoices(
+    organization_id: str,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Billing history (Stripe invoices / payments)."""
+    org, _seat = await _require_billing_org(organization_id, current_user, db)
+    result = await db.execute(
+        select(Organization)
+        .options(selectinload(Organization.owner))
+        .where(Organization.id == org.id)
+    )
+    org = result.scalar_one()
+    invoices = await BillingService.list_invoices(org)
+    return {"invoices": invoices}
+
+
+class CancelRequestBody(BaseModel):
+    reason: Optional[str] = None
+
+
+@router.post("/cancel-request")
+async def request_subscription_cancellation(
+    organization_id: str,
+    data: CancelRequestBody = CancelRequestBody(),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Cancellation workflow: confirm in UI, then email the configured billing inbox
+    (BILLING_CANCELLATION_REQUEST_EMAIL) for review. Does NOT cancel Stripe.
+    """
+    from app.services.email_service import send_cancellation_request_email
+
+    org, _seat = await _require_billing_org(organization_id, current_user, db)
+    result = await db.execute(
+        select(Organization)
+        .options(selectinload(Organization.subscription))
+        .where(Organization.id == org.id)
+    )
+    org = result.scalar_one()
+    sub = org.subscription
+    if not sub:
+        raise HTTPException(status_code=400, detail="No subscription found")
+
+    plan_label = BillingService._plan_display_label(sub.plan_type)
+    requester_name = (
+        f"{(current_user.first_name or '').strip()} {(current_user.last_name or '').strip()}".strip()
+        or current_user.email
+    )
+    inbox = (settings.billing_cancellation_request_email or "").strip() or "team@requi.io"
+    ok = await send_cancellation_request_email(
+        requester_email=current_user.email,
+        requester_name=requester_name,
+        organization_id=str(org.id),
+        organization_name=org.name,
+        plan_label=plan_label,
+        subscription_status=sub.status.value if sub.status else None,
+        subscription_id=str(sub.id),
+        stripe_subscription_id=sub.stripe_subscription_id,
+        period_end=sub.current_period_end.isoformat() if sub.current_period_end else None,
+        reason=(data.reason or "").strip()[:2000] or None,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Could not send cancellation request. "
+                f"Please try again or email {inbox}."
+            ),
+        )
+    return {
+        "ok": True,
+        "message": (
+            "Your cancellation request was sent to our team. "
+            "Your subscription stays active until we process your request."
+        ),
+        "notified_email": inbox,
+    }
 
 
 @public_router.post("/webhook")

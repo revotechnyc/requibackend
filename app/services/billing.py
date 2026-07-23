@@ -25,6 +25,12 @@ class BillingService:
     """Stripe billing service"""
 
     ENTERPRISE_BASE_SEAT_COUNT = 1
+
+    PLAN_RANK = {
+        PlanType.STANDARD: 1,
+        PlanType.PRO: 2,
+        PlanType.ENTERPRISE: 3,
+    }
     
     PLAN_PRICE_MAP = {
         PlanType.STANDARD: settings.stripe_price_standard,
@@ -209,6 +215,7 @@ class BillingService:
         
         # Handle plan change
         if new_plan_type and new_plan_type != subscription.plan_type:
+            BillingService._reject_plan_downgrade(subscription.plan_type, new_plan_type)
             new_price_id = BillingService.PLAN_PRICE_MAP.get(new_plan_type)
             if not new_price_id:
                 raise HTTPException(
@@ -1002,20 +1009,125 @@ class BillingService:
         return labels.get(plan_type, plan_type.value.title())
 
     @staticmethod
-    def _get_default_card_last4(customer_id: Optional[str]) -> Optional[str]:
+    def _reject_plan_downgrade(current: PlanType, new_plan: PlanType) -> None:
+        """In-app downgrades are not supported — cancel then re-subscribe instead."""
+        current_rank = BillingService.PLAN_RANK.get(current, 0)
+        new_rank = BillingService.PLAN_RANK.get(new_plan, 0)
+        if new_rank < current_rank:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Downgrading from {BillingService._plan_display_label(current)} to "
+                    f"{BillingService._plan_display_label(new_plan)} is not supported in-app. "
+                    "Request cancellation from Settings → Billing, then subscribe to the "
+                    "smaller plan after your current billing period ends."
+                ),
+            )
+
+    @staticmethod
+    def _card_last4_from_payment_method(pm) -> Optional[str]:
+        if not pm:
+            return None
+        if isinstance(pm, str):
+            try:
+                pm = stripe.PaymentMethod.retrieve(pm)
+            except stripe.error.StripeError:
+                return None
+        if isinstance(pm, dict) or hasattr(pm, "get"):
+            card = pm.get("card") if hasattr(pm, "get") else None
+            if card:
+                return card.get("last4")
+        return None
+
+    @staticmethod
+    def _get_default_card_last4(
+        customer_id: Optional[str],
+        *,
+        stripe_subscription_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Resolve card last4 for display.
+
+        Checkout often attaches the card to the subscription (or as a customer
+        PaymentMethod) without setting invoice_settings.default_payment_method,
+        so we fall back through several Stripe sources.
+        """
         if not customer_id or customer_id.startswith("local"):
             return None
+
+        # 1) Customer default payment method
         try:
             customer = stripe.Customer.retrieve(
                 customer_id,
                 expand=["invoice_settings.default_payment_method"],
             )
-            pm = customer.get("invoice_settings", {}).get("default_payment_method")
-            if isinstance(pm, dict):
-                card = pm.get("card") or {}
-                return card.get("last4")
+            pm = (customer.get("invoice_settings") or {}).get("default_payment_method")
+            last4 = BillingService._card_last4_from_payment_method(pm)
+            if last4:
+                return last4
+            # Legacy default_source (card_/src_)
+            default_source = customer.get("default_source")
+            if default_source:
+                if isinstance(default_source, str) and default_source.startswith("card_"):
+                    try:
+                        card = stripe.Customer.retrieve_source(customer_id, default_source)
+                        return card.get("last4")
+                    except stripe.error.StripeError:
+                        pass
+                elif isinstance(default_source, dict):
+                    return default_source.get("last4")
         except stripe.error.StripeError:
-            return None
+            pass
+
+        # 2) Subscription default payment method (common after Checkout)
+        sub_id = stripe_subscription_id
+        if sub_id and str(sub_id).startswith("sub_"):
+            try:
+                sub = stripe.Subscription.retrieve(
+                    sub_id,
+                    expand=["default_payment_method"],
+                )
+                last4 = BillingService._card_last4_from_payment_method(
+                    sub.get("default_payment_method")
+                )
+                if last4:
+                    return last4
+            except stripe.error.StripeError:
+                pass
+
+        # 3) Any card PaymentMethod attached to the customer
+        try:
+            methods = stripe.PaymentMethod.list(customer=customer_id, type="card", limit=5)
+            for pm in methods.data:
+                last4 = BillingService._card_last4_from_payment_method(pm)
+                if last4:
+                    return last4
+        except stripe.error.StripeError:
+            pass
+
+        # 4) Latest paid invoice's payment method
+        try:
+            invoices = stripe.Invoice.list(customer=customer_id, status="paid", limit=1)
+            if invoices.data:
+                inv = invoices.data[0]
+                pm_id = inv.get("default_payment_method") or inv.get("payment_intent")
+                if isinstance(pm_id, str) and pm_id.startswith("pm_"):
+                    last4 = BillingService._card_last4_from_payment_method(pm_id)
+                    if last4:
+                        return last4
+                # Expand charge → payment_method_details
+                charge_id = inv.get("charge")
+                if charge_id:
+                    try:
+                        charge = stripe.Charge.retrieve(charge_id)
+                        details = (charge.get("payment_method_details") or {}).get("card") or {}
+                        if details.get("last4"):
+                            return details.get("last4")
+                    except stripe.error.StripeError:
+                        pass
+        except stripe.error.StripeError:
+            pass
+
         return None
 
     @staticmethod
@@ -1195,6 +1307,8 @@ class BillingService:
                 detail=f"You are already on the {new_plan_type.value} plan",
             )
 
+        BillingService._reject_plan_downgrade(subscription.plan_type, new_plan_type)
+
         stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
         modify_items = BillingService._build_plan_change_modify_items(
             stripe_sub, new_plan_type, seat_quantity
@@ -1339,6 +1453,8 @@ class BillingService:
 
         if new_plan_type == subscription.plan_type:
             return subscription, 0
+
+        BillingService._reject_plan_downgrade(subscription.plan_type, new_plan_type)
 
         proration_ts = proration_date or int(datetime.now(tz=timezone.utc).timestamp())
 
@@ -1485,3 +1601,113 @@ class BillingService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to create portal session: {str(e)}"
             )
+
+    @staticmethod
+    async def get_billing_summary(organization: Organization) -> dict:
+        """Org billing snapshot for the Settings Billing module."""
+        sub = organization.subscription
+        owner = organization.owner
+        customer_id = getattr(owner, "stripe_customer_id", None) if owner else None
+        plan_type = sub.plan_type if sub else PlanType.STANDARD
+        status_value = sub.status.value if sub and sub.status else None
+        period_end = sub.current_period_end if sub else None
+        period_start = sub.current_period_start if sub else None
+        is_trial = bool(
+            sub
+            and sub.status == SubscriptionStatus.TRIALING
+            and (not sub.trial_end or sub.trial_end >= datetime.utcnow())
+        )
+
+        price_map = {
+            PlanType.STANDARD: settings.standard_plan_price,
+            PlanType.PRO: settings.pro_plan_price,
+            PlanType.ENTERPRISE: settings.enterprise_plan_price,
+        }
+        price_cents = int(price_map.get(plan_type, 0) or 0)
+
+        return {
+            "organization_id": str(organization.id),
+            "organization_name": organization.name,
+            "plan": plan_type.value if hasattr(plan_type, "value") else str(plan_type),
+            "plan_label": BillingService._plan_display_label(plan_type),
+            "status": status_value,
+            "seats": int(sub.seat_quantity) if sub and sub.seat_quantity else 1,
+            "is_trial_active": is_trial,
+            "trial_end": sub.trial_end.isoformat() if sub and sub.trial_end else None,
+            "current_period_start": period_start.isoformat() if period_start else None,
+            "current_period_end": period_end.isoformat() if period_end else None,
+            "next_payment_due": (
+                None
+                if is_trial or (sub and sub.cancel_at_period_end)
+                else (period_end.isoformat() if period_end else None)
+            ),
+            "cancel_at_period_end": bool(sub.cancel_at_period_end) if sub else False,
+            "subscription_id": str(sub.id) if sub else None,
+            "has_stripe_subscription": bool(
+                sub
+                and sub.stripe_subscription_id
+                and str(sub.stripe_subscription_id).startswith("sub_")
+            ),
+            "has_stripe_customer": bool(
+                customer_id and not str(customer_id).startswith("local")
+            ),
+            "card_last4": BillingService._get_default_card_last4(
+                customer_id,
+                stripe_subscription_id=(
+                    sub.stripe_subscription_id if sub else None
+                ),
+            ),
+            "price_cents": price_cents,
+            "price_display": BillingService._format_usd_cents(price_cents) + "/month",
+        }
+
+    @staticmethod
+    async def list_invoices(organization: Organization, *, limit: int = 24) -> list[dict]:
+        """List recent Stripe invoices for the org owner customer."""
+        owner = organization.owner
+        customer_id = getattr(owner, "stripe_customer_id", None) if owner else None
+        if not customer_id or str(customer_id).startswith("local"):
+            return []
+
+        try:
+            invoices = stripe.Invoice.list(customer=customer_id, limit=min(limit, 50))
+        except stripe.error.StripeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Failed to load invoices: {str(e)}",
+            )
+
+        rows: list[dict] = []
+        for inv in invoices.data:
+            created = inv.get("created")
+            period_end = inv.get("period_end")
+            rows.append(
+                {
+                    "id": inv.get("id"),
+                    "number": inv.get("number"),
+                    "status": inv.get("status"),
+                    "amount_due_cents": int(inv.get("amount_due") or 0),
+                    "amount_paid_cents": int(inv.get("amount_paid") or 0),
+                    "amount_due_formatted": BillingService._format_usd_cents(
+                        int(inv.get("amount_due") or 0)
+                    ),
+                    "amount_paid_formatted": BillingService._format_usd_cents(
+                        int(inv.get("amount_paid") or 0)
+                    ),
+                    "currency": (inv.get("currency") or "usd").upper(),
+                    "created_at": (
+                        datetime.utcfromtimestamp(created).isoformat() + "Z"
+                        if created
+                        else None
+                    ),
+                    "period_end": (
+                        datetime.utcfromtimestamp(period_end).isoformat() + "Z"
+                        if period_end
+                        else None
+                    ),
+                    "hosted_invoice_url": inv.get("hosted_invoice_url"),
+                    "invoice_pdf": inv.get("invoice_pdf"),
+                }
+            )
+        return rows
+

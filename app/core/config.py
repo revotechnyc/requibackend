@@ -284,6 +284,9 @@ class Settings(BaseSettings):
     smtp_from_email: Optional[str] = None
     smtp_sender_name: str = "Requi Health"
 
+    # Billing: inbox for subscription cancellation requests (Settings → Billing)
+    billing_cancellation_request_email: str = "team@requi.io"
+
     # CORS — comma-separated origins, or set CORS_ORIGINS=* / CORS_ALLOW_ALL=true for any frontend
     cors_origins: str = ""
     cors_allow_all: bool = False
