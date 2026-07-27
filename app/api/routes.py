@@ -33,6 +33,7 @@ from app.api.endpoints import (
     calendar,
     compliance,
     clm,
+    analytics,
     teams,
     users,
     viewers,
@@ -174,6 +175,10 @@ api_router.include_router(
 
 api_router.include_router(
     clm.router, prefix="/clm", tags=["v2.1 — CLM"], dependencies=auth_dep,
+)
+
+api_router.include_router(
+    analytics.router, prefix="/analytics", tags=["v2.1 — Analytics"], dependencies=auth_dep,
 )
 
 # View-Only User Management API
