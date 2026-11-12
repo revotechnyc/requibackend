@@ -414,6 +414,11 @@ def _serialize_task(
     }
 
 
+def _is_task_worker_role(user_role: UserRole) -> bool:
+    """Roles that create/update tasks and act as assignees (incl. Requi Flow)."""
+    return user_role in (UserRole.CONTRIBUTOR, UserRole.SEO, UserRole.PROJECT)
+
+
 def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRole) -> bool:
     """Start work, submit for review, resume after rejection — assigned user or admin."""
     if is_workspace_admin(user_role):
@@ -422,7 +427,7 @@ def _can_user_act_as_assignee(task: WorkspaceTask, user: User, user_role: UserRo
         return True
     # Legacy Pro tasks without explicit assignee — creator may complete
     if task.assignee_id is None and task.creator_id == user.id:
-        return user_role in (UserRole.CONTRIBUTOR, UserRole.SEO)
+        return _is_task_worker_role(user_role)
     return False
 
 
@@ -532,7 +537,7 @@ def _workflow_notice(
                 "The assignee has not started this task yet. "
                 "Approval will be available after the task is submitted and reviewed."
             )
-        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        if _is_task_worker_role(user_role):
             return "Only the assigned contributor/SEO or an admin can start this task."
         if user_role == UserRole.VIEWER:
             return "This task has not been started yet."
@@ -550,7 +555,7 @@ def _workflow_notice(
                 "This task is in progress. It must be submitted for review and "
                 "reviewed before you can approve it."
             )
-        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        if _is_task_worker_role(user_role):
             return "Only the assignee or an admin can submit this task for review."
         if user_role == UserRole.VIEWER:
             return f"This task is in progress. {assignee_name} is working on it."
@@ -558,7 +563,7 @@ def _workflow_notice(
     if status == TaskStatus.SUBMITTED_FOR_REVIEW:
         if workflow["can_complete_review"] or workflow["can_reject_at_review"]:
             return None
-        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO) and _can_user_act_as_assignee(
+        if _is_task_worker_role(user_role) and _can_user_act_as_assignee(
             task, user, user_role
         ):
             return f"Your submission is awaiting review by {reviewer_name}."
@@ -583,7 +588,7 @@ def _workflow_notice(
             return (
                 f"Review is complete. This task is awaiting final approval by {approver_name}."
             )
-        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        if _is_task_worker_role(user_role):
             return (
                 f"Your task has been reviewed and is pending final approval by {approver_name}."
             )
@@ -606,7 +611,7 @@ def _workflow_notice(
             return f"This task was rejected and returned to {assignee_name} for revision."
         if user_role == UserRole.APPROVER:
             return f"This task was rejected and returned to {assignee_name} for revision."
-        if user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        if _is_task_worker_role(user_role):
             return "Only the assignee or an admin can resume work on this rejected task."
 
     if status == TaskStatus.COMPLETED:
@@ -696,7 +701,7 @@ async def create_task(
         # Pro: single-owner — admin (or creator) is assignee by default
         if is_workspace_admin(user_role):
             assignee_id = current_user.id
-        elif user_role in (UserRole.CONTRIBUTOR, UserRole.SEO):
+        elif _is_task_worker_role(user_role):
             assignee_id = current_user.id
 
     resolved_doc_ids, document_id = await _resolve_org_documents(
@@ -863,11 +868,10 @@ async def get_task(
     return {
         "task": _serialize_task(task, org, documents=docs_map.get(str(task.id), [])),
         "permissions": {
-            "can_edit": user_role in (
-                UserRole.ENTERPRISE_ADMIN,
-                UserRole.ADMIN,
-                UserRole.CONTRIBUTOR,
-            ) and (is_workspace_admin(user_role) or is_owner),
+            "can_edit": (
+                is_workspace_admin(user_role)
+                or (_is_task_worker_role(user_role) and is_owner)
+            ),
             "can_review": _can_user_review(task, current_user, user_role),
             "can_approve": _can_user_approve(task, current_user, user_role),
             "can_delete": is_workspace_admin(user_role),
@@ -1142,7 +1146,7 @@ async def update_task(
     task = await _get_task_for_org(task_id, org.id, db)
 
     is_owner = task.creator_id == current_user.id
-    if user_role == UserRole.CONTRIBUTOR and not is_owner:
+    if _is_task_worker_role(user_role) and not is_owner and not is_workspace_admin(user_role):
         raise HTTPException(status_code=403, detail="Can only edit your own tasks")
     if user_role in (UserRole.VIEWER, UserRole.REVIEWER, UserRole.APPROVER):
         raise HTTPException(status_code=403, detail="Your role cannot edit tasks")

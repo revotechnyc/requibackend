@@ -34,6 +34,7 @@ ROLE_HIERARCHY = {
     UserRole.REVIEWER: 70,
     UserRole.ANALYST: 55,
     UserRole.CONTRIBUTOR: 50,
+    UserRole.PROJECT: 45,
     UserRole.PRESIDENT: 90,
     UserRole.VICE_PRESIDENT: 80,
     UserRole.DIRECTOR: 70,
@@ -140,6 +141,10 @@ ROLE_PERMISSIONS = {
     UserRole.CONTRIBUTOR: [
         "view", "create", "edit", "submit",
         "work_modules", "view_assigned", "publish_blog",
+    ],
+    UserRole.PROJECT: [
+        "view", "create", "edit", "submit",
+        "work_modules", "view_assigned",
     ],
     UserRole.ANALYST: [
         "view", "reports", "analytics",

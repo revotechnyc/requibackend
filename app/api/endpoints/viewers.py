@@ -73,7 +73,7 @@ class WorkspaceMemberInvite(BaseModel):
         r = (v or UserRole.VIEWER.value).strip().lower()
         if r not in INVITEABLE_ROLE_VALUES:
             raise ValueError(
-                "role must be one of: admin, reviewer, approver, contributor, analyst, viewer"
+                "role must be one of: admin, reviewer, approver, contributor, analyst, project, viewer"
             )
         return r
 
@@ -432,12 +432,21 @@ async def update_workspace_member(
             previous_role = UserRole(invite_role_value(invitation.role))
             was_paid = is_paid_role(previous_role)
             will_be_paid = is_paid_role(target_role)
+            # No downgrade from paid → Requi Flow yet (upgrade path only).
+            if was_paid and target_role == UserRole.PROJECT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Downgrading a paid seat to Requi Flow is not available yet. "
+                        "Upgrade Requi Flow users to a paid role instead."
+                    ),
+                )
             if will_be_paid and not was_paid:
                 await reserve_paid_seat(org, db)
             elif was_paid and not will_be_paid:
                 await release_paid_seat_if_unused(org, db)
             invitation.role = target_role.value
-            if data.feature_permissions is None:
+            if data.feature_permissions is None or target_role == UserRole.PROJECT:
                 invitation.feature_permissions = _default_invite_permissions(
                     org, target_role
                 )
@@ -489,20 +498,39 @@ async def update_workspace_member(
         )
         was_paid = is_paid_role(seat.role)
         will_be_paid = is_paid_role(target_role)
+        # No downgrade from paid → Requi Flow yet (upgrade path only).
+        if was_paid and target_role == UserRole.PROJECT:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Downgrading a paid seat to Requi Flow is not available yet. "
+                    "Upgrade Requi Flow users to a paid role instead."
+                ),
+            )
         if will_be_paid and not was_paid:
             await reserve_paid_seat(org, db)
         elif was_paid and not will_be_paid:
             await release_paid_seat_if_unused(org, db)
         seat.role = target_role
+        # Reset module map on role change to Requi Flow, or on free→paid upgrade
+        # when the client did not send an explicit permission payload.
+        if target_role == UserRole.PROJECT or (
+            will_be_paid and not was_paid and data.feature_permissions is None
+        ):
+            seat.feature_permissions = _default_invite_permissions(org, target_role)
     if data.feature_permissions is not None:
         if plan != PlanType.ENTERPRISE:
             raise HTTPException(
                 status_code=403,
                 detail="Custom module permissions require an Enterprise plan",
             )
-        seat.feature_permissions = sanitize_permissions_payload(
-            data.feature_permissions, plan, seat.role
-        )
+        # Requi Flow always keeps Projects + Tasks only (ignore expanded toggles).
+        if seat.role == UserRole.PROJECT:
+            seat.feature_permissions = _default_invite_permissions(org, UserRole.PROJECT)
+        else:
+            seat.feature_permissions = sanitize_permissions_payload(
+                data.feature_permissions, plan, seat.role
+            )
 
     await db.commit()
     if user:

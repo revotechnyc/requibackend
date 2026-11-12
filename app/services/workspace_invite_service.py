@@ -134,6 +134,13 @@ def assert_workspace_invite_allowed(
 
     if target_role == UserRole.VIEWER:
         pass  # Pro + Enterprise
+    elif target_role == UserRole.PROJECT:
+        # Requi Flow free project seat — Enterprise only
+        if plan != PlanType.ENTERPRISE:
+            raise HTTPException(
+                status_code=403,
+                detail="Requi Flow (project) seats require an Enterprise plan",
+            )
     elif target_role in PAID_ROLES:
         if plan != PlanType.ENTERPRISE:
             raise HTTPException(
@@ -282,7 +289,7 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
                 "accepted_at": seat.created_at.isoformat() if seat.created_at else None,
                 "invitation_id": None,
                 "seat_id": str(seat.id),
-                "revocable": seat.role == UserRole.VIEWER,
+                "revocable": seat.role in (UserRole.VIEWER, UserRole.PROJECT),
                 "member_type": "seat",
                 "user_id": str(seat.user_id),
                 "requires_password_change": seat.user_id in password_change_user_ids,
@@ -298,12 +305,15 @@ async def list_workspace_members_for_org(org_id: UUID, db: AsyncSession) -> dict
         )
 
     viewers = [m for m in members if m["role"] == "viewer"]
-    paid = [m for m in members if m["role"] != "viewer"]
+    project_flow = [m for m in members if m["role"] == "project"]
+    paid = [m for m in members if m["role"] not in ("viewer", "project")]
     counts = {
         "total": len(members),
         "active": len([m for m in members if m["status"] == "active"]),
         "pending": len([m for m in members if m["status"] == "pending"]),
         "viewers": len(viewers),
+        "project_flow": len(project_flow),
+        "free": len(viewers) + len(project_flow),
         "paid": len(paid),
     }
     billing = await billing_snapshot_for_org(org, db) if org else {}

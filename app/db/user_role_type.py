@@ -36,6 +36,7 @@ class UserRoleType(TypeDecorator):
             "ANALYST": "analyst",
             "APPROVER": "approver",
             "ENTERPRISE_ADMIN": "enterprise_admin",
+            "PROJECT": "project",
         }
         normalized = legacy.get(raw, raw.lower())
         return UserRole(normalized)

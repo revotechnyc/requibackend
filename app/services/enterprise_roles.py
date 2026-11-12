@@ -27,8 +27,15 @@ ROLE_SEAT_PRICE_CENTS: dict[str, int] = {
     UserRole.CONTRIBUTOR.value: STANDARD_ENTERPRISE_SEAT_CENTS,
     UserRole.ANALYST.value: STANDARD_ENTERPRISE_SEAT_CENTS,
     UserRole.SEO.value: STANDARD_ENTERPRISE_SEAT_CENTS,
+    UserRole.PROJECT.value: 0,
     UserRole.VIEWER.value: 0,
 }
+
+# Free seats (not billed): Viewer + Requi Flow (project)
+FREE_SEAT_ROLES: frozenset[str] = frozenset({
+    UserRole.VIEWER.value,
+    UserRole.PROJECT.value,
+})
 
 # Roles Enterprise workspace admins may assign when inviting
 # Enterprise Admin is signup-only (account owner) — not invitable.
@@ -38,11 +45,12 @@ INVITEABLE_ENTERPRISE_ROLES: tuple[str, ...] = (
     UserRole.REVIEWER.value,
     UserRole.CONTRIBUTOR.value,
     UserRole.ANALYST.value,
+    UserRole.PROJECT.value,
     UserRole.VIEWER.value,
 )
 
 PAID_INVITE_ROLES: frozenset[str] = frozenset(
-    r for r in INVITEABLE_ENTERPRISE_ROLES if r != UserRole.VIEWER.value
+    r for r in INVITEABLE_ENTERPRISE_ROLES if r not in FREE_SEAT_ROLES
 )
 
 WORKSPACE_ADMIN_ROLES: frozenset[UserRole] = frozenset({
@@ -90,6 +98,15 @@ ROLE_DISPLAY: dict[str, dict] = {
         "label": "Analyst",
         "description": "Reporting, analytics, KPI dashboards, and trend analysis.",
         "price_cents": STANDARD_ENTERPRISE_SEAT_CENTS,
+        "invitable": True,
+    },
+    UserRole.PROJECT.value: {
+        "label": "Requi Flow",
+        "description": (
+            "Free project seat — Projects and Tasks only. "
+            "Collaborate on assigned work; upgrade later to a paid seat for full platform access."
+        ),
+        "price_cents": 0,
         "invitable": True,
     },
     UserRole.VIEWER.value: {
@@ -142,6 +159,11 @@ def is_paid_invite_role(role: UserRole | str) -> bool:
     return value in PAID_INVITE_ROLES
 
 
+def is_free_seat_role(role: UserRole | str) -> bool:
+    value = role.value if isinstance(role, UserRole) else str(role).lower()
+    return value in FREE_SEAT_ROLES
+
+
 def seat_price_cents_for_member(
     role: UserRole | str,
     *,
@@ -149,7 +171,7 @@ def seat_price_cents_for_member(
     owner_id: Optional[UUID] = None,
 ) -> int:
     value = role.value if isinstance(role, UserRole) else str(role).lower()
-    if value == UserRole.VIEWER.value:
+    if value in FREE_SEAT_ROLES:
         return 0
     # Only the account owner is billed at $3,500; all other paid users are additional seat price.
     if user_id is not None and owner_id is not None and user_id == owner_id:

@@ -1010,7 +1010,7 @@ async def _ensure_userrole_enum_values(conn) -> None:
     if not await _pg_type_exists(conn, "userrole"):
         return
 
-    for value in ("reviewer", "contributor", "approver"):
+    for value in ("reviewer", "contributor", "approver", "project"):
         await conn.execute(
             text(
                 f"""

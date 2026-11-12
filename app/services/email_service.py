@@ -304,9 +304,10 @@ async def send_workspace_member_invite_email(
     accept_url: str,
     role_label: str,
     is_viewer: bool = False,
+    is_project_flow: bool = False,
     custom_message: Optional[str] = None,
 ) -> bool:
-    """Send customer-app workspace invitation (viewer or paid seat). Never raises."""
+    """Send customer-app workspace invitation (viewer, Requi Flow, or paid seat). Never raises."""
     greeting = invited_name.strip() or "there"
     inviter = inviter_name.strip() or "Your team admin"
     org = organization_name.strip() or "a Requi workspace"
@@ -314,11 +315,20 @@ async def send_workspace_member_invite_email(
     if custom_message and custom_message.strip():
         extra = f"<br><br><em>{custom_message.strip()}</em>"
 
-    access_note = (
-        "You can read dashboards, tasks, and compliance views — without editing or using Intelligence."
-        if is_viewer
-        else "You will have full access according to your assigned role after accepting."
-    )
+    if is_project_flow:
+        access_note = (
+            "You will have free access to Projects and Tasks only. "
+            "Sonia AI, Compliance Intelligence, and other modules stay locked unless your admin upgrades your seat."
+        )
+        badge = "Requi Flow · free Projects + Tasks"
+    elif is_viewer:
+        access_note = (
+            "You can read dashboards, tasks, and compliance views — without editing or using Intelligence."
+        )
+        badge = "View-only access"
+    else:
+        access_note = "You will have full access according to your assigned role after accepting."
+        badge = f"{role_label} · paid seat"
     title = f"You’re invited to {org}"
     subject = f"Requi Health — {role_label} access to {org}"
     message = (
@@ -328,7 +338,6 @@ async def send_workspace_member_invite_email(
         f"{extra}<br><br>"
         "Click below to accept your invitation and set up access. This link expires in 7 days."
     )
-    badge = "View-only access" if is_viewer else f"{role_label} · paid seat"
     try:
         service = get_email_service()
         ok = await service.send(

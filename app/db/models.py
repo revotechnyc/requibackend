@@ -55,6 +55,7 @@ class UserRole(str, PyEnum):
     APPROVER = "approver"
     CONTRIBUTOR = "contributor"
     ANALYST = "analyst"
+    PROJECT = "project"  # Requi Flow — free Projects + Tasks seat (Enterprise)
     PRESIDENT = "president"
     VICE_PRESIDENT = "vice_president"
     DIRECTOR = "director"

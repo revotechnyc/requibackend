@@ -75,12 +75,33 @@ MANAGEABLE_FEATURE_KEYS = (
     "settings",
 )
 
+# Requi Flow (project): locked to Projects (workflow) + Tasks only.
+PROJECT_ROLE_FEATURES: frozenset[str] = frozenset({"workflow", "tasks"})
+
 ROLE_FEATURE_ACCESS: dict[str, tuple[str, ...]] = {
     # Enterprise Admin + Admin: full module access (billing gated separately)
     "intelligence": ("enterprise_admin", "admin", "reviewer", "contributor", "analyst", "seo"),
     "dashboard": ("enterprise_admin", "admin", "reviewer", "contributor", "viewer", "analyst", "seo"),
-    "workflow": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "seo"),
-    "tasks": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "seo"),
+    "workflow": (
+        "enterprise_admin",
+        "admin",
+        "reviewer",
+        "approver",
+        "contributor",
+        "project",
+        "viewer",
+        "seo",
+    ),
+    "tasks": (
+        "enterprise_admin",
+        "admin",
+        "reviewer",
+        "approver",
+        "contributor",
+        "project",
+        "viewer",
+        "seo",
+    ),
     "compliance": ("enterprise_admin", "admin", "reviewer", "approver", "contributor", "viewer", "analyst", "seo"),
     "calendar": ("enterprise_admin", "admin", "reviewer", "contributor", "viewer", "seo"),
     "documents": ("enterprise_admin", "admin", "reviewer", "contributor", "seo"),
@@ -149,6 +170,12 @@ def sanitize_permissions_payload(
     stored = normalize_stored_permissions(raw) or {}
     if has_full_access(role):
         return {key: key in plan_feats for key in MANAGEABLE_FEATURE_KEYS}
+    # Requi Flow seats cannot unlock AI / Compliance / other modules via toggles.
+    if role == UserRole.PROJECT:
+        return {
+            key: key in PROJECT_ROLE_FEATURES and key in plan_feats
+            for key in MANAGEABLE_FEATURE_KEYS
+        }
     result: dict[str, bool] = {}
     for key in MANAGEABLE_FEATURE_KEYS:
         if key not in plan_feats:
