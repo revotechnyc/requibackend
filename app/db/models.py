@@ -331,6 +331,9 @@ class Subscription(Base):
     # Trial
     trial_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     trial_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    # Promo captured at trial signup; applied on first paid checkout/upgrade
+    pending_promotion_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

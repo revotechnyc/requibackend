@@ -55,6 +55,8 @@ class UserCreate(BaseModel):
     last_name: str
     plan_type: str = "pro"
     organization_name: Optional[str] = None
+    # Optional promo for trial signup — stored and applied on first paid checkout
+    promotion_code: Optional[str] = None
 
     @field_validator("password")
     @classmethod
@@ -76,7 +78,6 @@ class RegisterCheckoutCreate(UserCreate):
     """Register account then redirect to Stripe Checkout (no free trial)."""
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
-    promotion_code: Optional[str] = None
 
 
 class ValidatePromoCodeRequest(BaseModel):
@@ -247,6 +248,7 @@ def _subscription_payload(subscription: Optional[Subscription]) -> Optional[dict
             else None
         ),
         "cancel_at_period_end": subscription.cancel_at_period_end,
+        "pending_promotion_code": subscription.pending_promotion_code,
     }
 
 
@@ -323,6 +325,13 @@ async def register(
         )
 
     plan_type = PlanType(user_data.plan_type)
+    promotion_code = (user_data.promotion_code or "").strip().upper() or None
+    if promotion_code:
+        from app.services.stripe_promotions_service import StripePromotionsService
+
+        # Validate at signup so invalid codes don't get stored
+        StripePromotionsService.lookup_for_checkout(promotion_code, plan_type)
+
     limits = settings.get_plan_limits(plan_type.value)
     org_display_name = (
         user_data.organization_name.strip()
@@ -372,6 +381,7 @@ async def register(
         current_period_end=trial_end,
         trial_start=now,
         trial_end=trial_end,
+        pending_promotion_code=promotion_code,
     )
     db.add(subscription)
     await db.commit()

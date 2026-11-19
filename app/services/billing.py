@@ -586,6 +586,9 @@ class BillingService:
             subscription.trial_start = None
             subscription.trial_end = None
             subscription.cancel_at_period_end = bool(stripe_sub.get("cancel_at_period_end"))
+            # Promo was for first paid conversion — clear once billing is live
+            if status_value == SubscriptionStatus.ACTIVE:
+                subscription.pending_promotion_code = None
         else:
             subscription = Subscription(
                 organization_id=organization_id,
@@ -1224,11 +1227,64 @@ class BillingService:
         return [{"price": price_id, "quantity": total_seat_quantity}]
 
     @staticmethod
+    def _resolve_promotion_code(
+        explicit: Optional[str],
+        subscription: Optional[Subscription],
+    ) -> Optional[str]:
+        """Prefer explicit form value; fall back to pending trial promo when omitted."""
+        if explicit is not None:
+            return explicit.strip().upper() or None
+        if subscription and subscription.pending_promotion_code:
+            return subscription.pending_promotion_code.strip().upper() or None
+        return None
+
+    @staticmethod
+    def _attach_promo_preview(
+        payload: dict,
+        subscription: Subscription,
+        plan_type: PlanType,
+        promotion_code: Optional[str] = None,
+    ) -> dict:
+        """Expose pending promo + soft-validate for upgrade/checkout UI."""
+        pending = (subscription.pending_promotion_code or "").strip().upper() or None
+        payload["pending_promotion_code"] = pending
+        candidate = BillingService._resolve_promotion_code(promotion_code, subscription)
+        if not candidate:
+            return payload
+
+        from app.services.stripe_promotions_service import StripePromotionsService
+
+        try:
+            promo = StripePromotionsService.lookup_for_checkout(candidate, plan_type)
+            payload["promotion"] = {
+                "code": promo.get("code") or candidate,
+                "discount_label": promo.get("discount_label"),
+                "valid": True,
+            }
+            lines = list(payload.get("summary_lines") or [])
+            # Insert promo note above the due-today emphasis line when present
+            insert_at = len(lines) - 1 if lines and lines[-1].get("emphasis") else len(lines)
+            lines.insert(insert_at, {
+                "label": f"Promo {promo.get('code') or candidate}",
+                "formatted": promo.get("discount_label") or "Applied at checkout",
+            })
+            payload["summary_lines"] = lines
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else "Invalid or expired promotion code"
+            payload["promotion"] = {
+                "code": candidate,
+                "valid": False,
+                "message": detail,
+            }
+        return payload
+
+    @staticmethod
     async def _preview_trial_checkout(
         db: AsyncSession,
         subscription: Subscription,
         new_plan_type: PlanType,
         seat_quantity: int,
+        promotion_code: Optional[str] = None,
     ) -> dict:
         """Preview first paid checkout (trial → paid), including trial team seats."""
         from app.services.seat_allocation import (
@@ -1274,7 +1330,7 @@ class BillingService:
                 "emphasis": True,
             })
 
-        return {
+        payload = {
             "upgrade_type": "checkout",
             "seat_quantity": total_seats,
             "allocated_paid_seats": allocated,
@@ -1284,6 +1340,9 @@ class BillingService:
             "amount_due_formatted": BillingService._format_usd_cents(amount_due),
             "summary_lines": summary_lines,
         }
+        return BillingService._attach_promo_preview(
+            payload, subscription, new_plan_type, promotion_code
+        )
 
     @staticmethod
     async def preview_upgrade_plan(
@@ -1291,6 +1350,7 @@ class BillingService:
         subscription: Subscription,
         new_plan_type: PlanType,
         seat_quantity: int,
+        promotion_code: Optional[str] = None,
     ) -> dict:
         """Preview prorated charge for an in-place plan upgrade (Stripe invoice preview)."""
         stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
@@ -1298,7 +1358,7 @@ class BillingService:
         )
         if not stripe_sub_id:
             return await BillingService._preview_trial_checkout(
-                db, subscription, new_plan_type, seat_quantity
+                db, subscription, new_plan_type, seat_quantity, promotion_code
             )
 
         if new_plan_type == subscription.plan_type:
@@ -1354,7 +1414,7 @@ class BillingService:
             "emphasis": True,
         })
 
-        return {
+        payload = {
             "upgrade_type": "in_place",
             "current_plan": subscription.plan_type.value,
             "new_plan": new_plan_type.value,
@@ -1372,6 +1432,9 @@ class BillingService:
             "summary_lines": friendly_lines,
             "detail_lines": summary_lines,
         }
+        return BillingService._attach_promo_preview(
+            payload, subscription, new_plan_type, promotion_code
+        )
 
     @staticmethod
     async def _cancel_duplicate_stripe_subscriptions(
@@ -1437,6 +1500,7 @@ class BillingService:
         new_plan_type: PlanType,
         seat_quantity: int,
         proration_date: Optional[int] = None,
+        promotion_code: Optional[str] = None,
     ) -> tuple[Subscription, int]:
         """
         Change plan on the existing Stripe subscription (prorated, charged immediately).
@@ -1457,6 +1521,13 @@ class BillingService:
         BillingService._reject_plan_downgrade(subscription.plan_type, new_plan_type)
 
         proration_ts = proration_date or int(datetime.now(tz=timezone.utc).timestamp())
+        resolved_promo = BillingService._resolve_promotion_code(promotion_code, subscription)
+        promo_stripe_id: Optional[str] = None
+        if resolved_promo:
+            from app.services.stripe_promotions_service import StripePromotionsService
+
+            promo = StripePromotionsService.lookup_for_checkout(resolved_promo, new_plan_type)
+            promo_stripe_id = promo["id"]
 
         try:
             stripe_sub = stripe.Subscription.retrieve(stripe_sub_id)
@@ -1465,18 +1536,22 @@ class BillingService:
                 new_plan_type,
                 seat_quantity,
             )
-            updated_sub = stripe.Subscription.modify(
-                stripe_sub_id,
-                items=modify_items,
-                proration_behavior="always_invoice",
-                payment_behavior="error_if_incomplete",
-                proration_date=proration_ts,
-                metadata={
+            modify_params: dict = {
+                "items": modify_items,
+                "proration_behavior": "always_invoice",
+                "payment_behavior": "error_if_incomplete",
+                "proration_date": proration_ts,
+                "metadata": {
                     "organization_id": str(subscription.organization_id),
                     "plan_type": new_plan_type.value,
                 },
-                expand=["latest_invoice"],
-            )
+                "expand": ["latest_invoice"],
+            }
+            if promo_stripe_id:
+                modify_params["discounts"] = [{"promotion_code": promo_stripe_id}]
+                modify_params["metadata"]["promotion_code"] = resolved_promo
+
+            updated_sub = stripe.Subscription.modify(stripe_sub_id, **modify_params)
         except stripe.error.StripeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_402_PAYMENT_REQUIRED,
@@ -1503,6 +1578,10 @@ class BillingService:
             stripe_sub_id,
         )
 
+        # Clear pending regardless of whether a promo was applied this time
+        subscription.pending_promotion_code = None
+        await db.commit()
+
         synced = await BillingService.sync_subscription_from_stripe(
             db,
             subscription.organization_id,
@@ -1521,6 +1600,7 @@ class BillingService:
         seat_quantity: int,
         success_url: str,
         cancel_url: str,
+        promotion_code: Optional[str] = None,
     ) -> dict:
         """Start Stripe Checkout for first paid subscription (trial / no active sub)."""
         stripe_sub_id = await BillingService._resolve_billable_stripe_subscription_id(
@@ -1550,22 +1630,38 @@ class BillingService:
 
         line_items = BillingService._build_checkout_line_items(plan_type, seat_quantity)
 
+        resolved_promo = BillingService._resolve_promotion_code(promotion_code, subscription)
+        promo_stripe_id: Optional[str] = None
+        if resolved_promo:
+            from app.services.stripe_promotions_service import StripePromotionsService
+
+            promo = StripePromotionsService.lookup_for_checkout(resolved_promo, plan_type)
+            promo_stripe_id = promo["id"]
+            resolved_promo = promo.get("code") or resolved_promo
+
         try:
             metadata = {
                 "organization_id": str(organization.id),
                 "plan_type": plan_type.value,
                 "seat_quantity": str(seat_quantity),
             }
-            session = stripe.checkout.Session.create(
-                customer=organization.owner.stripe_customer_id,
-                payment_method_types=["card"],
-                line_items=line_items,
-                mode="subscription",
-                success_url=success_url,
-                cancel_url=cancel_url,
-                metadata=metadata,
-                subscription_data={"metadata": metadata},
-            )
+            if resolved_promo:
+                metadata["promotion_code"] = resolved_promo
+
+            session_params: dict = {
+                "customer": organization.owner.stripe_customer_id,
+                "payment_method_types": ["card"],
+                "line_items": line_items,
+                "mode": "subscription",
+                "success_url": success_url,
+                "cancel_url": cancel_url,
+                "metadata": metadata,
+                "subscription_data": {"metadata": metadata},
+            }
+            if promo_stripe_id:
+                session_params["discounts"] = [{"promotion_code": promo_stripe_id}]
+
+            session = stripe.checkout.Session.create(**session_params)
             return {
                 "session_id": session.id,
                 "url": session.url,

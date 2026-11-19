@@ -399,6 +399,7 @@ async def init_db() -> None:
         ("workspace_member_credentials_table", _ensure_workspace_member_credentials_table),
         ("user_password_flags_table", _ensure_user_password_flags_table),
         ("notification_type_enum", _ensure_notification_type_enum_values),
+        ("subscription_pending_promo", _ensure_subscription_pending_promo_column),
     ]
 
     for name, step in migration_steps:
@@ -418,6 +419,17 @@ async def _ensure_member_feature_permissions_columns(conn) -> None:
     if not await _column_exists(conn, "workspace_invitations", "feature_permissions"):
         await conn.execute(
             text("ALTER TABLE workspace_invitations ADD COLUMN feature_permissions JSONB")
+        )
+
+
+async def _ensure_subscription_pending_promo_column(conn) -> None:
+    """Store promo codes collected at trial signup for later checkout/upgrade."""
+    if not await _column_exists(conn, "subscriptions", "pending_promotion_code"):
+        await conn.execute(
+            text(
+                "ALTER TABLE subscriptions "
+                "ADD COLUMN pending_promotion_code VARCHAR(100)"
+            )
         )
 
 

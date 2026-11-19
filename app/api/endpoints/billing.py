@@ -41,12 +41,14 @@ class CheckoutSessionCreate(BaseModel):
     seat_quantity: int
     success_url: str
     cancel_url: str
+    promotion_code: Optional[str] = None
 
 
 class UpgradePlanRequest(BaseModel):
     plan_type: str
     seat_quantity: int = 1
     proration_date: Optional[int] = None
+    promotion_code: Optional[str] = None
 
 
 async def _require_billing_org(
@@ -303,6 +305,7 @@ async def create_checkout_session(
         resolved_seats,
         data.success_url,
         data.cancel_url,
+        promotion_code=data.promotion_code,
     )
 
     return session
@@ -335,6 +338,7 @@ async def preview_upgrade_plan(
         subscription,
         plan_type,
         data.seat_quantity,
+        promotion_code=data.promotion_code,
     )
 
 
@@ -366,6 +370,7 @@ async def upgrade_plan(
         plan_type,
         data.seat_quantity,
         proration_date=data.proration_date,
+        promotion_code=data.promotion_code,
     )
     plan_label = BillingService._plan_display_label(updated.plan_type)
     amount_formatted = BillingService._format_usd_cents(amount_charged_cents)
